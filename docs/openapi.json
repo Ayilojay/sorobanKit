@@ -211,6 +211,99 @@
           "403": { "$ref": "#/components/responses/Forbidden" }
         }
       }
+    },
+    "/api/admin/token-allowlist": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "List token allowlist entries",
+        "description": "Returns the governance-controlled token allowlist used to gate payment routing eligibility, including pending timelocked updates and emergency removals.",
+        "operationId": "listTokenAllowlist",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Token allowlist entries",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TokenAllowlist" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/api/admin/token-allowlist/{token}": {
+      "parameters": [
+        { "$ref": "#/components/parameters/TokenParam" }
+      ],
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Get a token allowlist entry",
+        "operationId": "getTokenAllowlistEntry",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Token allowlist entry",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TokenAllowlistEntry" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "put": {
+        "tags": ["Admin"],
+        "summary": "Schedule a timelocked allowlist update",
+        "description": "Schedules an allowlist change that takes effect after the configured timelock delay. The change is recorded as pending until the delay elapses.",
+        "operationId": "scheduleTokenAllowlistUpdate",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/TokenAllowlistUpdateInput" }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Timelocked update scheduled",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TokenAllowlistEntry" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      },
+      "delete": {
+        "tags": ["Admin"],
+        "summary": "Emergency removal of a token",
+        "description": "Immediately removes a token from the allowlist, bypassing the timelock. Existing refund claims for the token are preserved and remain claimable.",
+        "operationId": "emergencyRemoveToken",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Token removed; refund claims preserved",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TokenAllowlistEntry" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
     }
   },
   "components": {
@@ -253,6 +346,13 @@
         "required": true,
         "description": "Stellar account address (G...)",
         "schema": { "type": "string", "pattern": "^G[A-Z2-7]{55}$" }
+      },
+      "TokenParam": {
+        "name": "token",
+        "in": "path",
+        "required": true,
+        "description": "Token identifier (asset code or contract address)",
+        "schema": { "type": "string" }
       }
     },
     "responses": {
@@ -282,80 +382,69 @@
       }
     },
     "schemas": {
-      "Tag": {
+      "TokenAllowlist": {
         "type": "object",
-        "required": ["id", "address", "name"],
         "properties": {
-          "id": { "type": "string" },
-          "address": { "type": "string" },
-          "name": { "type": "string" },
-          "description": { "type": "string" },
-          "createdAt": { "type": "string", "format": "date-time" },
-          "updatedAt": { "type": "string", "format": "date-time" }
-        }
-      },
-      "TagInput": {
-        "type": "object",
-        "required": ["address", "name"],
-        "properties": {
-          "address": { "type": "string" },
-          "name": { "type": "string" },
-          "description": { "type": "string" }
-        }
-      },
-      "TagList": {
-        "type": "object",
-        "required": ["data"],
-        "properties": {
-          "data": {
-            "type": "array",
-            "items": { "$ref": "#/components/schemas/Tag" }
+          "timelockSeconds": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Configured timelock delay applied to non-emergency allowlist updates"
           },
-          "page": { "type": "integer" },
-          "limit": { "type": "integer" },
-          "total": { "type": "integer" }
-        }
-      },
-      "Activity": {
-        "type": "object",
-        "required": ["id", "type", "createdAt"],
-        "properties": {
-          "id": { "type": "string" },
-          "type": { "type": "string" },
-          "address": { "type": "string" },
-          "tagId": { "type": "string" },
-          "createdAt": { "type": "string", "format": "date-time" }
-        }
-      },
-      "ActivityList": {
-        "type": "object",
-        "required": ["data"],
-        "properties": {
-          "data": {
+          "entries": {
             "type": "array",
-            "items": { "$ref": "#/components/schemas/Activity" }
+            "items": { "$ref": "#/components/schemas/TokenAllowlistEntry" }
+          }
+        },
+        "required": ["timelockSeconds", "entries"]
+      },
+      "TokenAllowlistEntry": {
+        "type": "object",
+        "properties": {
+          "token": { "type": "string", "description": "Token identifier" },
+          "status": {
+            "type": "string",
+            "enum": ["allowed", "pending", "removed"],
+            "description": "Current eligibility status for payment routing"
           },
-          "nextCursor": { "type": ["string", "null"] },
-          "hasMore": { "type": "boolean" }
-        }
+          "eligible": {
+            "type": "boolean",
+            "description": "Whether the token is currently eligible for payment routing"
+          },
+          "effectiveAt": {
+            "type": ["string", "null"],
+            "format": "date-time",
+            "description": "When the pending change takes effect; null when not pending"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the entry was last modified"
+          },
+          "emergency": {
+            "type": "boolean",
+            "description": "True when the entry was removed via emergency removal"
+          },
+          "preservedRefundClaims": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Number of existing refund claims preserved after removal"
+          }
+        },
+        "required": ["token", "status", "eligible", "updatedAt", "emergency", "preservedRefundClaims"]
       },
-      "Stats": {
+      "TokenAllowlistUpdateInput": {
         "type": "object",
         "properties": {
-          "totalTags": { "type": "integer" },
-          "totalAddresses": { "type": "integer" },
-          "totalActivity": { "type": "integer" },
-          "period": { "type": "string" }
-        }
-      },
-      "Error": {
-        "type": "object",
-        "required": ["error"],
-        "properties": {
-          "error": { "type": "string" },
-          "message": { "type": "string" },
-          "details": { "type": "object" }
-        }
+          "allowed": {
+            "type": "boolean",
+            "description": "Whether the token should be eligible for payment routing after the timelock"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Governance rationale recorded with the change"
+          }
+        },
+        "required": ["allowed"]
       }
     }
   }
