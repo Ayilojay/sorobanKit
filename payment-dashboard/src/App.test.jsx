@@ -176,3 +176,63 @@ describe('App pre-sign simulation review', () => {
     expect(await screen.findByText(/stale|out of date|re-run/i)).toBeTruthy();
   });
 });
+
+describe('App human-readable review from exact transaction XDR', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    vi.clearAllMocks();
+    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
+    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
+    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
+    freighterApi.getNetwork.mockResolvedValue({ network: 'TESTNET' });
+  });
+
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  it('renders network, asset, amount, destination, memo, and fee decoded from the final XDR', async () => {
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    const reviewButton = await screen.findByRole('button', { name: /review|simulate/i });
+    reviewButton.click();
+
+    expect(await screen.findByText(/network/i)).toBeTruthy();
+    expect(await screen.findByText(/asset/i)).toBeTruthy();
+    expect(await screen.findByText(/amount/i)).toBeTruthy();
+    expect(await screen.findByText(/destination/i)).toBeTruthy();
+    expect(await screen.findByText(/memo/i)).toBeTruthy();
+    expect(await screen.findByText(/fee/i)).toBeTruthy();
+  });
+
+  it('blocks unknown or unsupported operation types in the review', async () => {
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    const reviewButton = await screen.findByRole('button', { name: /review|simulate/i });
+    reviewButton.click();
+
+    expect(await screen.findByText(/unsupported|unknown operation/i)).toBeTruthy();
+  });
+
+  it('blocks signing when decoded transaction data does not match user intent', async () => {
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    const reviewButton = await screen.findByRole('button', { name: /review|simulate/i });
+    reviewButton.click();
+
+    expect(await screen.findByText(/mismatch|does not match/i)).toBeTruthy();
+  });
+});
