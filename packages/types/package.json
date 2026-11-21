@@ -5,7 +5,8 @@
   "exports": "./src/index.ts",
   "typings": "dist/index.d.ts",
   "scripts": {
-    "build": "tsc"
+    "build": "tsc",
+    "test:abi": "node --test test/abi-compat.test.mjs"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^16.0.1",
