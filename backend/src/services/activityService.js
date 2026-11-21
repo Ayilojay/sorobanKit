@@ -230,14 +230,186 @@ async function cleanupCompletedRecords(options = {}) {
   return { deleted: result.count, cutoff, batchSize };
 }
 
+/**
+ * Actions that represent durable liability records reconciled by the report.
+ * Each entry maps an action to the liability category it contributes to.
+ */
+const RECONCILIATION_LIABILITY_ACTIONS = {
+  'payment.recorded': 'payment',
+  'payment.settled': 'payment',
+  'fee.charged': 'fee',
+  'fee.accrued': 'fee',
+  'refund.issued': 'refund',
+  'refund.completed': 'refund',
+};
+
+/**
+ * Hard upper bound on the number of durable records scanned by a single
+ * reconciliation run. Keeps the read-only report bounded.
+ */
+const MAX_RECONCILIATION_RECORDS = 10000;
+
+/**
+ * Build a read-only reconciliation report of payment, fee, and refund
+ * liabilities from durable activity records.
+ *
+ * The report is grouped by `network` and `asset` (read from record metadata)
+ * and bounded to the inclusive `[from, to]` date range. It surfaces:
+ * - missing records: liability references (metadata.reference) that appear in
+ *   one category but are absent from a category they should accompany.
+ * - duplicated records: the same reference recorded more than once within a
+ *   category.
+ * - inconsistent records: records missing required metadata (network, asset,
+ *   amount, reference) or with a non-positive amount.
+ *
+ * The operation is strictly read-only and deterministic for a given set of
+ * durable records.
+ *
+ * @param {Object} options
+ * @param {Date|string} options.from inclusive lower bound (required)
+ * @param {Date|string} options.to inclusive upper bound (required)
+ * @param {number} [options.limit=MAX_RECONCILIATION_RECORDS]
+ * @returns {Promise<Object>} reconciliation report
+ */
+async function reconcileLiabilities(options = {}) {
+  const from = options.from instanceof Date ? options.from : new Date(options.from);
+  const to = options.to instanceof Date ? options.to : new Date(options.to);
+
+  if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) {
+    throw new Error('reconcileLiabilities requires valid `from` and `to` dates');
+  }
+  if (from.getTime() > to.getTime()) {
+    throw new Error('reconcileLiabilities requires `from` <= `to`');
+  }
+
+  const requestedLimit = Number.parseInt(options.limit, 10);
+  const limit = Math.min(
+    MAX_RECONCILIATION_RECORDS,
+    Math.max(1, requestedLimit || MAX_RECONCILIATION_RECORDS)
+  );
+
+  const actions = Object.keys(RECONCILIATION_LIABILITY_ACTIONS);
+
+  const records = await prisma.activityLog.findMany({
+    where: {
+      action: { in: actions },
+      createdAt: { gte: from, lte: to },
+    },
+    orderBy: { createdAt: 'asc' },
+    take: limit,
+    select: { id: true, action: true, entityId: true, metadata: true, createdAt: true },
+  });
+
+  const groups = new Map();
+  const inconsistent = [];
+  const referencesByCategory = { payment: new Map(), fee: new Map(), refund: new Map() };
+
+  for (const record of records) {
+    const category = RECONCILIATION_LIABILITY_ACTIONS[record.action];
+    const meta = record.metadata || {};
+    const network = meta.network;
+    const asset = meta.asset;
+    const reference = meta.reference || record.entityId;
+    const amount = Number(meta.amount);
+
+    const problems = [];
+    if (!network) problems.push('missing network');
+    if (!asset) problems.push('missing asset');
+    if (!reference) problems.push('missing reference');
+    if (!Number.isFinite(amount) || amount <= 0) problems.push('invalid amount');
+
+    if (problems.length > 0) {
+      inconsistent.push({
+        id: record.id,
+        action: record.action,
+        category,
+        reference: reference || null,
+        problems,
+      });
+      continue;
+    }
+
+    const groupKey = `${network}::${asset}`;
+    if (!groups.has(groupKey)) {
+      groups.set(groupKey, {
+        network,
+        asset,
+        totals: { payment: 0, fee: 0, refund: 0 },
+        counts: { payment: 0, fee: 0, refund: 0 },
+      });
+    }
+    const group = groups.get(groupKey);
+    group.totals[category] += amount;
+    group.counts[category] += 1;
+
+    if (!referencesByCategory[category].has(reference)) {
+      referencesByCategory[category].set(reference, []);
+    }
+    referencesByCategory[category].get(reference).push(record.id);
+  }
+
+  // Duplicated records: same reference recorded more than once in a category.
+  const duplicated = [];
+  for (const category of Object.keys(referencesByCategory)) {
+    for (const [reference, ids] of referencesByCategory[category].entries()) {
+      if (ids.length > 1) {
+        duplicated.push({ category, reference, ids });
+      }
+    }
+  }
+
+  // Missing records: a reference present in one category but absent from a
+  // category it should accompany (payments should have matching fees/refunds
+  // when the reference is shared across categories).
+  const missing = [];
+  const allReferences = new Set();
+  for (const category of Object.keys(referencesByCategory)) {
+    for (const reference of referencesByCategory[category].keys()) {
+      allReferences.add(reference);
+    }
+  }
+  for (const reference of allReferences) {
+    const present = Object.keys(referencesByCategory).filter((category) =>
+      referencesByCategory[category].has(reference)
+    );
+    if (present.length > 1) {
+      for (const category of Object.keys(referencesByCategory)) {
+        if (!referencesByCategory[category].has(reference)) {
+          missing.push({ reference, expectedCategory: category, presentIn: present });
+        }
+      }
+    }
+  }
+
+  const byNetworkAsset = Array.from(groups.values()).sort((a, b) => {
+    if (a.network !== b.network) return a.network < b.network ? -1 : 1;
+    if (a.asset !== b.asset) return a.asset < b.asset ? -1 : 1;
+    return 0;
+  });
+
+  return {
+    from,
+    to,
+    recordCount: records.length,
+    truncated: records.length >= limit,
+    byNetworkAsset,
+    missing,
+    duplicated,
+    inconsistent,
+  };
+}
+
 module.exports = {
   log,
   logMany,
   listByUser,
   cleanupCompletedRecords,
+  reconcileLiabilities,
   DEFAULT_RETENTION_DAYS,
   DEFAULT_CLEANUP_BATCH_SIZE,
   MAX_CLEANUP_BATCH_SIZE,
   CLEANUP_ELIGIBLE_ACTIONS,
   CLEANUP_PROTECTED_ACTIONS,
+  RECONCILIATION_LIABILITY_ACTIONS,
+  MAX_RECONCILIATION_RECORDS,
 };
