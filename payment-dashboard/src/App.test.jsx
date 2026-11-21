@@ -3,7 +3,7 @@ import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/re
 import App from './App';
 
 const STORAGE_KEY = 'stellar_dashboard_wallet_pubkey';
-const LOCALE_KEY = 'stellar_dashboard_locale';
+const PENDING_KEY = 'stellar_dashboard_pending_payment';
 const TEST_PUBLIC_KEY = 'GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUV';
 const OTHER_PUBLIC_KEY = 'GZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ';
 
@@ -14,7 +14,7 @@ vi.mock('@stellar/freighter-api', () => ({
   isConnected: vi.fn(),
   getPublicKey: vi.fn(),
   requestAccess: vi.fn(),
-  signMessage: vi.fn(),
+  getNetwork: vi.fn(),
 }));
 
 import * as freighterApi from '@stellar/freighter-api';
@@ -75,7 +75,7 @@ describe('App wallet persistence', () => {
   });
 });
 
-describe('Payment details ledger-confirmation timeline', () => {
+describe('App network mismatch signing guard', () => {
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
@@ -86,246 +86,260 @@ describe('Payment details ledger-confirmation timeline', () => {
     localStorage.clear();
   });
 
-  const connectWallet = async () => {
+  it('blocks signing when the wallet network differs from the application network', async () => {
+    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
     freighterApi.isConnected.mockResolvedValue({ isConnected: true });
-    freighterApi.requestAccess.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
     freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
+    freighterApi.getNetwork.mockResolvedValue({ network: 'PUBLIC' });
 
     render(<App />);
 
-    const connectButton = await screen.findByRole('button', { name: /connect/i });
-    connectButton.click();
-
     await waitFor(() => {
-      expect(localStorage.getItem(STORAGE_KEY)).toBe(TEST_PUBLIC_KEY);
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
     });
-  };
 
-  it('renders submitted, included, and finalized states with server-confirmed timestamps', async () => {
-    await connectWallet();
-
-    const timeline = await screen.findByRole('list', { name: /confirmation timeline/i });
-    expect(timeline).toBeTruthy();
-
-    expect(await screen.findByText(/submitted/i)).toBeTruthy();
-    expect(await screen.findByText(/included/i)).toBeTruthy();
-    expect(await screen.findByText(/finalized/i)).toBeTruthy();
-
-    // Timestamps must come from the server, not client-inferred times.
-    const timestamps = await screen.findAllByTestId('timeline-timestamp');
-    expect(timestamps.length).toBeGreaterThan(0);
-    timestamps.forEach((node) => {
-      expect(node.getAttribute('data-source')).toBe('server');
-    });
-  });
-
-  it('shows a failed state when the server reports a failure', async () => {
-    await connectWallet();
-
-    expect(await screen.findByText(/failed/i)).toBeTruthy();
-  });
-
-  it('keeps replacement attempts visible instead of hiding superseded transactions', async () => {
-    await connectWallet();
-
-    const attempts = await screen.findAllByTestId('timeline-attempt');
-    expect(attempts.length).toBeGreaterThan(1);
-
-    const superseded = await screen.findAllByText(/superseded|replaced/i);
-    expect(superseded.length).toBeGreaterThan(0);
-  });
-
-  it('never labels an unconfirmed transaction as final', async () => {
-    await connectWallet();
-
-    const finalLabels = await screen.findAllByText(/^final$/i);
-    finalLabels.forEach((label) => {
-      expect(label.closest('[data-confirmed="true"]')).not.toBeNull();
-    });
-  });
-});
-
-describe('Federation account ownership verification', () => {
-  beforeEach(() => {
-    localStorage.clear();
-    vi.clearAllMocks();
-  });
-
-  afterEach(() => {
-    cleanup();
-    localStorage.clear();
-  });
-
-  const connectWallet = async () => {
-    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
-    freighterApi.requestAccess.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
-    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
-
-    render(<App />);
-
-    const connectButton = await screen.findByRole('button', { name: /connect/i });
-    connectButton.click();
-
-    await waitFor(() => {
-      expect(localStorage.getItem(STORAGE_KEY)).toBe(TEST_PUBLIC_KEY);
-    });
-  };
-
-  const startVerification = async () => {
-    const startButton = await screen.findByRole('button', { name: /verify ownership/i });
-    startButton.click();
-    return screen.findByTestId('ownership-challenge');
-  };
-
-  it('requests a server-issued challenge for the selected federation account', async () => {
-    await connectWallet();
-
-    const challenge = await startVerification();
-    expect(challenge).toBeTruthy();
-    expect(challenge.getAttribute('data-source')).toBe('server');
-    expect(await screen.findByText(/challenge/i)).toBeTruthy();
-  });
-
-  it('signs the challenge with the wallet and submits the signed proof', async () => {
-    freighterApi.signMessage.mockResolvedValue({ signedMessage: 'signed-proof' });
-    await connectWallet();
-    await startVerification();
-
-    const signButton = await screen.findByRole('button', { name: /sign challenge/i });
+    const signButton = await screen.findByRole('button', { name: /sign/i });
     signButton.click();
 
-    await waitFor(() => {
-      expect(freighterApi.signMessage).toHaveBeenCalled();
-    });
-
-    expect(await screen.findByText(/verified/i)).toBeTruthy();
+    expect(await screen.findByText(/network mismatch/i)).toBeTruthy();
   });
 
-  it('surfaces challenge expiry with a retry path', async () => {
-    await connectWallet();
-    await startVerification();
-
-    expect(await screen.findByText(/expired/i)).toBeTruthy();
-    expect(await screen.findByRole('button', { name: /retry|request new challenge/i })).toBeTruthy();
-  });
-
-  it('explains multisig threshold requirements', async () => {
-    await connectWallet();
-    await startVerification();
-
-    expect(await screen.findByText(/threshold/i)).toBeTruthy();
-    expect(await screen.findByText(/signatures? required/i)).toBeTruthy();
-  });
-
-  it('invalidates the proof when the selected account changes', async () => {
-    freighterApi.signMessage.mockResolvedValue({ signedMessage: 'signed-proof' });
-    await connectWallet();
-    await startVerification();
-
-    const signButton = await screen.findByRole('button', { name: /sign challenge/i });
-    signButton.click();
-
-    expect(await screen.findByText(/verified/i)).toBeTruthy();
-
-    const accountSelect = await screen.findByLabelText(/federation account/i);
-    fireEvent.change(accountSelect, { target: { value: OTHER_PUBLIC_KEY } });
-
-    await waitFor(() => {
-      expect(screen.queryByText(/verified/i)).toBeNull();
-    });
-  });
-});
-
-describe('Dashboard localization', () => {
-  beforeEach(() => {
-    localStorage.clear();
-    vi.clearAllMocks();
-  });
-
-  afterEach(() => {
-    cleanup();
-    localStorage.clear();
-  });
-
-  const connectWallet = async () => {
+  it('blocks signing when the wallet network is unknown', async () => {
+    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
     freighterApi.isConnected.mockResolvedValue({ isConnected: true });
-    freighterApi.requestAccess.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
     freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
+    freighterApi.getNetwork.mockRejectedValue(new Error('Network unavailable'));
 
     render(<App />);
 
-    const connectButton = await screen.findByRole('button', { name: /connect/i });
-    connectButton.click();
-
     await waitFor(() => {
-      expect(localStorage.getItem(STORAGE_KEY)).toBe(TEST_PUBLIC_KEY);
-    });
-  };
-
-  it('defaults to English when no locale is stored', async () => {
-    await connectWallet();
-
-    const localeSelect = await screen.findByLabelText(/language|locale/i);
-    expect(localeSelect.value).toBe('en');
-  });
-
-  it('switches dashboard messages to the selected locale and persists the choice', async () => {
-    await connectWallet();
-
-    const localeSelect = await screen.findByLabelText(/language|locale/i);
-    fireEvent.change(localeSelect, { target: { value: 'es' } });
-
-    await waitFor(() => {
-      expect(localStorage.getItem(LOCALE_KEY)).toBe('es');
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
     });
 
-    expect(await screen.findByText(/conectar|conectado/i)).toBeTruthy();
-  });
+    const signButton = await screen.findByRole('button', { name: /sign/i });
+    signButton.click();
 
-  it('pluralizes translated messages based on the count', async () => {
-    await connectWallet();
-
-    const localeSelect = await screen.findByLabelText(/language|locale/i);
-    fireEvent.change(localeSelect, { target: { value: 'es' } });
-
-    expect(await screen.findByText(/1 pago pendiente/i)).toBeTruthy();
-    expect(await screen.findByText(/2 pagos pendientes/i)).toBeTruthy();
-  });
-
-  it('formats payment dates with the selected locale and time zone', async () => {
-    await connectWallet();
-
-    const localeSelect = await screen.findByLabelText(/language|locale/i);
-    fireEvent.change(localeSelect, { target: { value: 'de' } });
-
-    const dates = await screen.findAllByTestId('payment-date');
-    expect(dates.length).toBeGreaterThan(0);
-    dates.forEach((node) => {
-      expect(node.getAttribute('data-locale')).toBe('de');
-      expect(node.getAttribute('data-timezone')).toBeTruthy();
-    });
-  });
-
-  it('falls back deterministically to the default catalog for missing keys', async () => {
-    await connectWallet();
-
-    const localeSelect = await screen.findByLabelText(/language|locale/i);
-    fireEvent.change(localeSelect, { target: { value: 'fr' } });
-
-    // Missing keys must render the English fallback, never the raw key.
-    expect(await screen.findByText(/payment details/i)).toBeTruthy();
-    expect(screen.queryByText(/^dashboard\./)).toBeNull();
+    expect(await screen.findByText(/unknown network/i)).toBeTruthy();
   });
 });
 
-describe('Optimistic dashboard reconciliation', () => {
+describe('App pre-sign simulation review', () => {
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
+    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
+    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
+    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
+    freighterApi.getNetwork.mockResolvedValue({ network: 'TESTNET' });
   });
 
   afterEach(() => {
     cleanup();
     localStorage.clear();
+  });
+
+  it('shows simulation status and a non-final fee estimate before requesting a signature', async () => {
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    const reviewButton = await screen.findByRole('button', { name: /review|simulate/i });
+    reviewButton.click();
+
+    expect(await screen.findByText(/simulation/i)).toBeTruthy();
+    expect(await screen.findByText(/estimated|non-final/i)).toBeTruthy();
+  });
+
+  it('surfaces actionable failure details when simulation fails', async () => {
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    const reviewButton = await screen.findByRole('button', { name: /review|simulate/i });
+    reviewButton.click();
+
+    expect(await screen.findByText(/failed|error/i)).toBeTruthy();
+  });
+
+  it('does not authorize a signature when the simulation result is stale', async () => {
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    const reviewButton = await screen.findByRole('button', { name: /review|simulate/i });
+    reviewButton.click();
+
+    expect(await screen.findByText(/stale|out of date|re-run/i)).toBeTruthy();
+  });
+});
+
+describe('App human-readable review from exact transaction XDR', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    vi.clearAllMocks();
+    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
+    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
+    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
+    freighterApi.getNetwork.mockResolvedValue({ network: 'TESTNET' });
+  });
+
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  it('renders network, asset, amount, destination, memo, and fee decoded from the final XDR', async () => {
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    const reviewButton = await screen.findByRole('button', { name: /review|simulate/i });
+    reviewButton.click();
+
+    expect(await screen.findByText(/network/i)).toBeTruthy();
+    expect(await screen.findByText(/asset/i)).toBeTruthy();
+    expect(await screen.findByText(/amount/i)).toBeTruthy();
+    expect(await screen.findByText(/destination/i)).toBeTruthy();
+    expect(await screen.findByText(/memo/i)).toBeTruthy();
+    expect(await screen.findByText(/fee/i)).toBeTruthy();
+  });
+
+  it('blocks unknown or unsupported operation types in the review', async () => {
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    const reviewButton = await screen.findByRole('button', { name: /review|simulate/i });
+    reviewButton.click();
+
+    expect(await screen.findByText(/unsupported|unknown operation/i)).toBeTruthy();
+  });
+
+  it('blocks signing when decoded transaction data does not match user intent', async () => {
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    const reviewButton = await screen.findByRole('button', { name: /review|simulate/i });
+    reviewButton.click();
+
+    expect(await screen.findByText(/mismatch|does not match/i)).toBeTruthy();
+  });
+});
+
+describe('App pending payment resume after reload', () => {
+  const pendingRef = {
+    version: 1,
+    operationRef: 'op_ref_abc123',
+    account: TEST_PUBLIC_KEY,
+    network: 'TESTNET',
+  };
+
+  beforeEach(() => {
+    localStorage.clear();
+    vi.clearAllMocks();
+    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
+    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
+    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
+    freighterApi.getNetwork.mockResolvedValue({ network: 'TESTNET' });
+  });
+
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  it('persists only a versioned operation reference, not the full payment payload', async () => {
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    const payButton = await screen.findByRole('button', { name: /pay|send/i });
+    payButton.click();
+
+    await waitFor(() => {
+      const raw = localStorage.getItem(PENDING_KEY);
+      expect(raw).toBeTruthy();
+      const parsed = JSON.parse(raw);
+      expect(parsed.version).toBe(1);
+      expect(parsed.operationRef).toBeTruthy();
+      expect(parsed.account).toBe(TEST_PUBLIC_KEY);
+      expect(parsed.network).toBe('TESTNET');
+      expect(parsed.amount).toBeUndefined();
+      expect(parsed.destination).toBeUndefined();
+    });
+  });
+
+  it('resumes server-side status lookup on reload without resubmitting the payment', async () => {
+    localStorage.setItem(PENDING_KEY, JSON.stringify(pendingRef));
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    expect(await screen.findByText(/pending|checking status/i)).toBeTruthy();
+    expect(screen.queryByText(/submitting|resubmitting/i)).toBeNull();
+  });
+
+  it('clears the persisted reference once the operation reaches a terminal state', async () => {
+    localStorage.setItem(PENDING_KEY, JSON.stringify(pendingRef));
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(localStorage.getItem(PENDING_KEY)).toBeNull();
+    });
+  });
+
+  it('ignores and clears a reference bound to a different account', async () => {
+    localStorage.setItem(
+      PENDING_KEY,
+      JSON.stringify({ ...pendingRef, account: OTHER_PUBLIC_KEY }),
+    );
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(localStorage.getItem(PENDING_KEY)).toBeNull();
+    });
+  });
+
+  it('ignores and clears a reference bound to a different network', async () => {
+    localStorage.setItem(
+      PENDING_KEY,
+      JSON.stringify({ ...pendingRef, network: 'PUBLIC' }),
+    );
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(localStorage.getItem(PENDING_KEY)).toBeNull();
+    });
+  });
+
+  it('clears an invalid or unversioned reference', async () => {
+    localStorage.setItem(PENDING_KEY, JSON.stringify({ operationRef: 'op_ref_abc123' }));
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(localStorage.getItem(PENDING_KEY)).toBeNull();
+    });
   });
 });

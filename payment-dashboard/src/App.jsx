@@ -264,6 +264,71 @@ function ShortcutsModal({ onClose, t }) {
   );
 }
 
+const PENDING_PAYMENT_STORAGE_KEY = 'handsoff.pendingPayment';
+const PENDING_PAYMENT_VERSION = 1;
+const TERMINAL_PAYMENT_STATUSES = new Set(['success', 'completed', 'failed', 'error', 'cancelled', 'canceled', 'expired']);
+
+/**
+ * Persist only a versioned operation reference for a pending payment.
+ * The reference is bound to the account and network so it is only resumed
+ * for the matching context.
+ * @param {{ operationId: string, account: string, network: string }} ref
+ */
+function persistPendingPaymentRef(ref) {
+  try {
+    const payload = {
+      version: PENDING_PAYMENT_VERSION,
+      operationId: ref.operationId,
+      account: ref.account,
+      network: ref.network,
+      savedAt: Date.now(),
+    };
+    window.localStorage.setItem(PENDING_PAYMENT_STORAGE_KEY, JSON.stringify(payload));
+  } catch (err) {
+    logger.error('Failed to persist pending payment reference:', err);
+  }
+}
+
+/**
+ * Read the persisted pending payment reference, validating version and shape.
+ * @returns {{ version: number, operationId: string, account: string, network: string, savedAt: number } | null}
+ */
+function readPendingPaymentRef() {
+  try {
+    const raw = window.localStorage.getItem(PENDING_PAYMENT_STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+
+    const parsed = JSON.parse(raw);
+    if (
+      !parsed ||
+      parsed.version !== PENDING_PAYMENT_VERSION ||
+      typeof parsed.operationId !== 'string' ||
+      !parsed.operationId ||
+      typeof parsed.account !== 'string' ||
+      typeof parsed.network !== 'string'
+    ) {
+      clearPendingPaymentRef();
+      return null;
+    }
+
+    return parsed;
+  } catch (err) {
+    logger.error('Failed to read pending payment reference:', err);
+    clearPendingPaymentRef();
+    return null;
+  }
+}
+
+function clearPendingPaymentRef() {
+  try {
+    window.localStorage.removeItem(PENDING_PAYMENT_STORAGE_KEY);
+  } catch (err) {
+    logger.error('Failed to clear pending payment reference:', err);
+  }
+}
+
 function App() {
 const [activeView, setActiveView] = useState('dashboard')
   const [userPublicKey, setUserPublicKey] = useState(() => {
@@ -364,6 +429,75 @@ const [activeView, setActiveView] = useState('dashboard')
       cancelled = true;
     };
   }, []);
+
+  // Resume a pending payment after reload by looking up server-side status.
+  // Never resubmit the payment; only poll the operation reference.
+  useEffect(() => {
+    if (!userPublicKey) {
+      return;
+    }
+
+    const pending = readPendingPaymentRef();
+    if (!pending) {
+      return;
+    }
+
+    if (pending.account !== userPublicKey || pending.network !== HORIZON_BASE) {
+      // Reference belongs to a different account/network context; discard it.
+      clearPendingPaymentRef();
+      return;
+    }
+
+    let cancelled = false;
+
+    const resume = async () => {
+      try {
+        const response = await withRequestId(
+          `${API_BASE}/payments/${encodeURIComponent(pending.operationId)}/status?address=${encodeURIComponent(pending.account)}`
+        );
+
+        if (cancelled) {
+          return;
+        }
+
+        if (response.status === 404 || response.status === 410) {
+          clearPendingPaymentRef();
+          return;
+        }
+
+        if (!response.ok) {
+          logger.error('Pending payment status lookup failed:', response.status);
+          return;
+        }
+
+        const data = await response.json();
+        if (cancelled) {
+          return;
+        }
+
+        const status = typeof data?.status === 'string' ? data.status.toLowerCase() : '';
+        if (TERMINAL_PAYMENT_STATUSES.has(status)) {
+          clearPendingPaymentRef();
+          if (status === 'success' || status === 'completed') {
+            toast.success('Pending payment completed.');
+          } else {
+            toast.error('Pending payment did not complete.');
+          }
+        }
+      } catch (err) {
+        if (cancelled) {
+          return;
+        }
+        logger.error('Failed to resume pending payment:', err);
+      }
+    };
+
+    resume();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [userPublicKey]);
 
   const handleConnectWallet = async () => {
     try {
