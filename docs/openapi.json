@@ -255,47 +255,45 @@
           "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" }
         }
-      },
-      "put": {
+      }
+    },
+    "/api/admin/fee-policies": {
+      "get": {
         "tags": ["Admin"],
-        "summary": "Schedule a timelocked allowlist update",
-        "description": "Schedules an allowlist change that takes effect after the configured timelock delay. The change is recorded as pending until the delay elapses.",
-        "operationId": "scheduleTokenAllowlistUpdate",
-        "security": [{ "bearerAuth": [] }],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": { "$ref": "#/components/schemas/TokenAllowlistUpdateInput" }
-            }
-          }
-        },
-        "responses": {
-          "202": {
-            "description": "Timelocked update scheduled",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/TokenAllowlistEntry" }
-              }
-            }
-          },
-          "400": { "$ref": "#/components/responses/BadRequest" },
-          "401": { "$ref": "#/components/responses/Unauthorized" },
-          "403": { "$ref": "#/components/responses/Forbidden" }
-        }
-      },
-      "delete": {
-        "tags": ["Admin"],
-        "summary": "Emergency removal of a token",
-        "description": "Immediately removes a token from the allowlist, bypassing the timelock. Existing refund claims for the token are preserved and remain claimable.",
-        "operationId": "emergencyRemoveToken",
+        "summary": "List versioned per-asset fee policies",
+        "description": "Returns the governance-controlled fee policies. Each asset may have a token-specific fee basis points and cap; assets without a policy fall back to the global configuration. Pending changes are queued through governance and applied only after approval.",
+        "operationId": "listFeePolicies",
         "security": [{ "bearerAuth": [] }],
         "responses": {
           "200": {
-            "description": "Token removed; refund claims preserved",
+            "description": "Fee policies including the global fallback and per-asset overrides",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/TokenAllowlistEntry" }
+                "schema": { "$ref": "#/components/schemas/FeePolicyList" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/api/admin/fee-policies/{token}": {
+      "parameters": [
+        { "$ref": "#/components/parameters/TokenParam" }
+      ],
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Get the effective fee policy for an asset",
+        "description": "Returns the effective fee policy for the asset. When no asset-specific policy exists, the global configuration is returned with source set to global.",
+        "operationId": "getFeePolicy",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Effective fee policy for the asset",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/FeePolicy" }
               }
             }
           },
@@ -330,7 +328,7 @@
       "CursorParam": {
         "name": "cursor",
         "in": "query",
-        "description": "Opaque cursor for cursor-based pagination",
+        "description": "Opaque cursor for pagination",
         "schema": { "type": "string" }
       },
       "TagIdParam": {
@@ -344,8 +342,8 @@
         "name": "address",
         "in": "path",
         "required": true,
-        "description": "Stellar account address (G...)",
-        "schema": { "type": "string", "pattern": "^G[A-Z2-7]{55}$" }
+        "description": "Stellar account address",
+        "schema": { "type": "string" }
       },
       "TokenParam": {
         "name": "token",
@@ -359,92 +357,164 @@
       "BadRequest": {
         "description": "Invalid request",
         "content": {
-          "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
         }
       },
       "Unauthorized": {
         "description": "Authentication required",
         "content": {
-          "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
         }
       },
       "Forbidden": {
         "description": "Insufficient permissions",
         "content": {
-          "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
         }
       },
       "NotFound": {
         "description": "Resource not found",
         "content": {
-          "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
         }
       }
     },
     "schemas": {
-      "TokenAllowlist": {
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": { "type": "string" },
+          "message": { "type": "string" }
+        }
+      },
+      "Tag": {
+        "type": "object",
+        "required": ["id", "address", "name"],
+        "properties": {
+          "id": { "type": "string" },
+          "address": { "type": "string" },
+          "name": { "type": "string" },
+          "createdAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "TagInput": {
+        "type": "object",
+        "required": ["address", "name"],
+        "properties": {
+          "address": { "type": "string" },
+          "name": { "type": "string" }
+        }
+      },
+      "TagList": {
+        "type": "object",
+        "required": ["items"],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Tag" }
+          },
+          "page": { "type": "integer" },
+          "limit": { "type": "integer" },
+          "total": { "type": "integer" }
+        }
+      },
+      "ActivityList": {
+        "type": "object",
+        "required": ["items"],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": { "type": "object" }
+          },
+          "nextCursor": { "type": ["string", "null"] }
+        }
+      },
+      "Stats": {
         "type": "object",
         "properties": {
-          "timelockSeconds": {
-            "type": "integer",
-            "minimum": 0,
-            "description": "Configured timelock delay applied to non-emergency allowlist updates"
-          },
+          "totalTags": { "type": "integer" },
+          "totalAddresses": { "type": "integer" },
+          "updatedAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "TokenAllowlist": {
+        "type": "object",
+        "required": ["entries"],
+        "properties": {
           "entries": {
             "type": "array",
             "items": { "$ref": "#/components/schemas/TokenAllowlistEntry" }
           }
-        },
-        "required": ["timelockSeconds", "entries"]
+        }
       },
       "TokenAllowlistEntry": {
         "type": "object",
+        "required": ["token", "allowed"],
         "properties": {
-          "token": { "type": "string", "description": "Token identifier" },
-          "status": {
-            "type": "string",
-            "enum": ["allowed", "pending", "removed"],
-            "description": "Current eligibility status for payment routing"
-          },
-          "eligible": {
-            "type": "boolean",
-            "description": "Whether the token is currently eligible for payment routing"
-          },
-          "effectiveAt": {
-            "type": ["string", "null"],
-            "format": "date-time",
-            "description": "When the pending change takes effect; null when not pending"
-          },
-          "updatedAt": {
-            "type": "string",
-            "format": "date-time",
-            "description": "When the entry was last modified"
-          },
-          "emergency": {
-            "type": "boolean",
-            "description": "True when the entry was removed via emergency removal"
-          },
-          "preservedRefundClaims": {
+          "token": { "type": "string" },
+          "allowed": { "type": "boolean" },
+          "pendingUpdate": { "type": ["object", "null"] },
+          "updatedAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "FeePolicy": {
+        "type": "object",
+        "required": ["token", "feeBps", "cap", "source", "version"],
+        "description": "Effective fee policy for an asset. feeBps is applied to the amount using exact integer arithmetic (floor(amount * feeBps / 10000)) and the result is clamped to cap. When no asset-specific policy exists, the global configuration is used and source is global.",
+        "properties": {
+          "token": { "type": "string" },
+          "feeBps": {
             "type": "integer",
             "minimum": 0,
-            "description": "Number of existing refund claims preserved after removal"
-          }
-        },
-        "required": ["token", "status", "eligible", "updatedAt", "emergency", "preservedRefundClaims"]
-      },
-      "TokenAllowlistUpdateInput": {
-        "type": "object",
-        "properties": {
-          "allowed": {
-            "type": "boolean",
-            "description": "Whether the token should be eligible for payment routing after the timelock"
+            "maximum": 10000,
+            "description": "Fee in basis points (1 bps = 0.01%)."
           },
-          "reason": {
+          "cap": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Maximum fee in the asset's smallest unit. The computed fee is clamped to this value."
+          },
+          "source": {
             "type": "string",
-            "description": "Governance rationale recorded with the change"
+            "enum": ["asset", "global"],
+            "description": "Whether the policy comes from an asset-specific override or the global fallback."
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Monotonic version incremented on each governance-approved change."
+          },
+          "pendingChange": {
+            "type": ["object", "null"],
+            "description": "Queued governance change awaiting approval, if any.",
+            "properties": {
+              "feeBps": { "type": "integer", "minimum": 0, "maximum": 10000 },
+              "cap": { "type": "integer", "minimum": 0 },
+              "effectiveAt": { "type": "string", "format": "date-time" }
+            }
+          },
+          "updatedAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "FeePolicyList": {
+        "type": "object",
+        "required": ["global", "assets"],
+        "properties": {
+          "global": { "$ref": "#/components/schemas/FeePolicy" },
+          "assets": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/FeePolicy" }
           }
-        },
-        "required": ["allowed"]
+        }
       }
     }
   }
