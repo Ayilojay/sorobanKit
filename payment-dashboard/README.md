@@ -5,7 +5,7 @@ This template provides a minimal setup to get React working in Vite with HMR and
 Currently, two official plugins are available:
 
 - [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs)
 
 ## React Compiler
 
@@ -34,6 +34,15 @@ The dashboard refuses to simulate or sign a transaction when the connected walle
 - The provider network and passphrase are re-verified immediately before a transaction is built and signed.
 - Any detected network change invalidates existing drafts, so a draft created on one network can never be signed on another.
 - Simulation and signing are blocked (with a clear error) for unknown or mismatched networks.
+
+## Pre-sign simulation review
+
+Before any signature is requested, the dashboard runs a transaction simulation and shows a review panel with the results.
+
+- **Simulation status**: the panel shows whether the simulation succeeded or failed. Signing is only enabled after a successful simulation of the current transaction.
+- **Fee estimate**: the estimated fee is displayed and explicitly labeled as an estimate / non-final. The actual fee may differ once the transaction is submitted.
+- **Actionable failures**: when the simulation fails, the panel surfaces the failure reason and any actionable details so the user can correct the transaction before signing.
+- **Stale-result protection**: simulation results are bound to the specific transaction (via a fingerprint of the transaction parameters/hash). If the transaction changes after a simulation, the previous result is invalidated and cannot be used to authorize the new transaction — a fresh simulation is required.
 
 ## Expanding the ESLint configuration
 

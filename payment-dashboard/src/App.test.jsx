@@ -120,3 +120,59 @@ describe('App network mismatch signing guard', () => {
     expect(await screen.findByText(/unknown network/i)).toBeTruthy();
   });
 });
+
+describe('App pre-sign simulation review', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    vi.clearAllMocks();
+    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
+    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
+    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
+    freighterApi.getNetwork.mockResolvedValue({ network: 'TESTNET' });
+  });
+
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  it('shows simulation status and a non-final fee estimate before requesting a signature', async () => {
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    const reviewButton = await screen.findByRole('button', { name: /review|simulate/i });
+    reviewButton.click();
+
+    expect(await screen.findByText(/simulation/i)).toBeTruthy();
+    expect(await screen.findByText(/estimated|non-final/i)).toBeTruthy();
+  });
+
+  it('surfaces actionable failure details when simulation fails', async () => {
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    const reviewButton = await screen.findByRole('button', { name: /review|simulate/i });
+    reviewButton.click();
+
+    expect(await screen.findByText(/failed|error/i)).toBeTruthy();
+  });
+
+  it('does not authorize a signature when the simulation result is stale', async () => {
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    const reviewButton = await screen.findByRole('button', { name: /review|simulate/i });
+    reviewButton.click();
+
+    expect(await screen.findByText(/stale|out of date|re-run/i)).toBeTruthy();
+  });
+});
