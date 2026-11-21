@@ -234,3 +234,83 @@ describe('Federation account ownership verification', () => {
     });
   });
 });
+
+describe('Optimistic dashboard reconciliation', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  const connectWallet = async () => {
+    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
+    freighterApi.requestAccess.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
+    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
+
+    render(<App />);
+
+    const connectButton = await screen.findByRole('button', { name: /connect/i });
+    connectButton.click();
+
+    await waitFor(() => {
+      expect(localStorage.getItem(STORAGE_KEY)).toBe(TEST_PUBLIC_KEY);
+    });
+  };
+
+  it('reconciles an optimistic insert with the server record without duplicating entries', async () => {
+    await connectWallet();
+
+    const submitButton = await screen.findByRole('button', { name: /send payment/i });
+    submitButton.click();
+
+    // Optimistic entry appears immediately.
+    const optimistic = await screen.findByTestId('payment-row-optimistic');
+    expect(optimistic).toBeTruthy();
+
+    // After the server confirms, the optimistic row is replaced by the server row.
+    await waitFor(() => {
+      expect(screen.queryByTestId('payment-row-optimistic')).toBeNull();
+    });
+
+    const rows = await screen.findAllByTestId('payment-row');
+    const ids = rows.map((row) => row.getAttribute('data-payment-id'));
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it('rolls back an optimistic insert when the server rejects the mutation', async () => {
+    await connectWallet();
+
+    const submitButton = await screen.findByRole('button', { name: /send payment/i });
+    submitButton.click();
+
+    expect(await screen.findByTestId('payment-row-optimistic')).toBeTruthy();
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('payment-row-optimistic')).toBeNull();
+    });
+
+    // A rejected payment must never be shown as completed.
+    expect(screen.queryByText(/completed/i)).toBeNull();
+    expect(await screen.findByText(/failed/i)).toBeTruthy();
+  });
+
+  it('ignores stale out-of-order responses so newer state wins', async () => {
+    await connectWallet();
+
+    const submitButton = await screen.findByRole('button', { name: /send payment/i });
+    submitButton.click();
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('payment-row-optimistic')).toBeNull();
+    });
+
+    // The latest server-confirmed status must be reflected, not an older response.
+    const row = await screen.findByTestId('payment-row');
+    expect(row.getAttribute('data-status')).toBe('completed');
+    expect(screen.queryByText(/pending/i)).toBeNull();
+  });
+});

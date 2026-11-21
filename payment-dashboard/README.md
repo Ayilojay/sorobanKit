@@ -5,7 +5,7 @@ This template provides a minimal setup to get React working in Vite with HMR and
 Currently, two official plugins are available:
 
 - [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs)
 
 ## React Compiler
 
@@ -26,6 +26,19 @@ VITE_BASE_PATH=/app/ npm run build
 ```
 
 You can also set `VITE_BASE_PATH` in a local `.env` file (see `.env.example`). The same build can be deployed at any path by rebuilding with the appropriate value.
+
+## Optimistic updates and server reconciliation
+
+The payment dashboard applies optimistic mutations (e.g. creating or updating a payment) immediately in the UI, then reconciles them with the authoritative server response. The reconciliation logic lives in the dashboard data layer and follows these rules:
+
+- **Pending mutations are centralized.** Each optimistic mutation is tracked in a single pending-mutation registry keyed by a client-generated request ID, rather than being scattered across components.
+- **Request IDs guard ordering.** Every mutation and every server response carries a request ID. Responses are matched to their originating mutation, and a response is only applied if it is newer than the state currently held for that entity.
+- **Out-of-order responses are ignored.** If a stale response arrives after a newer one (or after a newer optimistic mutation), it is discarded so it cannot overwrite fresher state.
+- **Rollback on failure.** When a mutation fails, the optimistic change is rolled back to the last known server state. A failed payment is never left displayed as completed.
+- **Cache revalidation.** After a mutation settles (success or failure), the affected cache entries are revalidated against the server so the list reflects authoritative data.
+- **No duplicate entries.** Optimistic inserts are reconciled with server-returned entities by identity, so a payment that was optimistically added is not duplicated when the server response is merged into the list.
+
+These behaviors are covered by focused tests in `src/App.test.jsx` (success, boundary, expected-failure, and concurrency/recovery cases).
 
 ## Expanding the ESLint configuration
 
