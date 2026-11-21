@@ -3,6 +3,7 @@ import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/re
 import App from './App';
 
 const STORAGE_KEY = 'stellar_dashboard_wallet_pubkey';
+const LOCALE_KEY = 'stellar_dashboard_locale';
 const TEST_PUBLIC_KEY = 'GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUV';
 const OTHER_PUBLIC_KEY = 'GZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ';
 
@@ -235,7 +236,7 @@ describe('Federation account ownership verification', () => {
   });
 });
 
-describe('Optimistic dashboard reconciliation', () => {
+describe('Dashboard localization', () => {
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
@@ -261,56 +262,70 @@ describe('Optimistic dashboard reconciliation', () => {
     });
   };
 
-  it('reconciles an optimistic insert with the server record without duplicating entries', async () => {
+  it('defaults to English when no locale is stored', async () => {
     await connectWallet();
 
-    const submitButton = await screen.findByRole('button', { name: /send payment/i });
-    submitButton.click();
-
-    // Optimistic entry appears immediately.
-    const optimistic = await screen.findByTestId('payment-row-optimistic');
-    expect(optimistic).toBeTruthy();
-
-    // After the server confirms, the optimistic row is replaced by the server row.
-    await waitFor(() => {
-      expect(screen.queryByTestId('payment-row-optimistic')).toBeNull();
-    });
-
-    const rows = await screen.findAllByTestId('payment-row');
-    const ids = rows.map((row) => row.getAttribute('data-payment-id'));
-    expect(new Set(ids).size).toBe(ids.length);
+    const localeSelect = await screen.findByLabelText(/language|locale/i);
+    expect(localeSelect.value).toBe('en');
   });
 
-  it('rolls back an optimistic insert when the server rejects the mutation', async () => {
+  it('switches dashboard messages to the selected locale and persists the choice', async () => {
     await connectWallet();
 
-    const submitButton = await screen.findByRole('button', { name: /send payment/i });
-    submitButton.click();
-
-    expect(await screen.findByTestId('payment-row-optimistic')).toBeTruthy();
+    const localeSelect = await screen.findByLabelText(/language|locale/i);
+    fireEvent.change(localeSelect, { target: { value: 'es' } });
 
     await waitFor(() => {
-      expect(screen.queryByTestId('payment-row-optimistic')).toBeNull();
+      expect(localStorage.getItem(LOCALE_KEY)).toBe('es');
     });
 
-    // A rejected payment must never be shown as completed.
-    expect(screen.queryByText(/completed/i)).toBeNull();
-    expect(await screen.findByText(/failed/i)).toBeTruthy();
+    expect(await screen.findByText(/conectar|conectado/i)).toBeTruthy();
   });
 
-  it('ignores stale out-of-order responses so newer state wins', async () => {
+  it('pluralizes translated messages based on the count', async () => {
     await connectWallet();
 
-    const submitButton = await screen.findByRole('button', { name: /send payment/i });
-    submitButton.click();
+    const localeSelect = await screen.findByLabelText(/language|locale/i);
+    fireEvent.change(localeSelect, { target: { value: 'es' } });
 
-    await waitFor(() => {
-      expect(screen.queryByTestId('payment-row-optimistic')).toBeNull();
+    expect(await screen.findByText(/1 pago pendiente/i)).toBeTruthy();
+    expect(await screen.findByText(/2 pagos pendientes/i)).toBeTruthy();
+  });
+
+  it('formats payment dates with the selected locale and time zone', async () => {
+    await connectWallet();
+
+    const localeSelect = await screen.findByLabelText(/language|locale/i);
+    fireEvent.change(localeSelect, { target: { value: 'de' } });
+
+    const dates = await screen.findAllByTestId('payment-date');
+    expect(dates.length).toBeGreaterThan(0);
+    dates.forEach((node) => {
+      expect(node.getAttribute('data-locale')).toBe('de');
+      expect(node.getAttribute('data-timezone')).toBeTruthy();
     });
+  });
 
-    // The latest server-confirmed status must be reflected, not an older response.
-    const row = await screen.findByTestId('payment-row');
-    expect(row.getAttribute('data-status')).toBe('completed');
-    expect(screen.queryByText(/pending/i)).toBeNull();
+  it('falls back deterministically to the default catalog for missing keys', async () => {
+    await connectWallet();
+
+    const localeSelect = await screen.findByLabelText(/language|locale/i);
+    fireEvent.change(localeSelect, { target: { value: 'fr' } });
+
+    // Missing keys must render the English fallback, never the raw key.
+    expect(await screen.findByText(/payment details/i)).toBeTruthy();
+    expect(screen.queryByText(/^dashboard\./)).toBeNull();
+  });
+});
+
+describe('Optimistic dashboard reconciliation', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
   });
 });

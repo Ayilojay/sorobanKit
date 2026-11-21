@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
 
 import { toast, Toaster } from "react-hot-toast";
 import logger from "./logger";
@@ -10,6 +10,135 @@ const HelpPage = lazy(() => import('./views/HelpPage.jsx'));
 const AnalyticsPage = lazy(() => import('./views/AnalyticsPage.jsx'));
 const HistoryPage = lazy(() => import('./views/HistoryPage.jsx'));
 const RegistrationPage = lazy(() => import('./views/RegistrationPage.jsx'));
+
+const DEFAULT_LOCALE = 'en';
+const LOCALE_STORAGE_KEY = 'payment-dashboard.locale';
+
+/**
+ * Translation catalogs for dashboard messages and payment-related strings.
+ * Keys are shared across locales; missing keys fall back to the default locale
+ * and finally to the key itself so the UI never renders blank text.
+ */
+const CATALOGS = {
+  en: {
+    'app.loadingView': 'Loading view...',
+    'app.shortcutsTitle': 'Keyboard Shortcuts',
+    'app.close': 'Close',
+    'app.offline': 'You are offline. Some actions may be unavailable.',
+    'wallet.connectFailed': 'Failed to connect wallet.',
+    'wallet.connectCancelled': 'Connection cancelled.',
+    'wallet.connectCancelledDetail': 'Wallet connection process cancelled.',
+    'wallet.disconnect': 'Disconnect wallet',
+    'wallet.connect': 'Connect wallet',
+    'payment.count': '{count, plural, one {# payment} other {# payments}}',
+    'payment.pending': '{count, plural, one {# payment pending} other {# payments pending}}',
+    'payment.date': 'Payment date',
+    'payment.amount': 'Amount',
+    'locale.label': 'Language',
+  },
+  es: {
+    'app.loadingView': 'Cargando vista...',
+    'app.shortcutsTitle': 'Atajos de teclado',
+    'app.close': 'Cerrar',
+    'app.offline': 'Estás sin conexión. Algunas acciones pueden no estar disponibles.',
+    'wallet.connectFailed': 'No se pudo conectar la billetera.',
+    'wallet.connectCancelled': 'Conexión cancelada.',
+    'wallet.connectCancelledDetail': 'Proceso de conexión de billetera cancelado.',
+    'wallet.disconnect': 'Desconectar billetera',
+    'wallet.connect': 'Conectar billetera',
+    'payment.count': '{count, plural, one {# pago} other {# pagos}}',
+    'payment.pending': '{count, plural, one {# pago pendiente} other {# pagos pendientes}}',
+    'payment.date': 'Fecha de pago',
+    'payment.amount': 'Importe',
+    'locale.label': 'Idioma',
+  },
+};
+
+const SUPPORTED_LOCALES = Object.keys(CATALOGS);
+
+/**
+ * Resolve the initial locale from storage, then the browser, then the default.
+ * @returns {string}
+ */
+function resolveInitialLocale() {
+  try {
+    const stored = localStorage.getItem(LOCALE_STORAGE_KEY);
+    if (stored && SUPPORTED_LOCALES.includes(stored)) {
+      return stored;
+    }
+  } catch (err) {
+    logger.debug('Unable to read stored locale:', err);
+  }
+
+  const browserLocale = typeof navigator !== 'undefined' ? navigator.language : '';
+  const base = (browserLocale || '').split('-')[0];
+  return SUPPORTED_LOCALES.includes(base) ? base : DEFAULT_LOCALE;
+}
+
+/**
+ * Interpolate a message, supporting ICU-style pluralization for `count`.
+ * @param {string} template
+ * @param {Record<string, unknown>} [values]
+ * @param {string} [locale]
+ * @returns {string}
+ */
+function formatMessage(template, values = {}, locale = DEFAULT_LOCALE) {
+  if (typeof template !== 'string') {
+    return '';
+  }
+
+  return template.replace(/\{(\w+), plural, ([^}]*)\}/g, (match, name, body) => {
+    const count = Number(values[name]);
+    if (!Number.isFinite(count)) {
+      return match;
+    }
+
+    const branches = {};
+    body.replace(/(=\d+|zero|one|two|few|many|other)\s*\{([^}]*)\}/g, (_, key, text) => {
+      branches[key] = text;
+      return '';
+    });
+
+    const pluralRules = typeof Intl !== 'undefined' && Intl.PluralRules
+      ? new Intl.PluralRules(locale)
+      : null;
+    const category = pluralRules ? pluralRules.select(count) : (count === 1 ? 'one' : 'other');
+    const chosen = branches[`=${count}`] ?? branches[category] ?? branches.other ?? '';
+    return chosen.replace(/#/g, new Intl.NumberFormat(locale).format(count));
+  }).replace(/\{(\w+)\}/g, (match, name) => {
+    return Object.prototype.hasOwnProperty.call(values, name) ? String(values[name]) : match;
+  });
+}
+
+/**
+ * Format a payment date/time with locale and time-zone awareness.
+ * @param {string | number | Date} value
+ * @param {string} locale
+ * @param {string} [timeZone]
+ * @returns {string}
+ */
+function formatPaymentDate(value, locale = DEFAULT_LOCALE, timeZone) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return '';
+  }
+
+  const resolvedTimeZone = timeZone
+    || (typeof Intl !== 'undefined' && Intl.DateTimeFormat
+      ? Intl.DateTimeFormat().resolvedOptions().timeZone
+      : undefined);
+
+  try {
+    return new Intl.DateTimeFormat(locale, {
+      dateStyle: 'medium',
+      timeStyle: 'short',
+      timeZone: resolvedTimeZone,
+    }).format(date);
+  } catch (err) {
+    logger.debug('Payment date formatting failed, using fallback:', err);
+    return date.toISOString();
+  }
+}
 
 /**
  * Generate a unique request identifier.
@@ -68,7 +197,7 @@ function isTypingTarget(target) {
   );
 }
 
-function ShortcutsModal({ onClose }) {
+function ShortcutsModal({ onClose, t }) {
   return (
     <div
       className="shortcuts-modal-backdrop"
@@ -100,7 +229,7 @@ function ShortcutsModal({ onClose }) {
         }}
       >
         <h2 id="shortcuts-modal-title" style={{ marginTop: 0 }}>
-          Keyboard Shortcuts
+          {t('app.shortcutsTitle')}
         </h2>
         <ul style={{ listStyle: 'none', padding: 0, margin: '16px 0' }}>
           {KEYBOARD_SHORTCUTS.map((shortcut) => (
@@ -128,7 +257,7 @@ function ShortcutsModal({ onClose }) {
           ))}
         </ul>
         <button type="button" onClick={onClose} autoFocus>
-          Close
+          {t('app.close')}
         </button>
       </div>
     </div>
@@ -143,6 +272,38 @@ const [activeView, setActiveView] = useState('dashboard')
   const [registrationState, setRegistrationState] = useState("unknown");
   const [isOffline, setIsOffline] = useState(!navigator.onLine);
   const [isShortcutsOpen, setIsShortcutsOpen] = useState(false);
+  const [locale, setLocale] = useState(() => resolveInitialLocale());
+
+  const t = useCallback(
+    (key, values) => {
+      const catalog = CATALOGS[locale] || CATALOGS[DEFAULT_LOCALE];
+      const fallback = CATALOGS[DEFAULT_LOCALE];
+      const template = catalog[key] ?? fallback[key] ?? key;
+      return formatMessage(template, values, locale);
+    },
+    [locale]
+  );
+
+  const formatDate = useCallback(
+    (value, timeZone) => formatPaymentDate(value, locale, timeZone),
+    [locale]
+  );
+
+  const handleLocaleChange = useCallback((nextLocale) => {
+    if (!SUPPORTED_LOCALES.includes(nextLocale)) {
+      return;
+    }
+    setLocale(nextLocale);
+    try {
+      localStorage.setItem(LOCALE_STORAGE_KEY, nextLocale);
+    } catch (err) {
+      logger.debug('Unable to persist locale:', err);
+    }
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.lang = locale;
+  }, [locale]);
 
   useEffect(() => {
     const handleOnline = () => setIsOffline(false);
@@ -237,16 +398,16 @@ const [activeView, setActiveView] = useState('dashboard')
             logger.debug("Wallet connected successfully.");
           } catch (err) {
             logger.error("Wallet connection failed:", err);
-            toast.error("Failed to connect wallet.");
+            toast.error(t('wallet.connectFailed'));
           }
         },
       });
 
       return { ok: true };
     } catch (error) {
-      toast.error("Connection cancelled.");
+      toast.error(t('wallet.connectCancelled'));
       logger.error("User closed modal or an error occurred:", error);
-      return { ok: false, error: "Wallet connection process cancelled." };
+      return { ok: false, error: t('wallet.connectCancelledDetail') };
     }
   };
 
@@ -261,301 +422,6 @@ const [activeView, setActiveView] = useState('dashboard')
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [balanceError, setBalanceError] = useState("");
 
-  const loadBalance = useCallback(async () => {
-    setIsRefreshing(true);
-    setBalanceError("");
-    try {
-      const response = await withRequestId(`${HORIZON_BASE}/accounts/${userPublicKey}`);
-      if (!response.ok) {
-        throw new Error(`Horizon error (${response.status}).`);
-      }
+  const load
 
-      const data = await response.json();
-      const nativeBalance = data?.balances?.find(
-        (item) => item.asset_type === "native",
-      );
-      const value = nativeBalance?.balance;
-      setBalance(value ? Number(value) : null);
-    } catch (error) {
-      setBalance(null);
-      setBalanceError(error instanceof Error ? error.message : "Unable to load balance.");
-    } finally {
-      setIsRefreshing(false);
-    }
-  }, [userPublicKey, setBalance, setIsRefreshing, setBalanceError]);
-
-  useEffect(() => {
-    if (!userPublicKey) {
-      return;
-    }
-    const run = async () => {
-      await loadBalance();
-    };
-    run();
-  }, [userPublicKey, loadBalance]);
-
-  useEffect(() => {
-    const syncView = () => {
-      const hash = window.location.hash;
-      if (hash === "#register") {
-        setActiveView("register");
-        return;
-      }
-
-      if (hash === "#help") {
-        setActiveView("help");
-        return;
-      }
-
-      if (hash === "#analytics") {
-        setActiveView("analytics");
-        return;
-      }
-
-      if (hash === "#history") {
-        setActiveView("history");
-        return;
-      }
-
-      setActiveView("dashboard");
-    };
-
-    syncView();
-    window.addEventListener("hashchange", syncView);
-    return () => window.removeEventListener("hashchange", syncView);
-  }, []);
-
-  /**
-   * @param {string} view
-   */
-  const handleNavigate = useCallback((view) => {
-    setActiveView(view);
-    if (view === "register") {
-      window.location.hash = "register";
-      return;
-    }
-
-    if (view === "help") {
-      window.location.hash = "help";
-      return;
-    }
-
-    if (view === "analytics") {
-      window.location.hash = "analytics";
-      return;
-    }
-
-    if (view === "history") {
-      window.location.hash = "history";
-      return;
-    }
-
-    window.location.hash = "";
-  }, []);
-
-  useEffect(() => {
-    const handleKeyDown = (event) => {
-      if (isTypingTarget(event.target)) {
-        return;
-      }
-
-      if (event.key === '?' && !event.altKey && !event.ctrlKey && !event.metaKey) {
-        event.preventDefault();
-        setIsShortcutsOpen((open) => !open);
-        return;
-      }
-
-      if (event.altKey && !event.ctrlKey && !event.metaKey) {
-        const key = event.key.toLowerCase();
-        if (key === 'r') {
-          event.preventDefault();
-          handleNavigate('register');
-          return;
-        }
-
-        if (key === 'h') {
-          event.preventDefault();
-          handleNavigate('history');
-          return;
-        }
-
-        if (key === 'a') {
-          event.preventDefault();
-          handleNavigate('analytics');
-        }
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [handleNavigate]);
-
-  const handleRegistrationStateChange = useCallback(
-    /**
-     * @param {string} nextState
-     */
-    (nextState) => {
-      setRegistrationState(nextState);
-
-      if (nextState === "new") {
-        handleNavigate("register");
-      }
-
-      if (nextState === "existing" && activeView === "register") {
-        handleNavigate("dashboard");
-      }
-    },
-    [activeView, handleNavigate],
-  );
-
-  if (activeView === "register" && (registrationState === "new" || registrationState === "skipped")) {
-    return (
-      <>
-        {isOffline && (
-          <div
-            style={{
-              backgroundColor: "#DC2626",
-              color: "#FFFFFF",
-              padding: "12px 16px",
-              textAlign: "center",
-              fontWeight: "500",
-              fontSize: "14px",
-              position: "sticky",
-              top: 0,
-              zIndex: 1000,
-            }}
-          >
-            ⚠️ You are currently offline. Transactions will fail.
-          </div>
-        )}
-        <Suspense fallback={<ViewFallback label="Loading registration..." />}>
-
-        <RegistrationPage
-          userPublicKey={userPublicKey}
-          setUserPublicKey={setUserPublicKey}
-          onBack={() => {
-            setRegistrationState("skipped"); // This breaks the loop!
-            handleNavigate("dashboard");
-          }}
-          onRegistered={() => handleRegistrationStateChange("existing")}
-        />
-        </Suspense>
-        {isShortcutsOpen && (
-          <ShortcutsModal onClose={() => setIsShortcutsOpen(false)} />
-        )}
-      </>
-    );
-  }
-
-  if (activeView === "help") {
-    return (
-      <>
-        {isOffline && (
-          <div
-            style={{
-              backgroundColor: "#DC2626",
-              color: "#FFFFFF",
-              padding: "12px 16px",
-              textAlign: "center",
-              fontWeight: "500",
-              fontSize: "14px",
-              position: "sticky",
-              top: 0,
-              zIndex: 1000,
-            }}
-          >
-            ⚠️ You are currently offline. Transactions will fail.
-          </div>
-        )}
-        <Suspense fallback={<ViewFallback label="Loading help center..." />}>
-
-        <HelpPage
-          userPublicKey={userPublicKey}
-          onConnectWallet={handleConnectWallet}
-          onDisconnectWallet={handleDisconnectWallet}
-          onDashboardClick={() => handleNavigate("dashboard")}
-          onAnalyticsClick={() => handleNavigate("analytics")}
-          onHistoryClick={() => handleNavigate("history")}
-          onRegisterClick={() => handleNavigate("register")}
-          canRegister={registrationState !== "existing"}
-        />
-        </Suspense>
-      </>
-    );
-  }
-
-  if (activeView === "analytics") {
-    return (
-      <>
-        {isOffline && (
-          <div
-            style={{
-              backgroundColor: "#DC2626",
-              color: "#FFFFFF",
-              padding: "12px 16px",
-              textAlign: "center",
-              fontWeight: "500",
-              fontSize: "14px",
-              position: "sticky",
-              top: 0,
-              zIndex: 1000,
-            }}
-          >
-            ⚠️ You are currently offline. Transactions will fail.
-          </div>
-        )}
-        <Suspense fallback={<ViewFallback label="Loading analytics..." />}>
-          <AnalyticsPage
-            userPublicKey={userPublicKey}
-            onConnectWallet={handleConnectWallet}
-            onDisconnectWallet={handleDisconnectWallet}
-            onDashboardClick={() => handleNavigate("dashboard")}
-            onHistoryClick={() => handleNavigate("history")}
-            onHelpClick={() => handleNavigate("help")}
-            onRegisterClick={() => handleNavigate("register")}
-            canRegister={registrationState !== "existing"}
-          />
-        </Suspense>
-      </>
-    );
-  }
-
-  return (
-    <>
-      {isOffline && (
-        <div
-          style={{
-            backgroundColor: "#DC2626",
-            color: "#FFFFFF",
-            padding: "12px 16px",
-            textAlign: "center",
-            fontWeight: "500",
-            fontSize: "14px",
-            position: "sticky",
-            top: 0,
-            zIndex: 1000,
-          }}
-        >
-          ⚠️ You are currently offline. Transactions will fail.
-        </div>
-      )}
-      <Suspense fallback={<ViewFallback label="Loading dashboard..." />}>
-        <Dashboard
-          userPublicKey={userPublicKey}
-          balance={balance}
-          isRefreshing={isRefreshing}
-          balanceError={balanceError}
-          onRefreshBalance={loadBalance}
-          onConnectWallet={handleConnectWallet}
-          onDisconnectWallet={handleDisconnectWallet}
-          onNavigate={handleNavigate}
-          registrationState={registrationState}
-          onRegistrationStateChange={handleRegistrationStateChange}
-        />
-      </Suspense>
-      <Toaster position="bottom-right" />
-    </>
-  );
-}
-
-/* … truncated 2006 chars — edit only what you need near the top … */
+/* … truncated 8075 chars — edit only what you need near the top … */
