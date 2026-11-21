@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const { PrismaClient } = require('@prisma/client');
 
 const prisma = new PrismaClient();
@@ -230,11 +231,123 @@ async function cleanupCompletedRecords(options = {}) {
   return { deleted: result.count, cutoff, batchSize };
 }
 
+/**
+ * Action recorded for every successful routed payment receipt.
+ */
+const PAYMENT_RECEIPT_ACTION = 'payment.receipt';
+
+/**
+ * Canonical field order for a payment receipt. The order is fixed so the
+ * serialized payload (and therefore its hash) is deterministic across
+ * processes, platforms, and runs.
+ */
+const RECEIPT_FIELDS = [
+  'sender',
+  'recipient',
+  'token',
+  'amount',
+  'fee',
+  'correlationId',
+];
+
+/**
+ * Normalize a receipt field to a stable string form. Amounts and fees are
+ * normalized to strings so numeric formatting differences (e.g. 1 vs 1.0)
+ * cannot change the resulting hash.
+ * @param {*} value
+ * @returns {string}
+ */
+function normalizeReceiptValue(value) {
+  if (value === null || value === undefined) {
+    return '';
+  }
+  return String(value);
+}
+
+/**
+ * Build a deterministic, verifiable receipt for a successful routed payment.
+ *
+ * The receipt contains the sender, recipient, token, amount, fee, and
+ * correlation ID. Its `hash` is the SHA-256 of the canonical JSON encoding of
+ * those fields in a fixed order, so the same inputs always produce the same
+ * hash and any tampering is detectable by recomputing it.
+ *
+ * @param {Object} payment
+ * @param {string} payment.sender
+ * @param {string} payment.recipient
+ * @param {string} payment.token
+ * @param {string|number} payment.amount
+ * @param {string|number} payment.fee
+ * @param {string} payment.correlationId
+ * @returns {{ sender: string, recipient: string, token: string, amount: string, fee: string, correlationId: string, hash: string }}
+ */
+function buildPaymentReceipt(payment) {
+  if (!payment || typeof payment !== 'object') {
+    throw new TypeError('payment is required to build a receipt');
+  }
+
+  const receipt = {};
+  for (const field of RECEIPT_FIELDS) {
+    receipt[field] = normalizeReceiptValue(payment[field]);
+  }
+
+  const canonical = JSON.stringify(RECEIPT_FIELDS.map((field) => receipt[field]));
+  receipt.hash = crypto.createHash('sha256').update(canonical).digest('hex');
+
+  return receipt;
+}
+
+/**
+ * Verify that a receipt's hash matches its contents.
+ * @param {Object} receipt
+ * @returns {boolean}
+ */
+function verifyPaymentReceipt(receipt) {
+  if (!receipt || typeof receipt !== 'object' || typeof receipt.hash !== 'string') {
+    return false;
+  }
+
+  const expected = buildPaymentReceipt(receipt);
+  return expected.hash === receipt.hash;
+}
+
+/**
+ * Emit exactly one receipt for a successful routed payment.
+ *
+ * The receipt is persisted as a single activity log entry. Callers must only
+ * invoke this on success; on failure no receipt is emitted. The returned
+ * receipt is the same deterministic object that was persisted, so integration
+ * tests can decode and verify it.
+ *
+ * @param {Object} payment see {@link buildPaymentReceipt}
+ * @param {Object} [options]
+ * @param {string} [options.userId] owner of the activity entry (defaults to sender)
+ * @returns {Promise<Object>} the persisted receipt
+ */
+async function emitPaymentReceipt(payment, options = {}) {
+  const receipt = buildPaymentReceipt(payment);
+
+  await log({
+    userId: options.userId || receipt.sender,
+    action: PAYMENT_RECEIPT_ACTION,
+    entityType: 'payment',
+    entityId: receipt.correlationId,
+    metadata: receipt,
+  });
+
+  return receipt;
+}
+
 module.exports = {
   log,
   logMany,
   listByUser,
   cleanupCompletedRecords,
+  buildPaymentReceipt,
+  verifyPaymentReceipt,
+  emitPaymentReceipt,
+  PAYMENT_RECEIPT_ACTION,
+  RECEIPT_FIELDS,
   DEFAULT_RETENTION_DAYS,
   DEFAULT_CLEANUP_BATCH_SIZE,
   MAX_CLEANUP_BATCH_SIZE,

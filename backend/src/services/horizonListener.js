@@ -34,6 +34,12 @@ const EVENT_SCHEMAS = {
       fields: ['id', 'action', 'actor', 'target', 'metadata'],
     },
   },
+  receipt: {
+    v1: {
+      symbol: 'receipt:v1',
+      fields: ['correlationId', 'sender', 'recipient', 'token', 'amount', 'fee'],
+    },
+  },
 };
 
 function getEventSymbol(category, version = EVENT_SCHEMA_VERSION) {
@@ -59,6 +65,28 @@ function buildEventPayload(category, data, version = EVENT_SCHEMA_VERSION) {
     payload[field] = data && data[field] !== undefined ? data[field] : null;
   }
   return payload;
+}
+
+// Build a deterministic receipt for a successful routed payment. The receipt is
+// keyed by correlationId so a given payment always yields the same receipt, and
+// the field order matches the receipt:v1 schema for stable decoding.
+function buildReceipt(payment, version = EVENT_SCHEMA_VERSION) {
+  if (!payment || typeof payment !== 'object') {
+    throw new Error('Cannot build receipt without a payment');
+  }
+  const correlationId = payment.correlationId || payment.id;
+  if (!correlationId) {
+    throw new Error('Cannot build receipt without a correlation ID');
+  }
+  const data = {
+    correlationId,
+    sender: payment.sender !== undefined ? payment.sender : payment.from,
+    recipient: payment.recipient !== undefined ? payment.recipient : payment.to,
+    token: payment.token !== undefined ? payment.token : payment.asset,
+    amount: payment.amount,
+    fee: payment.fee !== undefined ? payment.fee : null,
+  };
+  return buildEventPayload('receipt', data, version);
 }
 
 function getExpectedPassphrase(network) {
@@ -128,6 +156,19 @@ function handlePayment(payment, config) {
   }
 }
 
+// Emit exactly one receipt for a successful routed payment and none on failure.
+// Returns the receipt on success, or null when the payment did not succeed.
+function emitReceipt(payment, config) {
+  if (!payment || payment.successful === false) {
+    return null;
+  }
+  const receipt = buildReceipt(payment);
+  if (config && typeof config.onReceipt === 'function') {
+    config.onReceipt(receipt);
+  }
+  return receipt;
+}
+
 module.exports = {
   startHorizonListener,
   verifyNetwork,
@@ -138,4 +179,6 @@ module.exports = {
   getEventSymbol,
   getEventFields,
   buildEventPayload,
+  buildReceipt,
+  emitReceipt,
 };
