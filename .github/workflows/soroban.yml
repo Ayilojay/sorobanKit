@@ -42,6 +42,41 @@ jobs:
       - name: Run contract unit tests
         run: cargo test --features testutils -- --nocapture
 
+  hostile-token-tests:
+    name: Hostile Token-Contract Tests
+    needs: contract-checks
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./payment_router
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain (pinned)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ env.WASM_TARGET }}
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./payment_router
+
+      - name: Run hostile token-contract tests (rollback, fees, refunds)
+        run: >
+          cargo test --features testutils hostile
+          -- --nocapture --test-threads=1
+
+      - name: Fail if hostile token coverage is missing
+        run: |
+          if ! cargo test --features testutils hostile -- --list 2>/dev/null | grep -q ': test'; then
+            echo "::error::No hostile token-contract tests found. Add fixtures that revert/fail at transfer and balance boundaries (issue #431)."
+            exit 1
+          fi
+          echo "::notice::Hostile token-contract tests exercise revert-on-transfer, failing balance queries, insufficient balance, zero-amount edges, and rollback/refund accounting."
+
   reproducible-wasm:
     name: Reproducible WASM Build & Hash Verification
     needs: contract-checks

@@ -73,6 +73,40 @@ If the checksums differ, the build is not reproducible — investigate the
 toolchain, SDK, or optimizer version before proceeding. Never deploy an
 artifact whose checksum cannot be reproduced.
 
+## Token-contract behavior the router supports
+
+The router integrates with SEP-41-style token contracts. Because tokens are
+third-party code, the router must tolerate hostile or non-conforming behavior
+without corrupting its own accounting. The supported compatibility boundary is:
+
+- **Transfers** may revert (panic), return an error, or return `false`. The
+  router treats any of these as a failed transfer and rolls back the enclosing
+  operation — no partial state is persisted.
+- **Balance queries** may revert or return an error. The router must not assume
+  a balance read succeeds; failures surface as errors rather than panics in
+  router state.
+- **Insufficient balance** and **zero-amount** transfers are boundary cases the
+  router must handle explicitly (reject or no-op) rather than relying on the
+  token to enforce them.
+- **Fee and refund accounting** must remain consistent when a token fails
+  mid-operation: fees are not charged and refunds are not double-counted on a
+  rolled-back operation.
+
+Tokens that violate these assumptions (e.g. silently succeed while moving no
+funds, or mutate state before reverting) are **out of scope** and unsupported.
+
+### Hostile token test fixtures
+
+The test suite includes fixture token contracts that deliberately revert or
+fail at transfer and balance boundaries. When adding router logic that touches
+tokens, cover it with these fixtures:
+
+- success paths against a well-behaved token,
+- boundary cases (insufficient balance, zero amount),
+- expected failures (transfer revert, balance-query failure), and
+- rollback/recovery, asserting fee and refund accounting after a mid-operation
+  failure.
+
 ## Pull requests
 
 - Keep changes focused and scoped to the linked issue.
