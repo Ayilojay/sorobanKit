@@ -30,3 +30,23 @@ jobs:
       - name: Run ${{ matrix.target }} fuzz target
         working-directory: payment_router
         run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=30
+
+  property:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run payment/refund invariant property tests
+        working-directory: payment_router
+        env:
+          # Deterministic, bounded profile for CI: fixed seed, capped iterations/steps.
+          PROPTEST_CASES: '256'
+          PROPTEST_MAX_LOCAL_REJECTS: '1024'
+          PROPTEST_MAX_FLAT_MAP_REGENS: '1024'
+          PROPTEST_MAX_SHRINK_ITERS: '4096'
+          PROPTEST_RNG_SEED: '0x5eed'
+          PROP_MAX_STEPS: '64'
+        run: cargo test --locked --test payment_refund_invariants -- --nocapture

@@ -64,6 +64,40 @@ jobs:
           MEMORY_TEST_REQUESTS: '200'
           MEMORY_LEAK_THRESHOLD_MB: '50'
 
+  contract-budgets:
+    name: Contract Instruction & Storage Budgets (#427)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # The budget suite records reproducible CPU, memory, read/write, and
+      # entry-size budgets for the routing and governance public contract
+      # methods. It fails the job whenever a measured value exceeds the
+      # recorded budget (material regression) or a worst-case failure path
+      # stops being rejected as expected.
+      - name: Run Contract Budget Tests
+        run: npm run test:budgets
+
+      - name: Upload Budget Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-budget-report
+          path: |
+            **/budget-report.json
+            **/contract-budgets/**
+          retention-days: 14
+          if-no-files-found: ignore
+
   openapi-spec-check:
     name: Validate OpenAPI Spec (#253)
     runs-on: ubuntu-latest

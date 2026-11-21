@@ -122,8 +122,122 @@ async function listByUser(userId, options = {}) {
   };
 }
 
+/**
+ * Default retention window (in days) for completed timelock and accounting
+ * records. Records younger than this are kept for audit purposes.
+ */
+const DEFAULT_RETENTION_DAYS = 90;
+
+/**
+ * Default maximum number of records removed in a single cleanup run. Cleanup
+ * is always bounded so a single invocation cannot delete an unbounded set.
+ */
+const DEFAULT_CLEANUP_BATCH_SIZE = 500;
+
+/**
+ * Hard upper bound on the batch size accepted by cleanup, regardless of what
+ * the caller requests. Prevents accidental unbounded deletes.
+ */
+const MAX_CLEANUP_BATCH_SIZE = 5000;
+
+/**
+ * Actions that represent completed timelock / accounting records eligible for
+ * cleanup. Only these action types are ever considered for deletion.
+ */
+const CLEANUP_ELIGIBLE_ACTIONS = [
+  'timelock.completed',
+  'timelock.released',
+  'accounting.settled',
+  'accounting.reconciled',
+];
+
+/**
+ * Actions that must never be removed by cleanup because they represent
+ * pending work or outstanding refunds.
+ */
+const CLEANUP_PROTECTED_ACTIONS = [
+  'timelock.pending',
+  'timelock.scheduled',
+  'refund.pending',
+  'refund.outstanding',
+];
+
+/**
+ * Bound cleanup of completed timelock and accounting records.
+ *
+ * Deletes at most `batchSize` eligible activity records that are older than
+ * `retentionDays`. The operation is:
+ * - Bounded: never deletes more than `batchSize` rows per call.
+ * - Audit-preserving: only records older than the retention window qualify.
+ * - Dispute-safe: records flagged as disputed (via metadata) are skipped.
+ * - Pending-safe: pending actions and outstanding refunds are never eligible.
+ * - Idempotent: re-running simply deletes whatever still qualifies (or
+ *   nothing), with no duplicate or incorrect side effects.
+ *
+ * @param {Object} [options]
+ * @param {number} [options.retentionDays=DEFAULT_RETENTION_DAYS]
+ * @param {number} [options.batchSize=DEFAULT_CLEANUP_BATCH_SIZE]
+ * @param {Date} [options.now=new Date()] reference time (injectable for tests)
+ * @returns {Promise<{ deleted: number, cutoff: Date, batchSize: number }>}
+ */
+async function cleanupCompletedRecords(options = {}) {
+  const now = options.now instanceof Date ? options.now : new Date();
+
+  const retentionDays = Math.max(
+    0,
+    Number.parseInt(options.retentionDays, 10) || DEFAULT_RETENTION_DAYS
+  );
+
+  const requestedBatch = Number.parseInt(options.batchSize, 10);
+  const batchSize = Math.min(
+    MAX_CLEANUP_BATCH_SIZE,
+    Math.max(1, requestedBatch || DEFAULT_CLEANUP_BATCH_SIZE)
+  );
+
+  const cutoff = new Date(now.getTime() - retentionDays * 24 * 60 * 60 * 1000);
+
+  // Select a bounded set of eligible ids first so the delete is deterministic
+  // and cannot exceed the batch size even if new rows appear concurrently.
+  const candidates = await prisma.activityLog.findMany({
+    where: {
+      action: { in: CLEANUP_ELIGIBLE_ACTIONS },
+      createdAt: { lt: cutoff },
+      NOT: { action: { in: CLEANUP_PROTECTED_ACTIONS } },
+    },
+    orderBy: { createdAt: 'asc' },
+    take: batchSize,
+    select: { id: true, metadata: true },
+  });
+
+  // Skip records still needed for open disputes (metadata.disputed === true).
+  const ids = candidates
+    .filter((row) => !(row.metadata && row.metadata.disputed === true))
+    .map((row) => row.id);
+
+  if (ids.length === 0) {
+    return { deleted: 0, cutoff, batchSize };
+  }
+
+  const result = await prisma.activityLog.deleteMany({
+    where: {
+      id: { in: ids },
+      action: { in: CLEANUP_ELIGIBLE_ACTIONS },
+      createdAt: { lt: cutoff },
+      NOT: { action: { in: CLEANUP_PROTECTED_ACTIONS } },
+    },
+  });
+
+  return { deleted: result.count, cutoff, batchSize };
+}
+
 module.exports = {
   log,
   logMany,
   listByUser,
+  cleanupCompletedRecords,
+  DEFAULT_RETENTION_DAYS,
+  DEFAULT_CLEANUP_BATCH_SIZE,
+  MAX_CLEANUP_BATCH_SIZE,
+  CLEANUP_ELIGIBLE_ACTIONS,
+  CLEANUP_PROTECTED_ACTIONS,
 };

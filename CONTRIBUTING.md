@@ -99,6 +99,36 @@ cd payment_router
 cargo test
 ```
 
+## Instruction and Storage Budgets
+
+Public contract methods on the routing and governance paths are covered by reproducible resource budgets so that regressions are caught before they reach `main`. The budgets record CPU instructions, memory, ledger read/write counts, and entry size for each public method, and are enforced by focused tests in the contract workspace.
+
+### What is recorded
+
+For every public routing and governance method the budget suite captures:
+
+- **CPU instructions** — total instructions consumed by the invocation.
+- **Memory** — peak memory bytes used during execution.
+- **Read/write counts** — number of ledger entries read and written.
+- **Entry size** — serialized size of the largest entry written.
+
+Budgets are stored alongside the contract tests and are deterministic: they are derived from the same inputs on every run, so a diff in the recorded numbers always reflects a real change in behavior.
+
+### Worst-case failures
+
+The budget tests also exercise worst-case scenarios (maximum batch sizes, largest payloads, and full-capacity governance operations) so that the recorded ceilings reflect the true upper bound of each method rather than a best-case path. Expected-failure cases (e.g. exceeding a configured limit) are asserted to fail with the documented error rather than silently consuming unbounded resources.
+
+### Running the budget tests
+
+```bash
+cd payment_router
+cargo test budget
+```
+
+### Updating budgets
+
+If a change intentionally alters resource usage, update the recorded budgets in the same PR and explain the delta in the PR description. CI fails on material regressions against the recorded budgets, so an unexplained increase will block the merge. Keep budget updates in their own commit where practical to make review easier.
+
 ## Pull Requests
 
 1. Push your branch to your fork and open a PR against `main`.
