@@ -135,6 +135,71 @@ function ShortcutsModal({ onClose }) {
   );
 }
 
+const PENDING_PAYMENT_STORAGE_KEY = 'handsoff.pendingPayment';
+const PENDING_PAYMENT_VERSION = 1;
+const TERMINAL_PAYMENT_STATUSES = new Set(['success', 'completed', 'failed', 'error', 'cancelled', 'canceled', 'expired']);
+
+/**
+ * Persist only a versioned operation reference for a pending payment.
+ * The reference is bound to the account and network so it is only resumed
+ * for the matching context.
+ * @param {{ operationId: string, account: string, network: string }} ref
+ */
+function persistPendingPaymentRef(ref) {
+  try {
+    const payload = {
+      version: PENDING_PAYMENT_VERSION,
+      operationId: ref.operationId,
+      account: ref.account,
+      network: ref.network,
+      savedAt: Date.now(),
+    };
+    window.localStorage.setItem(PENDING_PAYMENT_STORAGE_KEY, JSON.stringify(payload));
+  } catch (err) {
+    logger.error('Failed to persist pending payment reference:', err);
+  }
+}
+
+/**
+ * Read the persisted pending payment reference, validating version and shape.
+ * @returns {{ version: number, operationId: string, account: string, network: string, savedAt: number } | null}
+ */
+function readPendingPaymentRef() {
+  try {
+    const raw = window.localStorage.getItem(PENDING_PAYMENT_STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+
+    const parsed = JSON.parse(raw);
+    if (
+      !parsed ||
+      parsed.version !== PENDING_PAYMENT_VERSION ||
+      typeof parsed.operationId !== 'string' ||
+      !parsed.operationId ||
+      typeof parsed.account !== 'string' ||
+      typeof parsed.network !== 'string'
+    ) {
+      clearPendingPaymentRef();
+      return null;
+    }
+
+    return parsed;
+  } catch (err) {
+    logger.error('Failed to read pending payment reference:', err);
+    clearPendingPaymentRef();
+    return null;
+  }
+}
+
+function clearPendingPaymentRef() {
+  try {
+    window.localStorage.removeItem(PENDING_PAYMENT_STORAGE_KEY);
+  } catch (err) {
+    logger.error('Failed to clear pending payment reference:', err);
+  }
+}
+
 function App() {
 const [activeView, setActiveView] = useState('dashboard')
   const [userPublicKey, setUserPublicKey] = useState(() => {
@@ -204,6 +269,75 @@ const [activeView, setActiveView] = useState('dashboard')
     };
   }, []);
 
+  // Resume a pending payment after reload by looking up server-side status.
+  // Never resubmit the payment; only poll the operation reference.
+  useEffect(() => {
+    if (!userPublicKey) {
+      return;
+    }
+
+    const pending = readPendingPaymentRef();
+    if (!pending) {
+      return;
+    }
+
+    if (pending.account !== userPublicKey || pending.network !== HORIZON_BASE) {
+      // Reference belongs to a different account/network context; discard it.
+      clearPendingPaymentRef();
+      return;
+    }
+
+    let cancelled = false;
+
+    const resume = async () => {
+      try {
+        const response = await withRequestId(
+          `${API_BASE}/payments/${encodeURIComponent(pending.operationId)}/status?address=${encodeURIComponent(pending.account)}`
+        );
+
+        if (cancelled) {
+          return;
+        }
+
+        if (response.status === 404 || response.status === 410) {
+          clearPendingPaymentRef();
+          return;
+        }
+
+        if (!response.ok) {
+          logger.error('Pending payment status lookup failed:', response.status);
+          return;
+        }
+
+        const data = await response.json();
+        if (cancelled) {
+          return;
+        }
+
+        const status = typeof data?.status === 'string' ? data.status.toLowerCase() : '';
+        if (TERMINAL_PAYMENT_STATUSES.has(status)) {
+          clearPendingPaymentRef();
+          if (status === 'success' || status === 'completed') {
+            toast.success('Pending payment completed.');
+          } else {
+            toast.error('Pending payment did not complete.');
+          }
+        }
+      } catch (err) {
+        if (cancelled) {
+          return;
+        }
+        logger.error('Failed to resume pending payment:', err);
+      }
+    };
+
+    resume();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [userPublicKey]);
+
   const handleConnectWallet = async () => {
     try {
       await walletKit.openModal({
@@ -261,301 +395,6 @@ const [activeView, setActiveView] = useState('dashboard')
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [balanceError, setBalanceError] = useState("");
 
-  const loadBalance = useCallback(async () => {
-    setIsRefreshing(true);
-    setBalanceError("");
-    try {
-      const response = await withRequestId(`${HORIZON_BASE}/accounts/${userPublicKey}`);
-      if (!response.ok) {
-        throw new Error(`Horizon error (${response.status}).`);
-      }
+  const load
 
-      const data = await response.json();
-      const nativeBalance = data?.balances?.find(
-        (item) => item.asset_type === "native",
-      );
-      const value = nativeBalance?.balance;
-      setBalance(value ? Number(value) : null);
-    } catch (error) {
-      setBalance(null);
-      setBalanceError(error instanceof Error ? error.message : "Unable to load balance.");
-    } finally {
-      setIsRefreshing(false);
-    }
-  }, [userPublicKey, setBalance, setIsRefreshing, setBalanceError]);
-
-  useEffect(() => {
-    if (!userPublicKey) {
-      return;
-    }
-    const run = async () => {
-      await loadBalance();
-    };
-    run();
-  }, [userPublicKey, loadBalance]);
-
-  useEffect(() => {
-    const syncView = () => {
-      const hash = window.location.hash;
-      if (hash === "#register") {
-        setActiveView("register");
-        return;
-      }
-
-      if (hash === "#help") {
-        setActiveView("help");
-        return;
-      }
-
-      if (hash === "#analytics") {
-        setActiveView("analytics");
-        return;
-      }
-
-      if (hash === "#history") {
-        setActiveView("history");
-        return;
-      }
-
-      setActiveView("dashboard");
-    };
-
-    syncView();
-    window.addEventListener("hashchange", syncView);
-    return () => window.removeEventListener("hashchange", syncView);
-  }, []);
-
-  /**
-   * @param {string} view
-   */
-  const handleNavigate = useCallback((view) => {
-    setActiveView(view);
-    if (view === "register") {
-      window.location.hash = "register";
-      return;
-    }
-
-    if (view === "help") {
-      window.location.hash = "help";
-      return;
-    }
-
-    if (view === "analytics") {
-      window.location.hash = "analytics";
-      return;
-    }
-
-    if (view === "history") {
-      window.location.hash = "history";
-      return;
-    }
-
-    window.location.hash = "";
-  }, []);
-
-  useEffect(() => {
-    const handleKeyDown = (event) => {
-      if (isTypingTarget(event.target)) {
-        return;
-      }
-
-      if (event.key === '?' && !event.altKey && !event.ctrlKey && !event.metaKey) {
-        event.preventDefault();
-        setIsShortcutsOpen((open) => !open);
-        return;
-      }
-
-      if (event.altKey && !event.ctrlKey && !event.metaKey) {
-        const key = event.key.toLowerCase();
-        if (key === 'r') {
-          event.preventDefault();
-          handleNavigate('register');
-          return;
-        }
-
-        if (key === 'h') {
-          event.preventDefault();
-          handleNavigate('history');
-          return;
-        }
-
-        if (key === 'a') {
-          event.preventDefault();
-          handleNavigate('analytics');
-        }
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [handleNavigate]);
-
-  const handleRegistrationStateChange = useCallback(
-    /**
-     * @param {string} nextState
-     */
-    (nextState) => {
-      setRegistrationState(nextState);
-
-      if (nextState === "new") {
-        handleNavigate("register");
-      }
-
-      if (nextState === "existing" && activeView === "register") {
-        handleNavigate("dashboard");
-      }
-    },
-    [activeView, handleNavigate],
-  );
-
-  if (activeView === "register" && (registrationState === "new" || registrationState === "skipped")) {
-    return (
-      <>
-        {isOffline && (
-          <div
-            style={{
-              backgroundColor: "#DC2626",
-              color: "#FFFFFF",
-              padding: "12px 16px",
-              textAlign: "center",
-              fontWeight: "500",
-              fontSize: "14px",
-              position: "sticky",
-              top: 0,
-              zIndex: 1000,
-            }}
-          >
-            ⚠️ You are currently offline. Transactions will fail.
-          </div>
-        )}
-        <Suspense fallback={<ViewFallback label="Loading registration..." />}>
-
-        <RegistrationPage
-          userPublicKey={userPublicKey}
-          setUserPublicKey={setUserPublicKey}
-          onBack={() => {
-            setRegistrationState("skipped"); // This breaks the loop!
-            handleNavigate("dashboard");
-          }}
-          onRegistered={() => handleRegistrationStateChange("existing")}
-        />
-        </Suspense>
-        {isShortcutsOpen && (
-          <ShortcutsModal onClose={() => setIsShortcutsOpen(false)} />
-        )}
-      </>
-    );
-  }
-
-  if (activeView === "help") {
-    return (
-      <>
-        {isOffline && (
-          <div
-            style={{
-              backgroundColor: "#DC2626",
-              color: "#FFFFFF",
-              padding: "12px 16px",
-              textAlign: "center",
-              fontWeight: "500",
-              fontSize: "14px",
-              position: "sticky",
-              top: 0,
-              zIndex: 1000,
-            }}
-          >
-            ⚠️ You are currently offline. Transactions will fail.
-          </div>
-        )}
-        <Suspense fallback={<ViewFallback label="Loading help center..." />}>
-
-        <HelpPage
-          userPublicKey={userPublicKey}
-          onConnectWallet={handleConnectWallet}
-          onDisconnectWallet={handleDisconnectWallet}
-          onDashboardClick={() => handleNavigate("dashboard")}
-          onAnalyticsClick={() => handleNavigate("analytics")}
-          onHistoryClick={() => handleNavigate("history")}
-          onRegisterClick={() => handleNavigate("register")}
-          canRegister={registrationState !== "existing"}
-        />
-        </Suspense>
-      </>
-    );
-  }
-
-  if (activeView === "analytics") {
-    return (
-      <>
-        {isOffline && (
-          <div
-            style={{
-              backgroundColor: "#DC2626",
-              color: "#FFFFFF",
-              padding: "12px 16px",
-              textAlign: "center",
-              fontWeight: "500",
-              fontSize: "14px",
-              position: "sticky",
-              top: 0,
-              zIndex: 1000,
-            }}
-          >
-            ⚠️ You are currently offline. Transactions will fail.
-          </div>
-        )}
-        <Suspense fallback={<ViewFallback label="Loading analytics..." />}>
-          <AnalyticsPage
-            userPublicKey={userPublicKey}
-            onConnectWallet={handleConnectWallet}
-            onDisconnectWallet={handleDisconnectWallet}
-            onDashboardClick={() => handleNavigate("dashboard")}
-            onHistoryClick={() => handleNavigate("history")}
-            onHelpClick={() => handleNavigate("help")}
-            onRegisterClick={() => handleNavigate("register")}
-            canRegister={registrationState !== "existing"}
-          />
-        </Suspense>
-      </>
-    );
-  }
-
-  return (
-    <>
-      {isOffline && (
-        <div
-          style={{
-            backgroundColor: "#DC2626",
-            color: "#FFFFFF",
-            padding: "12px 16px",
-            textAlign: "center",
-            fontWeight: "500",
-            fontSize: "14px",
-            position: "sticky",
-            top: 0,
-            zIndex: 1000,
-          }}
-        >
-          ⚠️ You are currently offline. Transactions will fail.
-        </div>
-      )}
-      <Suspense fallback={<ViewFallback label="Loading dashboard..." />}>
-        <Dashboard
-          userPublicKey={userPublicKey}
-          balance={balance}
-          isRefreshing={isRefreshing}
-          balanceError={balanceError}
-          onRefreshBalance={loadBalance}
-          onConnectWallet={handleConnectWallet}
-          onDisconnectWallet={handleDisconnectWallet}
-          onNavigate={handleNavigate}
-          registrationState={registrationState}
-          onRegistrationStateChange={handleRegistrationStateChange}
-        />
-      </Suspense>
-      <Toaster position="bottom-right" />
-    </>
-  );
-}
-
-/* … truncated 2006 chars — edit only what you need near the top … */
+/* … truncated 8075 chars — edit only what you need near the top … */

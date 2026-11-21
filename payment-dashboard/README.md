@@ -44,6 +44,15 @@ Before any signature is requested, the dashboard runs a transaction simulation a
 - **Actionable failures**: when the simulation fails, the panel surfaces the failure reason and any actionable details so the user can correct the transaction before signing.
 - **Stale-result protection**: simulation results are bound to the specific transaction (via a fingerprint of the transaction parameters/hash). If the transaction changes after a simulation, the previous result is invalidated and cannot be used to authorize the new transaction — a fresh simulation is required.
 
+## Resuming pending payments after reload
+
+If the page is reloaded while a payment is in flight, the dashboard restores progress by resuming a server-side status lookup rather than resubmitting the payment.
+
+- **Versioned reference only**: the dashboard persists only a small, versioned operation reference (an operation id plus a schema version) — never the full payment payload, amounts, or signing material.
+- **Bound to account and network**: the persisted reference is stored together with the account and network it was created for. On reload it is only resumed when the currently connected account and network match; otherwise it is discarded.
+- **No resubmission**: resuming performs a read-only status lookup against the server using the stored reference. The payment is never re-sent on reload.
+- **Cleared on completion or mismatch**: the reference is removed once the operation reaches a terminal state (success or failure), or when it is invalid, unreadable, or does not match the current account/network.
+
 ## Expanding the ESLint configuration
 
 If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.

@@ -3,7 +3,9 @@ import { render, screen, waitFor, cleanup } from '@testing-library/react';
 import App from './App';
 
 const STORAGE_KEY = 'stellar_dashboard_wallet_pubkey';
+const PENDING_KEY = 'stellar_dashboard_pending_payment';
 const TEST_PUBLIC_KEY = 'GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUV';
+const OTHER_PUBLIC_KEY = 'GZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ';
 
 const mockConnect = vi.fn();
 const mockDisconnect = vi.fn();
@@ -234,5 +236,110 @@ describe('App human-readable review from exact transaction XDR', () => {
     reviewButton.click();
 
     expect(await screen.findByText(/mismatch|does not match/i)).toBeTruthy();
+  });
+});
+
+describe('App pending payment resume after reload', () => {
+  const pendingRef = {
+    version: 1,
+    operationRef: 'op_ref_abc123',
+    account: TEST_PUBLIC_KEY,
+    network: 'TESTNET',
+  };
+
+  beforeEach(() => {
+    localStorage.clear();
+    vi.clearAllMocks();
+    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
+    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
+    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
+    freighterApi.getNetwork.mockResolvedValue({ network: 'TESTNET' });
+  });
+
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  it('persists only a versioned operation reference, not the full payment payload', async () => {
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    const payButton = await screen.findByRole('button', { name: /pay|send/i });
+    payButton.click();
+
+    await waitFor(() => {
+      const raw = localStorage.getItem(PENDING_KEY);
+      expect(raw).toBeTruthy();
+      const parsed = JSON.parse(raw);
+      expect(parsed.version).toBe(1);
+      expect(parsed.operationRef).toBeTruthy();
+      expect(parsed.account).toBe(TEST_PUBLIC_KEY);
+      expect(parsed.network).toBe('TESTNET');
+      expect(parsed.amount).toBeUndefined();
+      expect(parsed.destination).toBeUndefined();
+    });
+  });
+
+  it('resumes server-side status lookup on reload without resubmitting the payment', async () => {
+    localStorage.setItem(PENDING_KEY, JSON.stringify(pendingRef));
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    expect(await screen.findByText(/pending|checking status/i)).toBeTruthy();
+    expect(screen.queryByText(/submitting|resubmitting/i)).toBeNull();
+  });
+
+  it('clears the persisted reference once the operation reaches a terminal state', async () => {
+    localStorage.setItem(PENDING_KEY, JSON.stringify(pendingRef));
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(localStorage.getItem(PENDING_KEY)).toBeNull();
+    });
+  });
+
+  it('ignores and clears a reference bound to a different account', async () => {
+    localStorage.setItem(
+      PENDING_KEY,
+      JSON.stringify({ ...pendingRef, account: OTHER_PUBLIC_KEY }),
+    );
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(localStorage.getItem(PENDING_KEY)).toBeNull();
+    });
+  });
+
+  it('ignores and clears a reference bound to a different network', async () => {
+    localStorage.setItem(
+      PENDING_KEY,
+      JSON.stringify({ ...pendingRef, network: 'PUBLIC' }),
+    );
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(localStorage.getItem(PENDING_KEY)).toBeNull();
+    });
+  });
+
+  it('clears an invalid or unversioned reference', async () => {
+    localStorage.setItem(PENDING_KEY, JSON.stringify({ operationRef: 'op_ref_abc123' }));
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(localStorage.getItem(PENDING_KEY)).toBeNull();
+    });
   });
 });
