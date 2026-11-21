@@ -99,6 +99,56 @@ cd payment_router
 cargo test
 ```
 
+## Payment Router State-Transition Specification
+
+The payment router is a state machine. This section is the public contract for its
+state, actors, transition preconditions, emitted events, and rollback behavior. Each
+transition is backed by a Rust test or invariant in the `payment_router` workspace; when
+you change a transition, update the corresponding test and this table in the same PR.
+
+### Public state
+
+| State | Meaning |
+| --- | --- |
+| `Active` | Router accepts payments, refunds, and pause/freeze/governance operations. |
+| `Paused` | Payments are rejected; refunds and governance operations remain available. |
+| `Frozen` | All value-moving operations (payments and refunds) are rejected; only governance can unfreeze. |
+
+### Actors
+
+- **Payer** — submits payments and requests refunds.
+- **Admin** — pauses/unpauses the router and freezes it.
+- **Governance** — unfreezes the router and applies governance parameter changes.
+
+### Transitions
+
+| Operation | From → To | Preconditions | Emitted event | Rollback |
+| --- | --- | --- | --- | --- |
+| Payment | `Active` → `Active` | Router `Active`; amount within configured limits; payer authorized | `PaymentRouted` | Atomic: no state or balance change on failure |
+| Pause | `Active` → `Paused` | Caller is `Admin`; router `Active` | `RouterPaused` | Atomic: state unchanged on failure |
+| Unpause | `Paused` → `Active` | Caller is `Admin`; router `Paused` | `RouterUnpaused` | Atomic: state unchanged on failure |
+| Freeze | `Active`/`Paused` → `Frozen` | Caller is `Admin`; router not already `Frozen` | `RouterFrozen` | Atomic: state unchanged on failure |
+| Unfreeze | `Frozen` → `Active` | Caller is `Governance`; router `Frozen` | `RouterUnfrozen` | Atomic: state unchanged on failure |
+| Refund | `Active` → `Active` | Router `Active`; original payment exists and is refundable | `PaymentRefunded` | Atomic: no state or balance change on failure |
+| Governance | `Active`/`Paused` → same | Caller is `Governance`; parameters valid | `GovernanceUpdated` | Atomic: parameters unchanged on failure |
+
+### Invariants
+
+- A `Frozen` router never emits `PaymentRouted` or `PaymentRefunded`.
+- Every transition is all-or-nothing: a failed precondition leaves state, balances, and
+  emitted events untouched (Soroban rolls back the invocation).
+- Only `Governance` can move the router out of `Frozen`.
+
+### Tests
+
+Focused tests covering success, boundary, expected-failure, and recovery paths live in
+the `payment_router` workspace:
+
+```bash
+cd payment_router
+cargo test
+```
+
 ## Instruction and Storage Budgets
 
 Public contract methods on the routing and governance paths are covered by reproducible resource budgets so that regressions are caught before they reach `main`. The budgets record CPU instructions, memory, ledger read/write counts, and entry size for each public method, and are enforced by focused tests in the contract workspace.
