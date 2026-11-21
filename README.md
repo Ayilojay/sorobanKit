@@ -781,3 +781,6 @@ See [LICENSE](LICENSE).
 
 <!-- handsoff-issue-250 -->
 - #250: [#83] Smart contract `route_batch` does not return per-recipient result status
+
+<!-- handsoff-issue-424 -->
+- #424: Define a renewal strategy for persistent Soroban ledger entries
