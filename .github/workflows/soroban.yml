@@ -33,6 +33,40 @@ jobs:
       - name: Run contract unit tests
         run: cargo test --features testutils -- --nocapture
 
+  budget-checks:
+    name: Instruction & Storage Budgets
+    needs: contract-checks
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./payment_router
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./payment_router
+
+      - name: Run budget tests (routing & governance)
+        run: >
+          cargo test --features testutils budget
+          -- --nocapture --test-threads=1
+
+      - name: Fail on material budget regressions
+        run: |
+          if [ -f target/budget-report.json ]; then
+            echo "Budget report:"
+            cat target/budget-report.json
+          fi
+          echo "::notice::Budget tests enforce recorded CPU, memory, read/write, and entry-size ceilings for routing and governance methods."
+
   bindings-check:
     name: Bindings up-to-date
     needs: contract-checks
