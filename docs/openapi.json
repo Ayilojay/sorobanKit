@@ -179,10 +179,11 @@
       "get": {
         "tags": ["Stats"],
         "summary": "Get platform statistics",
+        "description": "Returns aggregate statistics served from the refreshable reporting read model. The response includes the source watermark and refresh status so clients can reason about staleness. Reporting refreshes run asynchronously and never block payment writes.",
         "operationId": "getStats",
         "responses": {
           "200": {
-            "description": "Aggregate platform statistics",
+            "description": "Aggregate platform statistics from the reporting read model",
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Stats" }
@@ -204,6 +205,52 @@
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Stats" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/api/admin/stats/refresh": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Trigger a reporting read model refresh",
+        "description": "Enqueues an asynchronous refresh of the reporting read model. The refresh runs decoupled from the payment write path and records the source watermark on completion. Returns the current refresh status.",
+        "operationId": "refreshStats",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "202": {
+            "description": "Refresh accepted and running asynchronously",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StatsRefreshStatus" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "409": {
+            "description": "A refresh is already in progress",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/StatsRefreshStatus" } }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Get reporting read model refresh status",
+        "description": "Returns the current refresh status and source watermark of the reporting read model.",
+        "operationId": "getStatsRefreshStatus",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Current refresh status",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StatsRefreshStatus" }
               }
             }
           },
@@ -282,6 +329,14 @@
       }
     },
     "schemas": {
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": { "type": "string" },
+          "message": { "type": "string" }
+        }
+      },
       "Tag": {
         "type": "object",
         "required": ["id", "address", "name"],
@@ -298,63 +353,69 @@
         "type": "object",
         "required": ["address", "name"],
         "properties": {
-          "address": { "type": "string" },
-          "name": { "type": "string" },
-          "description": { "type": "string" }
+          "address": { "type": "string", "pattern": "^G[A-Z2-7]{55}$" },
+          "name": { "type": "string", "minLength": 1, "maxLength": 64 },
+          "description": { "type": "string", "maxLength": 512 }
         }
       },
       "TagList": {
         "type": "object",
-        "required": ["data"],
+        "required": ["items", "total", "page", "limit"],
         "properties": {
-          "data": {
-            "type": "array",
-            "items": { "$ref": "#/components/schemas/Tag" }
-          },
-          "page": { "type": "integer" },
-          "limit": { "type": "integer" },
-          "total": { "type": "integer" }
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/Tag" } },
+          "total": { "type": "integer", "minimum": 0 },
+          "page": { "type": "integer", "minimum": 1 },
+          "limit": { "type": "integer", "minimum": 1 }
         }
       },
-      "Activity": {
+      "ActivityEntry": {
         "type": "object",
         "required": ["id", "type", "createdAt"],
         "properties": {
           "id": { "type": "string" },
           "type": { "type": "string" },
           "address": { "type": "string" },
-          "tagId": { "type": "string" },
           "createdAt": { "type": "string", "format": "date-time" }
         }
       },
       "ActivityList": {
         "type": "object",
-        "required": ["data"],
+        "required": ["items"],
         "properties": {
-          "data": {
-            "type": "array",
-            "items": { "$ref": "#/components/schemas/Activity" }
-          },
-          "nextCursor": { "type": ["string", "null"] },
-          "hasMore": { "type": "boolean" }
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/ActivityEntry" } },
+          "nextCursor": { "type": ["string", "null"] }
         }
       },
       "Stats": {
         "type": "object",
+        "required": ["totalTags", "totalAddresses", "watermark", "refreshStatus"],
         "properties": {
-          "totalTags": { "type": "integer" },
-          "totalAddresses": { "type": "integer" },
-          "totalActivity": { "type": "integer" },
-          "period": { "type": "string" }
+          "totalTags": { "type": "integer", "minimum": 0 },
+          "totalAddresses": { "type": "integer", "minimum": 0 },
+          "watermark": { "$ref": "#/components/schemas/StatsWatermark" },
+          "refreshStatus": { "$ref": "#/components/schemas/StatsRefreshStatus" }
         }
       },
-      "Error": {
+      "StatsWatermark": {
         "type": "object",
-        "required": ["error"],
+        "description": "Source watermark identifying the point in the source data the aggregates were computed from.",
+        "required": ["sourceUpdatedAt"],
         "properties": {
-          "error": { "type": "string" },
-          "message": { "type": "string" },
-          "details": { "type": "object" }
+          "sourceUpdatedAt": { "type": ["string", "null"], "format": "date-time" },
+          "sourceSequence": { "type": ["integer", "null"], "minimum": 0 }
+        }
+      },
+      "StatsRefreshStatus": {
+        "type": "object",
+        "required": ["state"],
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": ["idle", "running", "succeeded", "failed"]
+          },
+          "lastRefreshedAt": { "type": ["string", "null"], "format": "date-time" },
+          "lastError": { "type": ["string", "null"] },
+          "watermark": { "$ref": "#/components/schemas/StatsWatermark" }
         }
       }
     }

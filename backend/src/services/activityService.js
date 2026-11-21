@@ -230,11 +230,151 @@ async function cleanupCompletedRecords(options = {}) {
   return { deleted: result.count, cutoff, batchSize };
 }
 
+/**
+ * In-memory reporting read model for aggregate activity statistics.
+ *
+ * Aggregates are computed from the source `activityLog` table and cached here
+ * so reporting reads never run heavy GROUP BY scans inline against the write
+ * path. Each refresh records a source watermark (the highest activity log id
+ * observed) and a refresh status so consumers can reason about staleness.
+ *
+ * @typedef {Object} ReportingReadModel
+ * @property {Object|null} aggregates
+ * @property {string|null} watermark
+ * @property {'idle'|'refreshing'|'ready'|'failed'} status
+ * @property {Date|null} refreshedAt
+ * @property {string|null} error
+ */
+const reportingReadModel = {
+  aggregates: null,
+  watermark: null,
+  status: 'idle',
+  refreshedAt: null,
+  error: null,
+};
+
+/**
+ * Compute aggregate activity statistics directly from the source table.
+ *
+ * This is the source-of-truth query used both to build the read model and to
+ * prove correctness of the cached aggregates.
+ *
+ * @returns {Promise<{ total: number, byAction: Object, watermark: string|null }>}
+ */
+async function computeSourceAggregates() {
+  const [total, grouped, latest] = await Promise.all([
+    prisma.activityLog.count(),
+    prisma.activityLog.groupBy({
+      by: ['action'],
+      _count: { _all: true },
+    }),
+    prisma.activityLog.findFirst({
+      orderBy: { id: 'desc' },
+      select: { id: true },
+    }),
+  ]);
+
+  const byAction = {};
+  for (const row of grouped) {
+    byAction[row.action] = row._count._all;
+  }
+
+  return {
+    total,
+    byAction,
+    watermark: latest ? latest.id : null,
+  };
+}
+
+/**
+ * Refresh the reporting read model from the source table.
+ *
+ * Runs the aggregation off the payment write path and atomically swaps the
+ * cached aggregates once the source query completes. Concurrent refreshes are
+ * coalesced: if a refresh is already in flight the in-flight promise is
+ * returned instead of starting a second scan.
+ *
+ * @returns {Promise<ReportingReadModel>}
+ */
+let inFlightRefresh = null;
+
+async function refreshReportingReadModel() {
+  if (inFlightRefresh) {
+    return inFlightRefresh;
+  }
+
+  reportingReadModel.status = 'refreshing';
+  reportingReadModel.error = null;
+
+  inFlightRefresh = (async () => {
+    try {
+      const source = await computeSourceAggregates();
+      reportingReadModel.aggregates = {
+        total: source.total,
+        byAction: source.byAction,
+      };
+      reportingReadModel.watermark = source.watermark;
+      reportingReadModel.refreshedAt = new Date();
+      reportingReadModel.status = 'ready';
+    } catch (err) {
+      reportingReadModel.status = 'failed';
+      reportingReadModel.error = err && err.message ? err.message : String(err);
+    } finally {
+      inFlightRefresh = null;
+    }
+
+    return getReportingStatus();
+  })();
+
+  return inFlightRefresh;
+}
+
+/**
+ * Read the current reporting read model status and aggregates.
+ *
+ * @returns {{ status: string, watermark: string|null, refreshedAt: Date|null, error: string|null, aggregates: Object|null }}
+ */
+function getReportingStatus() {
+  return {
+    status: reportingReadModel.status,
+    watermark: reportingReadModel.watermark,
+    refreshedAt: reportingReadModel.refreshedAt,
+    error: reportingReadModel.error,
+    aggregates: reportingReadModel.aggregates,
+  };
+}
+
+/**
+ * Verify the cached read model aggregates against a fresh source query.
+ *
+ * @returns {Promise<{ matches: boolean, source: Object, cached: Object|null, watermark: string|null }>}
+ */
+async function verifyReportingReadModel() {
+  const source = await computeSourceAggregates();
+  const cached = reportingReadModel.aggregates;
+
+  const matches =
+    cached !== null &&
+    cached.total === source.total &&
+    JSON.stringify(cached.byAction) === JSON.stringify(source.byAction);
+
+  return {
+    matches,
+    source: { total: source.total, byAction: source.byAction },
+    cached,
+    watermark: source.watermark,
+  };
+}
+
 module.exports = {
   log,
   logMany,
   listByUser,
   cleanupCompletedRecords,
+  computeSourceAggregates,
+  refreshReportingReadModel,
+  getReportingStatus,
+  verifyReportingReadModel,
   DEFAULT_RETENTION_DAYS,
   DEFAULT_CLEANUP_BATCH_SIZE,
   MAX_CLEANUP_BATCH_SIZE,
