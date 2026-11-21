@@ -1,9 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { render, screen, waitFor, cleanup } from '@testing-library/react';
+import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react';
 import App from './App';
 
 const STORAGE_KEY = 'stellar_dashboard_wallet_pubkey';
 const TEST_PUBLIC_KEY = 'GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUV';
+const OTHER_PUBLIC_KEY = 'GZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ';
 
 const mockConnect = vi.fn();
 const mockDisconnect = vi.fn();
@@ -12,6 +13,7 @@ vi.mock('@stellar/freighter-api', () => ({
   isConnected: vi.fn(),
   getPublicKey: vi.fn(),
   requestAccess: vi.fn(),
+  signMessage: vi.fn(),
 }));
 
 import * as freighterApi from '@stellar/freighter-api';
@@ -138,6 +140,97 @@ describe('Payment details ledger-confirmation timeline', () => {
     const finalLabels = await screen.findAllByText(/^final$/i);
     finalLabels.forEach((label) => {
       expect(label.closest('[data-confirmed="true"]')).not.toBeNull();
+    });
+  });
+});
+
+describe('Federation account ownership verification', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  const connectWallet = async () => {
+    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
+    freighterApi.requestAccess.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
+    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
+
+    render(<App />);
+
+    const connectButton = await screen.findByRole('button', { name: /connect/i });
+    connectButton.click();
+
+    await waitFor(() => {
+      expect(localStorage.getItem(STORAGE_KEY)).toBe(TEST_PUBLIC_KEY);
+    });
+  };
+
+  const startVerification = async () => {
+    const startButton = await screen.findByRole('button', { name: /verify ownership/i });
+    startButton.click();
+    return screen.findByTestId('ownership-challenge');
+  };
+
+  it('requests a server-issued challenge for the selected federation account', async () => {
+    await connectWallet();
+
+    const challenge = await startVerification();
+    expect(challenge).toBeTruthy();
+    expect(challenge.getAttribute('data-source')).toBe('server');
+    expect(await screen.findByText(/challenge/i)).toBeTruthy();
+  });
+
+  it('signs the challenge with the wallet and submits the signed proof', async () => {
+    freighterApi.signMessage.mockResolvedValue({ signedMessage: 'signed-proof' });
+    await connectWallet();
+    await startVerification();
+
+    const signButton = await screen.findByRole('button', { name: /sign challenge/i });
+    signButton.click();
+
+    await waitFor(() => {
+      expect(freighterApi.signMessage).toHaveBeenCalled();
+    });
+
+    expect(await screen.findByText(/verified/i)).toBeTruthy();
+  });
+
+  it('surfaces challenge expiry with a retry path', async () => {
+    await connectWallet();
+    await startVerification();
+
+    expect(await screen.findByText(/expired/i)).toBeTruthy();
+    expect(await screen.findByRole('button', { name: /retry|request new challenge/i })).toBeTruthy();
+  });
+
+  it('explains multisig threshold requirements', async () => {
+    await connectWallet();
+    await startVerification();
+
+    expect(await screen.findByText(/threshold/i)).toBeTruthy();
+    expect(await screen.findByText(/signatures? required/i)).toBeTruthy();
+  });
+
+  it('invalidates the proof when the selected account changes', async () => {
+    freighterApi.signMessage.mockResolvedValue({ signedMessage: 'signed-proof' });
+    await connectWallet();
+    await startVerification();
+
+    const signButton = await screen.findByRole('button', { name: /sign challenge/i });
+    signButton.click();
+
+    expect(await screen.findByText(/verified/i)).toBeTruthy();
+
+    const accountSelect = await screen.findByLabelText(/federation account/i);
+    fireEvent.change(accountSelect, { target: { value: OTHER_PUBLIC_KEY } });
+
+    await waitFor(() => {
+      expect(screen.queryByText(/verified/i)).toBeNull();
     });
   });
 });
