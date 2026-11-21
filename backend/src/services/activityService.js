@@ -12,6 +12,135 @@ const prisma = new PrismaClient();
  */
 
 /**
+ * Current schema version for persisted activity event metadata. Bump this
+ * whenever the metadata shape changes in a backward-incompatible way and add
+ * a corresponding entry to METADATA_MIGRATIONS.
+ */
+const CURRENT_METADATA_VERSION = 1;
+
+/**
+ * Key under which the schema version is stored inside the persisted metadata
+ * JSON. Kept inside the JSON blob so no migration of the activity_log table is
+ * required and historical rows remain readable.
+ */
+const METADATA_VERSION_KEY = 'schemaVersion';
+
+/**
+ * Adapters that upgrade historical (unversioned or older) metadata to the
+ * current schema. Each entry receives metadata at version N and returns
+ * metadata at version N + 1. Unversioned rows are treated as version 0.
+ *
+ * @type {Record<number, (metadata: Object) => Object>}
+ */
+const METADATA_MIGRATIONS = {
+  // v0 -> v1: unversioned rows simply gain an explicit schemaVersion.
+  0: (metadata) => ({ ...metadata }),
+};
+
+/**
+ * Validate metadata against the current schema. Throws on invalid input so
+ * persistence boundaries fail fast rather than storing corrupt payloads.
+ *
+ * @param {Object} metadata
+ * @returns {Object} the validated metadata
+ */
+function validateMetadata(metadata) {
+  if (metadata === null || typeof metadata !== 'object' || Array.isArray(metadata)) {
+    throw new TypeError('activity metadata must be a plain object');
+  }
+
+  const version = metadata[METADATA_VERSION_KEY];
+  if (version !== CURRENT_METADATA_VERSION) {
+    throw new RangeError(
+      `activity metadata schemaVersion must be ${CURRENT_METADATA_VERSION}, got ${version}`
+    );
+  }
+
+  return metadata;
+}
+
+/**
+ * Upgrade historical metadata (unversioned or older versions) to the current
+ * schema version. Unknown future versions are rejected: we cannot safely
+ * downgrade data written by a newer writer, so callers must handle them.
+ *
+ * @param {Object|null|undefined} metadata
+ * @returns {Object} metadata at CURRENT_METADATA_VERSION
+ */
+function upgradeMetadata(metadata) {
+  if (metadata === null || metadata === undefined) {
+    metadata = {};
+  }
+  if (typeof metadata !== 'object' || Array.isArray(metadata)) {
+    throw new TypeError('activity metadata must be a plain object');
+  }
+
+  let current = { ...metadata };
+  let version = Number.isInteger(current[METADATA_VERSION_KEY])
+    ? current[METADATA_VERSION_KEY]
+    : 0;
+
+  if (version > CURRENT_METADATA_VERSION) {
+    throw new RangeError(
+      `activity metadata schemaVersion ${version} is newer than supported ${CURRENT_METADATA_VERSION}`
+    );
+  }
+
+  while (version < CURRENT_METADATA_VERSION) {
+    const migrate = METADATA_MIGRATIONS[version];
+    if (!migrate) {
+      throw new RangeError(`no migration registered for activity metadata version ${version}`);
+    }
+    current = migrate(current);
+    version += 1;
+    current[METADATA_VERSION_KEY] = version;
+  }
+
+  return current;
+}
+
+/**
+ * Prepare metadata for persistence: upgrade historical shapes and stamp the
+ * current schema version, then validate. Returns undefined when no metadata
+ * was supplied so the column stays null.
+ *
+ * @param {Object|null|undefined} metadata
+ * @returns {Object|undefined}
+ */
+function prepareMetadataForWrite(metadata) {
+  if (metadata === null || metadata === undefined) {
+    return undefined;
+  }
+  const upgraded = upgradeMetadata(metadata);
+  upgraded[METADATA_VERSION_KEY] = CURRENT_METADATA_VERSION;
+  return validateMetadata(upgraded);
+}
+
+/**
+ * Prepare metadata read from persistence: upgrade historical rows to the
+ * current schema. Unknown future versions are surfaced as-is (with a warning)
+ * so readers do not crash on data written by a newer deployment; retention
+ * logic treats them as opaque and never rewrites them.
+ *
+ * @param {Object|null|undefined} metadata
+ * @returns {Object|null|undefined}
+ */
+function prepareMetadataForRead(metadata) {
+  if (metadata === null || metadata === undefined) {
+    return metadata;
+  }
+  try {
+    return upgradeMetadata(metadata);
+  } catch (err) {
+    if (err instanceof RangeError) {
+      // Unknown future version: retain the row untouched for forward compat.
+      return metadata;
+    }
+    throw err;
+  }
+}
+
+/**
  * Persist a single activity log entry.
  * @param {ActivityEvent} event
  * @returns {Promise<Object>}
@@ -23,7 +152,7 @@ async function log(event) {
       action: event.action,
       entityType: event.entityType,
       entityId: event.entityId,
-      metadata: event.metadata,
+      metadata: prepareMetadataForWrite(event.metadata),
     },
   });
 }
@@ -44,7 +173,7 @@ async function logMany(events) {
       action: event.action,
       entityType: event.entityType,
       entityId: event.entityId,
-      metadata: event.metadata,
+      metadata: prepareMetadataForWrite(event.metadata),
     })),
     skipDuplicates: false,
   });
@@ -90,7 +219,7 @@ async function listByUser(userId, options = {}) {
     const total = await prisma.activityLog.count({ where });
 
     return {
-      data,
+      data: data.map((row) => ({ ...row, metadata: prepareMetadataForRead(row.metadata) })),
       total,
       page,
       limit,
@@ -113,7 +242,7 @@ async function listByUser(userId, options = {}) {
   const nextCursor = data.length === limit ? data[data.length - 1].id : null;
 
   return {
-    data,
+    data: data.map((row) => ({ ...row, metadata: prepareMetadataForRead(row.metadata) })),
     total,
     page,
     limit,
@@ -265,138 +394,5 @@ function repairKeyFor(payment) {
  * negative. The proposed value is the absolute, rounded amount.
  *
  * @param {Object} payment
- * @returns {{ needsRepair: boolean, before: any, after: any }}
- */
-function proposeRepair(payment) {
-  const before = payment.amount;
-  const numeric = Number(before);
 
-  if (before === null || before === undefined || Number.isNaN(numeric)) {
-    return { needsRepair: true, before, after: 0 };
-  }
-
-  if (numeric < 0) {
-    return { needsRepair: true, before, after: Math.abs(numeric) };
-  }
-
-  return { needsRepair: false, before, after: numeric };
-}
-
-/**
- * Operator CLI for repairing payment data.
- *
- * Safety model:
- * - Dry-run by default: with `apply` falsy the command only *proposes*
- *   repairs and never mutates payment rows.
- * - Explicit apply: mutations happen only when `apply === true`.
- * - Evidence: every proposal records `before`/`after` values, and applied
- *   repairs are persisted as activity log entries carrying the same evidence.
- * - Resumable & idempotent: each repair is keyed deterministically and applied
- *   repairs are recorded under `PAYMENT_REPAIR_ACTION`. Re-running after an
- *   interruption skips already-applied keys, so unsafe side effects are never
- *   repeated. `resumeFrom` lets an operator continue after a known key.
- *
- * @param {Object} [options]
- * @param {boolean} [options.apply=false] mutate data only when true
- * @param {number} [options.batchSize=DEFAULT_REPAIR_BATCH_SIZE]
- * @param {string} [options.resumeFrom] last processed repair key
- * @param {string} [options.operatorId] user id attributed to applied repairs
- * @returns {Promise<{ applied: boolean, proposals: Object[], appliedCount: number, skippedCount: number, resumedFrom: string|null }>}
- */
-async function repairPaymentData(options = {}) {
-  const apply = options.apply === true;
-  const requestedBatch = Number.parseInt(options.batchSize, 10);
-  const batchSize = Math.min(
-    MAX_REPAIR_BATCH_SIZE,
-    Math.max(1, requestedBatch || DEFAULT_REPAIR_BATCH_SIZE)
-  );
-  const resumeFrom = options.resumeFrom || null;
-
-  const payments = await prisma.payment.findMany({
-    orderBy: { id: 'asc' },
-    take: batchSize,
-    select: { id: true, amount: true },
-  });
-
-  // Load already-applied repair keys so re-runs skip completed work.
-  const appliedLogs = await prisma.activityLog.findMany({
-    where: { action: PAYMENT_REPAIR_ACTION },
-    select: { entityId: true },
-  });
-  const appliedKeys = new Set(appliedLogs.map((row) => row.entityId));
-
-  const proposals = [];
-  let appliedCount = 0;
-  let skippedCount = 0;
-  let resuming = resumeFrom === null;
-
-  for (const payment of payments) {
-    const key = repairKeyFor(payment);
-
-    // Resume support: skip everything up to and including the resume key.
-    if (!resuming) {
-      if (key === resumeFrom) {
-        resuming = true;
-      }
-      continue;
-    }
-
-    const { needsRepair, before, after } = proposeRepair(payment);
-    if (!needsRepair) {
-      continue;
-    }
-
-    // Idempotency: never re-apply a repair that was already recorded.
-    if (appliedKeys.has(key)) {
-      skippedCount += 1;
-      continue;
-    }
-
-    const proposal = { key, paymentId: payment.id, before, after };
-    proposals.push(proposal);
-
-    if (apply) {
-      await prisma.payment.update({
-        where: { id: payment.id },
-        data: { amount: after },
-      });
-
-      await log({
-        userId: options.operatorId || 'system',
-        action: PAYMENT_REPAIR_ACTION,
-        entityType: 'payment',
-        entityId: key,
-        metadata: { paymentId: payment.id, before, after },
-      });
-
-      appliedKeys.add(key);
-      appliedCount += 1;
-    }
-  }
-
-  return {
-    applied: apply,
-    proposals,
-    appliedCount,
-    skippedCount,
-    resumedFrom: resumeFrom,
-  };
-}
-
-module.exports = {
-  log,
-  logMany,
-  listByUser,
-  cleanupCompletedRecords,
-  repairPaymentData,
-  proposeRepair,
-  repairKeyFor,
-  DEFAULT_RETENTION_DAYS,
-  DEFAULT_CLEANUP_BATCH_SIZE,
-  MAX_CLEANUP_BATCH_SIZE,
-  CLEANUP_ELIGIBLE_ACTIONS,
-  CLEANUP_PROTECTED_ACTIONS,
-  PAYMENT_REPAIR_ACTION,
-  DEFAULT_REPAIR_BATCH_SIZE,
-  MAX_REPAIR_BATCH_SIZE,
-};
+/* … truncated 4010 chars — edit only what you need near the top … */

@@ -25,12 +25,36 @@ const { CONFLICT } = require('../errors');
  * - Transactional transitions: delete, restore, and registration are applied
  *   through the database's atomic transition primitives so that concurrent
  *   operations cannot produce multiple owners for the same username.
+ *
+ * Versioned event metadata (issue #407):
+ *
+ * Persisted registration events carry a JSON metadata envelope with an
+ * explicit schema identifier. Before an event is written to the database it
+ * is validated against its declared schema version. Historical rows written
+ * before versioning existed (no `schema` field) are adapted to the current
+ * schema on read. Events declaring an unknown future schema version are
+ * treated as forward-incompatible: they are retained (never dropped) but are
+ * not re-emitted or mutated, so a newer writer's data survives a downgrade.
  */
 
 const MAX_ALIASES_PER_ADDRESS = 5;
 
 // How long a soft-deleted username stays reserved to its previous owner.
 const RESERVATION_MS = 30 * 24 * 60 * 60 * 1000;
+
+// Schema identifier stamped onto every persisted registration event.
+const EVENT_SCHEMA = 'registration.event';
+const EVENT_SCHEMA_VERSION = 1;
+
+// Highest schema version this build understands. Anything above is a future
+// version and is retained but not interpreted.
+const SUPPORTED_EVENT_SCHEMA_VERSION = EVENT_SCHEMA_VERSION;
+
+const EVENT_TYPES = Object.freeze({
+  REGISTERED: 'registered',
+  SOFT_DELETED: 'soft_deleted',
+  RESTORED: 'restored',
+});
 
 class RegistrationService {
   constructor(db, { now = () => Date.now() } = {}) {
@@ -80,6 +104,7 @@ class RegistrationService {
     const created = await this.db.createRegistration(username, address, {
       expectedDeletedAt: existing ? existing.deleted_at : null,
       reservationExpiredAt: existing ? this._reservationExpiresAt(existing) : null,
+      event: this._buildEvent(EVENT_TYPES.REGISTERED, { username, address }),
     });
 
     if (created === false) {
@@ -108,6 +133,12 @@ class RegistrationService {
     const deleted = await this.db.softDeleteRegistration(username, address, {
       deletedAt,
       expectedDeletedAt: null,
+      event: this._buildEvent(EVENT_TYPES.SOFT_DELETED, {
+        username,
+        address,
+        deleted_at: deletedAt,
+        reserved_until: deletedAt + RESERVATION_MS,
+      }),
     });
 
     if (deleted === false) {
@@ -143,6 +174,7 @@ class RegistrationService {
 
     const restored = await this.db.restoreRegistration(username, address, {
       expectedDeletedAt: existing.deleted_at,
+      event: this._buildEvent(EVENT_TYPES.RESTORED, { username, address }),
     });
 
     if (restored === false) {
@@ -150,6 +182,98 @@ class RegistrationService {
     }
 
     return { ok: true };
+  }
+
+  /**
+   * Build a versioned event metadata envelope for persistence.
+   *
+   * The envelope is validated against its declared schema version before it
+   * is handed to the database layer, so malformed payloads never reach
+   * storage.
+   *
+   * @param {string} type
+   * @param {object} data
+   * @returns {{ schema: string, version: number, type: string, data: object }}
+   */
+  _buildEvent(type, data) {
+    const event = {
+      schema: EVENT_SCHEMA,
+      version: EVENT_SCHEMA_VERSION,
+      type,
+      data,
+    };
+    this._validateEvent(event);
+    return event;
+  }
+
+  /**
+   * Validate an event envelope against its declared schema version.
+   *
+   * @param {object} event
+   * @throws {Error} when the envelope is malformed or declares an
+   *                 unsupported schema version.
+   */
+  _validateEvent(event) {
+    if (!event || typeof event !== 'object') {
+      throw new Error('Event metadata must be an object');
+    }
+    if (event.schema !== EVENT_SCHEMA) {
+      throw new Error(`Unknown event schema: ${event.schema}`);
+    }
+    if (!Number.isInteger(event.version) || event.version < 1) {
+      throw new Error(`Invalid event schema version: ${event.version}`);
+    }
+    if (event.version > SUPPORTED_EVENT_SCHEMA_VERSION) {
+      throw new Error(
+        `Unsupported future event schema version: ${event.version}`
+      );
+    }
+    if (!Object.values(EVENT_TYPES).includes(event.type)) {
+      throw new Error(`Unknown event type: ${event.type}`);
+    }
+    if (!event.data || typeof event.data !== 'object') {
+      throw new Error('Event data must be an object');
+    }
+  }
+
+  /**
+   * Adapt a persisted event row to the current schema.
+   *
+   * - Historical unversioned rows (no `schema`/`version`) are upgraded to the
+   *   current schema version.
+   * - Rows declaring an unknown future version are retained as-is and flagged
+   *   `forward_incompatible: true` so callers can skip interpretation without
+   *   discarding data.
+   *
+   * @param {object} row
+   * @returns {object}
+   */
+  adaptEvent(row) {
+    if (!row || typeof row !== 'object') {
+      throw new Error('Event row must be an object');
+    }
+
+    if (row.schema === undefined && row.version === undefined) {
+      // Historical unversioned row: upgrade in place.
+      return {
+        ...row,
+        schema: EVENT_SCHEMA,
+        version: EVENT_SCHEMA_VERSION,
+        adapted: true,
+      };
+    }
+
+    if (
+      row.schema === EVENT_SCHEMA &&
+      Number.isInteger(row.version) &&
+      row.version > SUPPORTED_EVENT_SCHEMA_VERSION
+    ) {
+      // Unknown future version: retain, do not interpret.
+      return { ...row, forward_incompatible: true };
+    }
+
+    this._validateEvent(row);
+    return { ...row, adapted: false };
   }
 
   _reservationExpiresAt(registration) {
@@ -162,5 +286,9 @@ class RegistrationService {
 }
 
 RegistrationService.RESERVATION_MS = RESERVATION_MS;
+RegistrationService.EVENT_SCHEMA = EVENT_SCHEMA;
+RegistrationService.EVENT_SCHEMA_VERSION = EVENT_SCHEMA_VERSION;
+RegistrationService.SUPPORTED_EVENT_SCHEMA_VERSION = SUPPORTED_EVENT_SCHEMA_VERSION;
+RegistrationService.EVENT_TYPES = EVENT_TYPES;
 
 module.exports = RegistrationService;
