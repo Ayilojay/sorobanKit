@@ -345,9 +345,7 @@ impl PaymentRouter {
 
     fn action_authority(env: &Env, action: &ActionType) -> Result<Address, Error> {
         match action {
-            ActionType::SetFeeConfig(_, _) | ActionType::SetFeeBps(_) => {
-                Self::fee_authority(env)
-            }
+            ActionType::SetFeeConfig(_, _) | ActionType::SetFeeBps(_) => Self::fee_authority(env),
             _ => Self::require_admin(env),
         }
     }
@@ -359,9 +357,7 @@ impl PaymentRouter {
             {
                 Err(Error::InvalidFeeRate)
             }
-            ActionType::SetFeeBps(fee_bps)
-                if !(0..=Self::BPS_DIVISOR).contains(fee_bps) =>
-            {
+            ActionType::SetFeeBps(fee_bps) if !(0..=Self::BPS_DIVISOR).contains(fee_bps) => {
                 Err(Error::InvalidFeeRate)
             }
             ActionType::SetMinLimit(amount) | ActionType::SetMinAmount(amount)
@@ -369,9 +365,7 @@ impl PaymentRouter {
             {
                 Err(Error::LimitExceeded)
             }
-            ActionType::SetMaxAmount(amount)
-                if *amount <= 0 || *amount > Self::MAX_AMOUNT =>
-            {
+            ActionType::SetMaxAmount(amount) if *amount <= 0 || *amount > Self::MAX_AMOUNT => {
                 Err(Error::LimitExceeded)
             }
             _ => Ok(()),
@@ -814,10 +808,14 @@ impl PaymentRouter {
                 env.storage().instance().set(&DataKey::MinLimit, &min_limit);
             }
             ActionType::SetMinAmount(min_amount) => {
-                env.storage().instance().set(&DataKey::MinAmount, &min_amount);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::MinAmount, &min_amount);
             }
             ActionType::SetMaxAmount(max_amount) => {
-                env.storage().instance().set(&DataKey::MaxAmount, &max_amount);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::MaxAmount, &max_amount);
             }
             ActionType::SetBlacklist(address, blacklisted) => {
                 let blacklist_key = DataKey::Blacklist(address.clone());
@@ -1834,10 +1832,13 @@ mod test {
     fn has_event(env: &Env, expected: Symbol) -> bool {
         let events = env.events().all();
         events.iter().any(|(_, topics, _)| {
-            topics.get(0).map(|raw| {
-                let symbol: Result<Symbol, _> = raw.try_into_val(env);
-                symbol.map(|value| value == expected).unwrap_or(false)
-            }).unwrap_or(false)
+            topics
+                .get(0)
+                .map(|raw| {
+                    let symbol: Result<Symbol, _> = raw.try_into_val(env);
+                    symbol.map(|value| value == expected).unwrap_or(false)
+                })
+                .unwrap_or(false)
         })
     }
 
@@ -2008,10 +2009,7 @@ mod test {
         let pending = client.get_pending_admin_transfer().unwrap();
         assert_eq!(pending.proposed_admin, nominee);
         assert_eq!(pending.action_nonce, nonce);
-        advance_time(
-            &env,
-            pending.expires_at - env.ledger().timestamp(),
-        );
+        advance_time(&env, pending.expires_at - env.ledger().timestamp());
 
         client.accept_admin();
         assert_eq!(client.get_admin(), nominee);
@@ -2057,10 +2055,7 @@ mod test {
         client.expire_admin_transfer();
         assert!(client.get_pending_admin_transfer().is_none());
         assert_eq!(client.get_admin(), admin);
-        assert!(has_event(
-            &env,
-            Symbol::new(&env, "admin_transfer_expired")
-        ));
+        assert!(has_event(&env, Symbol::new(&env, "admin_transfer_expired")));
     }
 
     #[test]
@@ -3262,7 +3257,10 @@ mod test {
         assert_eq!(token_client.balance(&contract_id), remainder);
 
         // Sender's refund ledger must reflect the full remainder.
-        assert_eq!(client.get_refund_balance(&sender, &token_address), remainder);
+        assert_eq!(
+            client.get_refund_balance(&sender, &token_address),
+            remainder
+        );
 
         // A "refunded" event must have been published.
         let events = env.events().all();
@@ -3277,7 +3275,10 @@ mod test {
             };
             t0 == symbol_short!("refunded")
         });
-        assert!(refunded_found, "route_payment should publish a \"refunded\" event on trustline failure");
+        assert!(
+            refunded_found,
+            "route_payment should publish a \"refunded\" event on trustline failure"
+        );
     }
 
     #[test]
@@ -3430,7 +3431,11 @@ mod test {
         execute_after_delay(&client.env, &client, &ActionType::SetFeeBps(150));
         assert_eq!(client.get_fee(), 150);
 
-        execute_after_delay(&client.env, &client, &ActionType::SetGovernance(gov.clone()));
+        execute_after_delay(
+            &client.env,
+            &client,
+            &ActionType::SetGovernance(gov.clone()),
+        );
 
         // Governance controls fee actions after it is installed.
         execute_after_delay(&client.env, &client, &ActionType::SetFeeBps(200));
@@ -3478,7 +3483,11 @@ mod test {
 
         // Must have exactly two dots (MAJOR.MINOR.PATCH).
         let parts: std::vec::Vec<&str> = version_str.split('.').collect();
-        assert_eq!(parts.len(), 3, "version must have three components, got: {version_str}");
+        assert_eq!(
+            parts.len(),
+            3,
+            "version must have three components, got: {version_str}"
+        );
 
         // Each part must be a non-negative integer.
         for part in &parts {
