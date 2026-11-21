@@ -211,6 +211,24 @@
           "403": { "$ref": "#/components/responses/Forbidden" }
         }
       }
+    },
+    "/api/config/batch-limit": {
+      "get": {
+        "tags": ["Stats"],
+        "summary": "Get the maximum supported batch item count",
+        "description": "Returns the configured maximum number of items accepted in a single batch routing request. Batches exceeding this limit are rejected before any state change.",
+        "operationId": "getBatchLimit",
+        "responses": {
+          "200": {
+            "description": "Configured batch item limit",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/BatchLimit" }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -282,70 +300,15 @@
       }
     },
     "schemas": {
-      "Tag": {
+      "BatchLimit": {
         "type": "object",
-        "required": ["id", "address", "name"],
+        "required": ["maxBatchItems"],
         "properties": {
-          "id": { "type": "string" },
-          "address": { "type": "string" },
-          "name": { "type": "string" },
-          "description": { "type": "string" },
-          "createdAt": { "type": "string", "format": "date-time" },
-          "updatedAt": { "type": "string", "format": "date-time" }
-        }
-      },
-      "TagInput": {
-        "type": "object",
-        "required": ["address", "name"],
-        "properties": {
-          "address": { "type": "string" },
-          "name": { "type": "string" },
-          "description": { "type": "string" }
-        }
-      },
-      "TagList": {
-        "type": "object",
-        "required": ["data"],
-        "properties": {
-          "data": {
-            "type": "array",
-            "items": { "$ref": "#/components/schemas/Tag" }
-          },
-          "page": { "type": "integer" },
-          "limit": { "type": "integer" },
-          "total": { "type": "integer" }
-        }
-      },
-      "Activity": {
-        "type": "object",
-        "required": ["id", "type", "createdAt"],
-        "properties": {
-          "id": { "type": "string" },
-          "type": { "type": "string" },
-          "address": { "type": "string" },
-          "tagId": { "type": "string" },
-          "createdAt": { "type": "string", "format": "date-time" }
-        }
-      },
-      "ActivityList": {
-        "type": "object",
-        "required": ["data"],
-        "properties": {
-          "data": {
-            "type": "array",
-            "items": { "$ref": "#/components/schemas/Activity" }
-          },
-          "nextCursor": { "type": ["string", "null"] },
-          "hasMore": { "type": "boolean" }
-        }
-      },
-      "Stats": {
-        "type": "object",
-        "properties": {
-          "totalTags": { "type": "integer" },
-          "totalAddresses": { "type": "integer" },
-          "totalActivity": { "type": "integer" },
-          "period": { "type": "string" }
+          "maxBatchItems": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Maximum number of items accepted in a single batch routing request"
+          }
         }
       },
       "Error": {
@@ -353,8 +316,47 @@
         "required": ["error"],
         "properties": {
           "error": { "type": "string" },
-          "message": { "type": "string" },
-          "details": { "type": "object" }
+          "message": { "type": "string" }
+        }
+      },
+      "Tag": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "address": { "type": "string" },
+          "name": { "type": "string" },
+          "createdAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "TagInput": {
+        "type": "object",
+        "required": ["address", "name"],
+        "properties": {
+          "address": { "type": "string" },
+          "name": { "type": "string" }
+        }
+      },
+      "TagList": {
+        "type": "object",
+        "properties": {
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/Tag" } },
+          "total": { "type": "integer" },
+          "page": { "type": "integer" },
+          "limit": { "type": "integer" }
+        }
+      },
+      "ActivityList": {
+        "type": "object",
+        "properties": {
+          "items": { "type": "array", "items": { "type": "object" } },
+          "nextCursor": { "type": "string", "nullable": true }
+        }
+      },
+      "Stats": {
+        "type": "object",
+        "properties": {
+          "totalTags": { "type": "integer" },
+          "totalAddresses": { "type": "integer" }
         }
       }
     }
