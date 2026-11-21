@@ -9,6 +9,58 @@ const NETWORK_PASSPHRASES = {
   futurenet: 'Test SDF Future Network ; October 2022',
 };
 
+// Versioned Soroban event schemas for payment, refund, and admin/governance actions.
+// Symbols carry a version suffix (e.g. "payment:v1") so consumers can decode old
+// versions while new versions are emitted. Bump EVENT_SCHEMA_VERSION when the
+// payload shape changes and add a matching entry to EVENT_SCHEMAS.
+const EVENT_SCHEMA_VERSION = 1;
+
+const EVENT_SCHEMAS = {
+  payment: {
+    v1: {
+      symbol: 'payment:v1',
+      fields: ['id', 'from', 'to', 'amount', 'asset', 'memo'],
+    },
+  },
+  refund: {
+    v1: {
+      symbol: 'refund:v1',
+      fields: ['id', 'paymentId', 'to', 'amount', 'asset', 'reason'],
+    },
+  },
+  admin: {
+    v1: {
+      symbol: 'admin:v1',
+      fields: ['id', 'action', 'actor', 'target', 'metadata'],
+    },
+  },
+};
+
+function getEventSymbol(category, version = EVENT_SCHEMA_VERSION) {
+  const schema = EVENT_SCHEMAS[category] && EVENT_SCHEMAS[category][`v${version}`];
+  if (!schema) {
+    throw new Error(`Unknown event schema ${category}:v${version}`);
+  }
+  return schema.symbol;
+}
+
+function getEventFields(category, version = EVENT_SCHEMA_VERSION) {
+  const schema = EVENT_SCHEMAS[category] && EVENT_SCHEMAS[category][`v${version}`];
+  if (!schema) {
+    throw new Error(`Unknown event schema ${category}:v${version}`);
+  }
+  return schema.fields.slice();
+}
+
+function buildEventPayload(category, data, version = EVENT_SCHEMA_VERSION) {
+  const fields = getEventFields(category, version);
+  const payload = { version, symbol: getEventSymbol(category, version) };
+  for (const field of fields) {
+    payload[field] = data && data[field] !== undefined ? data[field] : null;
+  }
+  return payload;
+}
+
 function getExpectedPassphrase(network) {
   const key = String(network || '').toLowerCase();
   return NETWORK_PASSPHRASES[key] || null;
@@ -23,7 +75,7 @@ async function verifyNetwork(server, network) {
 
   let root;
   try {
-    root = await server.serverURL ? await fetchRoot(server) : await fetchRoot(server);
+    root = await fetchRoot(server);
   } catch (err) {
     logger.error(`Failed to fetch Horizon root for network verification: ${err.message}`);
     throw err;
@@ -81,4 +133,9 @@ module.exports = {
   verifyNetwork,
   getExpectedPassphrase,
   NETWORK_PASSPHRASES,
+  EVENT_SCHEMA_VERSION,
+  EVENT_SCHEMAS,
+  getEventSymbol,
+  getEventFields,
+  buildEventPayload,
 };
