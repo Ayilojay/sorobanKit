@@ -784,3 +784,6 @@ See [LICENSE](LICENSE).
 
 <!-- handsoff-issue-424 -->
 - #424: Define a renewal strategy for persistent Soroban ledger entries
+
+<!-- handsoff-issue-435 -->
+- #435: Introduce a wallet-provider adapter boundary
