@@ -9,6 +9,11 @@ Use this checklist for every deployment. Do not skip steps.
 - [ ] Required secrets and environment variables are configured
 - [ ] Confirm `MIGRATION_POLICY: strict` is set in `render.yaml` so production
       deploys fail fast on pending migrations instead of starting in `warn` mode
+- [ ] Run the governance contract identity preflight against the candidate
+      governance contract and confirm it reports the expected contract identity
+      (address/version/interface) before any timelocked authority change is
+      scheduled. A candidate whose interface handshake does not match the
+      expected version must be rejected and must not be delegated to.
 
 ## Testnet Deployment
 
