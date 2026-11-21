@@ -230,14 +230,173 @@ async function cleanupCompletedRecords(options = {}) {
   return { deleted: result.count, cutoff, batchSize };
 }
 
+/**
+ * Action recorded when an operator applies a payment data repair. Used to
+ * detect already-applied repairs so re-runs stay idempotent.
+ */
+const PAYMENT_REPAIR_ACTION = 'payment.repair.applied';
+
+/**
+ * Default maximum number of payment records examined per repair run.
+ */
+const DEFAULT_REPAIR_BATCH_SIZE = 200;
+
+/**
+ * Hard upper bound on the repair batch size, regardless of caller input.
+ */
+const MAX_REPAIR_BATCH_SIZE = 2000;
+
+/**
+ * Build a stable, deterministic key for a repair proposal so the same
+ * underlying defect always maps to the same key across runs. This is what
+ * makes resumption idempotent: an applied repair is recorded under this key
+ * and skipped on subsequent runs.
+ *
+ * @param {Object} payment
+ * @returns {string}
+ */
+function repairKeyFor(payment) {
+  return `payment:${payment.id}:amount`;
+}
+
+/**
+ * Determine whether a payment record needs an amount repair. A record is
+ * considered defective when its stored amount is missing, non-numeric, or
+ * negative. The proposed value is the absolute, rounded amount.
+ *
+ * @param {Object} payment
+ * @returns {{ needsRepair: boolean, before: any, after: any }}
+ */
+function proposeRepair(payment) {
+  const before = payment.amount;
+  const numeric = Number(before);
+
+  if (before === null || before === undefined || Number.isNaN(numeric)) {
+    return { needsRepair: true, before, after: 0 };
+  }
+
+  if (numeric < 0) {
+    return { needsRepair: true, before, after: Math.abs(numeric) };
+  }
+
+  return { needsRepair: false, before, after: numeric };
+}
+
+/**
+ * Operator CLI for repairing payment data.
+ *
+ * Safety model:
+ * - Dry-run by default: with `apply` falsy the command only *proposes*
+ *   repairs and never mutates payment rows.
+ * - Explicit apply: mutations happen only when `apply === true`.
+ * - Evidence: every proposal records `before`/`after` values, and applied
+ *   repairs are persisted as activity log entries carrying the same evidence.
+ * - Resumable & idempotent: each repair is keyed deterministically and applied
+ *   repairs are recorded under `PAYMENT_REPAIR_ACTION`. Re-running after an
+ *   interruption skips already-applied keys, so unsafe side effects are never
+ *   repeated. `resumeFrom` lets an operator continue after a known key.
+ *
+ * @param {Object} [options]
+ * @param {boolean} [options.apply=false] mutate data only when true
+ * @param {number} [options.batchSize=DEFAULT_REPAIR_BATCH_SIZE]
+ * @param {string} [options.resumeFrom] last processed repair key
+ * @param {string} [options.operatorId] user id attributed to applied repairs
+ * @returns {Promise<{ applied: boolean, proposals: Object[], appliedCount: number, skippedCount: number, resumedFrom: string|null }>}
+ */
+async function repairPaymentData(options = {}) {
+  const apply = options.apply === true;
+  const requestedBatch = Number.parseInt(options.batchSize, 10);
+  const batchSize = Math.min(
+    MAX_REPAIR_BATCH_SIZE,
+    Math.max(1, requestedBatch || DEFAULT_REPAIR_BATCH_SIZE)
+  );
+  const resumeFrom = options.resumeFrom || null;
+
+  const payments = await prisma.payment.findMany({
+    orderBy: { id: 'asc' },
+    take: batchSize,
+    select: { id: true, amount: true },
+  });
+
+  // Load already-applied repair keys so re-runs skip completed work.
+  const appliedLogs = await prisma.activityLog.findMany({
+    where: { action: PAYMENT_REPAIR_ACTION },
+    select: { entityId: true },
+  });
+  const appliedKeys = new Set(appliedLogs.map((row) => row.entityId));
+
+  const proposals = [];
+  let appliedCount = 0;
+  let skippedCount = 0;
+  let resuming = resumeFrom === null;
+
+  for (const payment of payments) {
+    const key = repairKeyFor(payment);
+
+    // Resume support: skip everything up to and including the resume key.
+    if (!resuming) {
+      if (key === resumeFrom) {
+        resuming = true;
+      }
+      continue;
+    }
+
+    const { needsRepair, before, after } = proposeRepair(payment);
+    if (!needsRepair) {
+      continue;
+    }
+
+    // Idempotency: never re-apply a repair that was already recorded.
+    if (appliedKeys.has(key)) {
+      skippedCount += 1;
+      continue;
+    }
+
+    const proposal = { key, paymentId: payment.id, before, after };
+    proposals.push(proposal);
+
+    if (apply) {
+      await prisma.payment.update({
+        where: { id: payment.id },
+        data: { amount: after },
+      });
+
+      await log({
+        userId: options.operatorId || 'system',
+        action: PAYMENT_REPAIR_ACTION,
+        entityType: 'payment',
+        entityId: key,
+        metadata: { paymentId: payment.id, before, after },
+      });
+
+      appliedKeys.add(key);
+      appliedCount += 1;
+    }
+  }
+
+  return {
+    applied: apply,
+    proposals,
+    appliedCount,
+    skippedCount,
+    resumedFrom: resumeFrom,
+  };
+}
+
 module.exports = {
   log,
   logMany,
   listByUser,
   cleanupCompletedRecords,
+  repairPaymentData,
+  proposeRepair,
+  repairKeyFor,
   DEFAULT_RETENTION_DAYS,
   DEFAULT_CLEANUP_BATCH_SIZE,
   MAX_CLEANUP_BATCH_SIZE,
   CLEANUP_ELIGIBLE_ACTIONS,
   CLEANUP_PROTECTED_ACTIONS,
+  PAYMENT_REPAIR_ACTION,
+  DEFAULT_REPAIR_BATCH_SIZE,
+  MAX_REPAIR_BATCH_SIZE,
 };
