@@ -27,6 +27,14 @@ VITE_BASE_PATH=/app/ npm run build
 
 You can also set `VITE_BASE_PATH` in a local `.env` file (see `.env.example`). The same build can be deployed at any path by rebuilding with the appropriate value.
 
+## Network safety for signing
+
+The dashboard refuses to simulate or sign a transaction when the connected wallet's network does not match the application's configured network, or when either network is unknown.
+
+- The provider network and passphrase are re-verified immediately before a transaction is built and signed.
+- Any detected network change invalidates existing drafts, so a draft created on one network can never be signed on another.
+- Simulation and signing are blocked (with a clear error) for unknown or mismatched networks.
+
 ## Expanding the ESLint configuration
 
 If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.

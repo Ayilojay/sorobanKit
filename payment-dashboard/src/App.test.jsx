@@ -12,6 +12,7 @@ vi.mock('@stellar/freighter-api', () => ({
   isConnected: vi.fn(),
   getPublicKey: vi.fn(),
   requestAccess: vi.fn(),
+  getNetwork: vi.fn(),
 }));
 
 import * as freighterApi from '@stellar/freighter-api';
@@ -69,5 +70,53 @@ describe('App wallet persistence', () => {
     });
 
     expect(await screen.findByRole('button', { name: /connect/i })).toBeTruthy();
+  });
+});
+
+describe('App network mismatch signing guard', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  it('blocks signing when the wallet network differs from the application network', async () => {
+    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
+    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
+    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
+    freighterApi.getNetwork.mockResolvedValue({ network: 'PUBLIC' });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    const signButton = await screen.findByRole('button', { name: /sign/i });
+    signButton.click();
+
+    expect(await screen.findByText(/network mismatch/i)).toBeTruthy();
+  });
+
+  it('blocks signing when the wallet network is unknown', async () => {
+    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
+    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
+    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
+    freighterApi.getNetwork.mockRejectedValue(new Error('Network unavailable'));
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    const signButton = await screen.findByRole('button', { name: /sign/i });
+    signButton.click();
+
+    expect(await screen.findByText(/unknown network/i)).toBeTruthy();
   });
 });
