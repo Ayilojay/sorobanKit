@@ -211,6 +211,42 @@
           "403": { "$ref": "#/components/responses/Forbidden" }
         }
       }
+    },
+    "/api/admin/upgrade-simulations": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Simulate a contract upgrade against a ledger snapshot",
+        "description": "Applies candidate migrations to a synthetic ledger snapshot for a supported state version, runs critical reads and invariant checks, and reports results. Unsupported snapshot layouts or state versions are rejected before any mutation is performed.",
+        "operationId": "simulateUpgrade",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/UpgradeSimulationInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Simulation completed; results of migrations, critical reads, and invariant checks",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/UpgradeSimulationResult" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "422": {
+            "description": "Unsupported snapshot layout or state version; rejected before mutation",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -282,6 +318,14 @@
       }
     },
     "schemas": {
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": { "type": "string" },
+          "message": { "type": "string" }
+        }
+      },
       "Tag": {
         "type": "object",
         "required": ["id", "address", "name"],
@@ -289,54 +333,33 @@
           "id": { "type": "string" },
           "address": { "type": "string" },
           "name": { "type": "string" },
-          "description": { "type": "string" },
-          "createdAt": { "type": "string", "format": "date-time" },
-          "updatedAt": { "type": "string", "format": "date-time" }
+          "createdAt": { "type": "string", "format": "date-time" }
         }
       },
       "TagInput": {
         "type": "object",
         "required": ["address", "name"],
         "properties": {
-          "address": { "type": "string" },
-          "name": { "type": "string" },
-          "description": { "type": "string" }
+          "address": { "type": "string", "pattern": "^G[A-Z2-7]{55}$" },
+          "name": { "type": "string", "minLength": 1, "maxLength": 64 }
         }
       },
       "TagList": {
         "type": "object",
-        "required": ["data"],
+        "required": ["items"],
         "properties": {
-          "data": {
-            "type": "array",
-            "items": { "$ref": "#/components/schemas/Tag" }
-          },
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/Tag" } },
           "page": { "type": "integer" },
           "limit": { "type": "integer" },
           "total": { "type": "integer" }
         }
       },
-      "Activity": {
-        "type": "object",
-        "required": ["id", "type", "createdAt"],
-        "properties": {
-          "id": { "type": "string" },
-          "type": { "type": "string" },
-          "address": { "type": "string" },
-          "tagId": { "type": "string" },
-          "createdAt": { "type": "string", "format": "date-time" }
-        }
-      },
       "ActivityList": {
         "type": "object",
-        "required": ["data"],
+        "required": ["items"],
         "properties": {
-          "data": {
-            "type": "array",
-            "items": { "$ref": "#/components/schemas/Activity" }
-          },
-          "nextCursor": { "type": ["string", "null"] },
-          "hasMore": { "type": "boolean" }
+          "items": { "type": "array", "items": { "type": "object" } },
+          "nextCursor": { "type": ["string", "null"] }
         }
       },
       "Stats": {
@@ -344,17 +367,68 @@
         "properties": {
           "totalTags": { "type": "integer" },
           "totalAddresses": { "type": "integer" },
-          "totalActivity": { "type": "integer" },
-          "period": { "type": "string" }
+          "updatedAt": { "type": "string", "format": "date-time" }
         }
       },
-      "Error": {
+      "UpgradeSimulationInput": {
         "type": "object",
-        "required": ["error"],
+        "required": ["snapshot", "stateVersion"],
         "properties": {
-          "error": { "type": "string" },
-          "message": { "type": "string" },
-          "details": { "type": "object" }
+          "snapshot": {
+            "type": "object",
+            "description": "Synthetic ledger snapshot to simulate against",
+            "required": ["layout"],
+            "properties": {
+              "layout": { "type": "string", "description": "Snapshot layout identifier; unsupported layouts are rejected before mutation" },
+              "entries": { "type": "array", "items": { "type": "object" } }
+            }
+          },
+          "stateVersion": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "State version of the snapshot; must be a supported version"
+          },
+          "migrations": {
+            "type": "array",
+            "description": "Candidate migrations to apply",
+            "items": { "type": "string" }
+          }
+        }
+      },
+      "UpgradeSimulationResult": {
+        "type": "object",
+        "required": ["stateVersion", "applied", "criticalReads", "invariants"],
+        "properties": {
+          "stateVersion": { "type": "integer" },
+          "applied": {
+            "type": "array",
+            "description": "Migrations applied during the simulation",
+            "items": { "type": "string" }
+          },
+          "criticalReads": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name", "ok"],
+              "properties": {
+                "name": { "type": "string" },
+                "ok": { "type": "boolean" },
+                "detail": { "type": "string" }
+              }
+            }
+          },
+          "invariants": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name", "ok"],
+              "properties": {
+                "name": { "type": "string" },
+                "ok": { "type": "boolean" },
+                "detail": { "type": "string" }
+              }
+            }
+          }
         }
       }
     }

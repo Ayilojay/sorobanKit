@@ -230,14 +230,181 @@ async function cleanupCompletedRecords(options = {}) {
   return { deleted: result.count, cutoff, batchSize };
 }
 
+/**
+ * Supported activity-log ledger state versions. Each version maps to the
+ * shape of the `activityLog` records that version produced. Snapshots whose
+ * `stateVersion` is not listed here are rejected before any mutation.
+ */
+const SUPPORTED_STATE_VERSIONS = ['1.0.0', '1.1.0', '2.0.0'];
+
+/**
+ * Candidate migrations keyed by the state version they upgrade FROM. Each
+ * migration is a pure function that receives a snapshot record and returns
+ * the upgraded record (or throws if the record is malformed).
+ */
+const ACTIVITY_MIGRATIONS = {
+  '1.0.0': (record) => ({
+    ...record,
+    metadata: record.metadata || {},
+    entityType: record.entityType || null,
+    entityId: record.entityId || null,
+  }),
+  '1.1.0': (record) => ({
+    ...record,
+    metadata: record.metadata || {},
+  }),
+};
+
+/**
+ * Invariant checks run against a migrated snapshot. Each check returns true
+ * when the invariant holds. A failing check aborts the simulation.
+ */
+const ACTIVITY_INVARIANTS = [
+  {
+    name: 'userId is a non-empty string',
+    check: (record) => typeof record.userId === 'string' && record.userId.length > 0,
+  },
+  {
+    name: 'action is a non-empty string',
+    check: (record) => typeof record.action === 'string' && record.action.length > 0,
+  },
+  {
+    name: 'metadata is an object when present',
+    check: (record) =>
+      record.metadata === undefined ||
+      record.metadata === null ||
+      (typeof record.metadata === 'object' && !Array.isArray(record.metadata)),
+  },
+];
+
+/**
+ * Validate that a snapshot has a supported layout before any mutation.
+ * @param {Object} snapshot
+ * @returns {{ ok: boolean, reason?: string }}
+ */
+function validateSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== 'object') {
+    return { ok: false, reason: 'snapshot must be an object' };
+  }
+  if (!SUPPORTED_STATE_VERSIONS.includes(snapshot.stateVersion)) {
+    return {
+      ok: false,
+      reason: `unsupported stateVersion: ${String(snapshot.stateVersion)}`,
+    };
+  }
+  if (!Array.isArray(snapshot.records)) {
+    return { ok: false, reason: 'snapshot.records must be an array' };
+  }
+  return { ok: true };
+}
+
+/**
+ * Apply candidate migrations to a single snapshot record, walking forward
+ * through each supported version until the latest is reached.
+ * @param {Object} record
+ * @param {string} fromVersion
+ * @returns {Object}
+ */
+function migrateRecord(record, fromVersion) {
+  let current = { ...record };
+  let version = fromVersion;
+  const latest = SUPPORTED_STATE_VERSIONS[SUPPORTED_STATE_VERSIONS.length - 1];
+
+  while (version !== latest) {
+    const migration = ACTIVITY_MIGRATIONS[version];
+    if (!migration) {
+      throw new Error(`no migration path from stateVersion ${version}`);
+    }
+    current = migration(current);
+    const idx = SUPPORTED_STATE_VERSIONS.indexOf(version);
+    version = SUPPORTED_STATE_VERSIONS[idx + 1];
+  }
+
+  return current;
+}
+
+/**
+ * Simulate a contract upgrade against a representative ledger snapshot.
+ *
+ * The simulation:
+ * - Rejects unsupported snapshot layouts / state versions BEFORE mutation.
+ * - Applies candidate migrations to every record in the snapshot.
+ * - Runs critical reads and invariant checks on the migrated records.
+ * - Never touches the live database; operates purely on the supplied snapshot.
+ *
+ * @param {Object} snapshot
+ * @param {string} snapshot.stateVersion
+ * @param {Object[]} snapshot.records
+ * @returns {Promise<{ ok: boolean, stateVersion: string, migrated: Object[], checks: Object[], reason?: string }>}
+ */
+async function simulateUpgrade(snapshot) {
+  const validation = validateSnapshot(snapshot);
+  if (!validation.ok) {
+    return {
+      ok: false,
+      stateVersion: snapshot && snapshot.stateVersion,
+      migrated: [],
+      checks: [],
+      reason: validation.reason,
+    };
+  }
+
+  const migrated = [];
+  const checks = [];
+
+  for (const record of snapshot.records) {
+    let upgraded;
+    try {
+      upgraded = migrateRecord(record, snapshot.stateVersion);
+    } catch (err) {
+      return {
+        ok: false,
+        stateVersion: snapshot.stateVersion,
+        migrated,
+        checks,
+        reason: err.message,
+      };
+    }
+
+    for (const invariant of ACTIVITY_INVARIANTS) {
+      const passed = invariant.check(upgraded);
+      checks.push({ name: invariant.name, passed });
+      if (!passed) {
+        return {
+          ok: false,
+          stateVersion: snapshot.stateVersion,
+          migrated,
+          checks,
+          reason: `invariant failed: ${invariant.name}`,
+        };
+      }
+    }
+
+    migrated.push(upgraded);
+  }
+
+  return {
+    ok: true,
+    stateVersion: snapshot.stateVersion,
+    migrated,
+    checks,
+  };
+}
+
 module.exports = {
   log,
   logMany,
   listByUser,
   cleanupCompletedRecords,
+  simulateUpgrade,
+  validateSnapshot,
+  migrateRecord,
   DEFAULT_RETENTION_DAYS,
   DEFAULT_CLEANUP_BATCH_SIZE,
   MAX_CLEANUP_BATCH_SIZE,
   CLEANUP_ELIGIBLE_ACTIONS,
   CLEANUP_PROTECTED_ACTIONS,
+  SUPPORTED_STATE_VERSIONS,
+  ACTIVITY_MIGRATIONS,
+  ACTIVITY_INVARIANTS,
 };
