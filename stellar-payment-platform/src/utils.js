@@ -24,14 +24,31 @@ function normalizeNameTag(value) {
 }
 
 function validateMemo(memoType, memo) {
-  if (!memoType && !memo) return null;
-  if (memoType && !memo) return 'memo is required when memo_type is provided.';
-  if (!memoType && memo) return 'memo_type is required when memo is provided.';
+  const isMemoEmpty = memo === undefined || memo === null || memo === '';
+  const isTypeEmpty = memoType === undefined || memoType === null || memoType === '';
+
+  if (isTypeEmpty && isMemoEmpty) return null;
+  if (!isTypeEmpty && isMemoEmpty) return 'memo is required when memo_type is provided.';
+  if (isTypeEmpty && !isMemoEmpty) return 'memo_type is required when memo is provided.';
   if (!VALID_MEMO_TYPES.includes(memoType)) {
     return `memo_type must be one of: ${VALID_MEMO_TYPES.join(', ')}.`;
   }
-  if (memoType === 'text' && Buffer.byteLength(memo, 'utf8') > 28) {
-    return 'memo of type text must not exceed 28 bytes.';
+  if (typeof memo !== 'string') {
+    return 'memo must be a string.';
+  }
+  if (memoType === 'text') {
+    // Check if memo contains the replacement character (U+FFFD), which indicates
+    // that invalid UTF-8 bytes were decoded by Node.js. We reject these because
+    // the original client data was not valid UTF-8 and would cause issues with
+    // the Stellar SDK downstream.
+    if (memo.includes('\uFFFD')) {
+      return 'memo of type text must contain valid UTF-8 characters.';
+    }
+    // Validate that when encoded as UTF-8, it doesn't exceed 28 bytes
+    const byteLength = Buffer.byteLength(memo, 'utf8');
+    if (byteLength > 28) {
+      return 'memo of type text must not exceed 28 bytes.';
+    }
   }
   if (memoType === 'id') {
     if (!MEMO_ID_RE.test(memo) || BigInt(memo) > 18446744073709551615n) {
@@ -48,6 +65,26 @@ const USER_DATABASE = {
   'client*localhost': 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
   'lekan*localhost': 'GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ',
 };
+
+// #175 — exponential backoff with jitter for webhook retry scheduling.
+// Delay for `attempt` (1-based) is base * factor^(attempt-1), capped at `max`,
+// then randomised by ±`jitter` (fraction, default 0.1 = ±10%).
+const DEFAULT_RETRY_FACTOR = 2;
+const DEFAULT_RETRY_JITTER = 0.1;
+
+function exponentialDelay(attempt, base, max, jitter = DEFAULT_RETRY_JITTER, factor = DEFAULT_RETRY_FACTOR) {
+  const safeAttempt = Number.isFinite(attempt) && attempt > 0 ? Math.floor(attempt) : 1;
+  const safeBase = Number.isFinite(base) && base > 0 ? base : 0;
+  const safeMax = Number.isFinite(max) && max > 0 ? max : Infinity;
+  const safeFactor = Number.isFinite(factor) && factor > 0 ? factor : DEFAULT_RETRY_FACTOR;
+  const safeJitter = Number.isFinite(jitter) && jitter >= 0 ? jitter : DEFAULT_RETRY_JITTER;
+
+  const raw = safeBase * Math.pow(safeFactor, safeAttempt - 1);
+  const capped = Math.min(raw, safeMax);
+  const spread = capped * safeJitter;
+  const jittered = capped + (Math.random() * 2 - 1) * spread;
+  return Math.max(0, Math.round(jittered));
+}
 
 const shouldFallbackToLocalRegistry = (error) => {
   const code = typeof error?.code === 'string' ? error.code : '';
@@ -68,4 +105,7 @@ module.exports = {
   VALID_MEMO_TYPES,
   USER_DATABASE,
   shouldFallbackToLocalRegistry,
+  exponentialDelay,
+  DEFAULT_RETRY_FACTOR,
+  DEFAULT_RETRY_JITTER,
 };

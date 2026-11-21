@@ -2,6 +2,18 @@
 
 jest.mock('../src/logger', () => ({ logger: require('pino')({ level: 'silent' }) }));
 
+// Stub the Prisma client so seedDatabase() tests never need a real database.
+// The variable name must start with "mock" for Jest's hoisting rules to allow it
+// inside the factory function.
+const mockPrismaClient = {
+  user: { upsert: jest.fn(), deleteMany: jest.fn() },
+  webhook: { upsert: jest.fn(), deleteMany: jest.fn() },
+  paymentIntent: { upsert: jest.fn(), deleteMany: jest.fn() },
+  apiKey: { upsert: jest.fn(), deleteMany: jest.fn() },
+  $disconnect: jest.fn(),
+};
+jest.mock('../prismaClient', () => ({ prisma: mockPrismaClient }));
+
 // The SDK is ESM-only under this jest config, so StrKey is stubbed here the way
 // the rest of the suite stubs it. That keeps the encoder itself out of scope;
 // what the seed owns is the 32-byte payload it hands over, asserted below.
@@ -23,6 +35,7 @@ const {
   buildApiKeys,
   writeSeedData,
   resetSeedData,
+  seedDatabase,
   assertSeedable,
   isLocalDatabase,
   DEFAULT_ALLOWED_HOSTS,
@@ -223,6 +236,27 @@ describe('api keys', () => {
     expect(apiKeys.filter((k) => !k.record.revokedAt)).toHaveLength(1);
     expect(apiKeys.filter((k) => k.record.revokedAt)).toHaveLength(1);
   });
+
+  test('the active key is emitted in the parseable TEST_ADMIN_API_KEY form', () => {
+    const active = apiKeys.filter((k) => !k.record.revokedAt);
+    expect(active).toHaveLength(1);
+
+    const line = `TEST_ADMIN_API_KEY=${active[0].rawKey}`;
+    const parsed = Object.fromEntries(
+      line
+        .split('\n')
+        .filter((l) => l && !l.startsWith('#'))
+        .map((l) => {
+          const idx = l.indexOf('=');
+          return [l.slice(0, idx), l.slice(idx + 1)];
+        }),
+    );
+
+    expect(parsed.TEST_ADMIN_API_KEY).toBe(active[0].rawKey);
+    expect(parsed.TEST_ADMIN_API_KEY).toMatch(/^sk_live_[0-9a-f]+$/);
+    expect(parsed.TEST_ADMIN_API_KEY).toBe(active[0].rawKey);
+    expect(parsed.TEST_ADMIN_API_KEY).not.toBe(apiKeys.find((k) => k.record.revokedAt).rawKey);
+  });
 });
 
 describe('writeSeedData', () => {
@@ -277,6 +311,56 @@ describe('writeSeedData', () => {
     for (const model of ['user', 'webhook', 'paymentIntent', 'apiKey']) {
       expect(second[model].upsert.mock.calls).toEqual(first[model].upsert.mock.calls);
     }
+  });
+
+  test('re-running the seed against the same database is idempotent', async () => {
+    const prisma = mockPrisma();
+
+    await writeSeedData(prisma, data);
+    const firstRun = {
+      user: [...prisma.user.upsert.mock.calls],
+      webhook: [...prisma.webhook.upsert.mock.calls],
+      paymentIntent: [...prisma.paymentIntent.upsert.mock.calls],
+      apiKey: [...prisma.apiKey.upsert.mock.calls],
+    };
+
+    await writeSeedData(prisma, data);
+    const secondRun = {
+      user: prisma.user.upsert.mock.calls.slice(firstRun.user.length),
+      webhook: prisma.webhook.upsert.mock.calls.slice(firstRun.webhook.length),
+      paymentIntent: prisma.paymentIntent.upsert.mock.calls.slice(firstRun.paymentIntent.length),
+      apiKey: prisma.apiKey.upsert.mock.calls.slice(firstRun.apiKey.length),
+    };
+
+    for (const model of ['user', 'webhook', 'paymentIntent', 'apiKey']) {
+      expect(secondRun[model]).toEqual(firstRun[model]);
+    }
+    // Upserts only: a re-run must never create or delete rows.
+    for (const model of ['user', 'webhook', 'paymentIntent', 'apiKey']) {
+      expect(prisma[model].deleteMany).not.toHaveBeenCalled();
+    }
+  });
+
+  test('the active API key is stable across runs so CI can export it', async () => {
+    const active = data.apiKeys.filter((k) => !k.record.revokedAt);
+    expect(active).toHaveLength(1);
+
+    const first = mockPrisma();
+    const second = mockPrisma();
+    await writeSeedData(first, data);
+    await writeSeedData(second, data);
+
+    const activeUpsert = (prisma) =>
+      prisma.apiKey.upsert.mock.calls.find(
+        ([call]) => call.where.keyHash === active[0].record.keyHash,
+      );
+    expect(activeUpsert(second)).toEqual(activeUpsert(first));
+
+    // The raw key handed to CI is the same one the stored hash was derived from.
+    const crypto = require('crypto');
+    expect(active[0].record.keyHash).toBe(
+      crypto.createHash('sha256').update(active[0].rawKey).digest('hex'),
+    );
   });
 
   test('reset deletes only the rows the seed owns', async () => {
@@ -342,5 +426,81 @@ describe('assertSeedable', () => {
       SEED_ALLOWED_HOSTS: 'staging.example.com',
     };
     expect(() => assertSeedable(env)).toThrow(/SEED_ALLOW_REMOTE/);
+  });
+});
+
+// ── Issue #255: seedDatabase --reset flag ─────────────────────────────────────
+// Tests the full orchestration path: assertSeedable → (optional) resetSeedData
+// → writeSeedData.  The prismaClient module is mocked at the top of this file
+// (mockPrismaClient) so no real database is required.
+
+const LOCAL_DB_URL = 'postgresql://postgres:postgres@localhost:5432/stellar_tags_test';
+
+describe('seedDatabase', () => {
+  let origDbUrl;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    origDbUrl = process.env.DATABASE_URL;
+    process.env.DATABASE_URL = LOCAL_DB_URL;
+
+    for (const model of ['user', 'webhook', 'paymentIntent', 'apiKey']) {
+      mockPrismaClient[model].upsert.mockResolvedValue({});
+      mockPrismaClient[model].deleteMany.mockResolvedValue({ count: 0 });
+    }
+    mockPrismaClient.$disconnect.mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    if (origDbUrl === undefined) {
+      delete process.env.DATABASE_URL;
+    } else {
+      process.env.DATABASE_URL = origDbUrl;
+    }
+  });
+
+  test('--reset flag calls deleteMany then upsert for every model', async () => {
+    const callOrder = [];
+    for (const model of ['user', 'webhook', 'paymentIntent', 'apiKey']) {
+      mockPrismaClient[model].deleteMany.mockImplementation(() => {
+        callOrder.push(`${model}.deleteMany`);
+        return Promise.resolve({ count: 0 });
+      });
+      mockPrismaClient[model].upsert.mockImplementation(() => {
+        callOrder.push(`${model}.upsert`);
+        return Promise.resolve({});
+      });
+    }
+
+    await seedDatabase({ reset: true });
+
+    // Every deleteMany must precede the first upsert of the same model.
+    for (const model of ['user', 'webhook', 'paymentIntent', 'apiKey']) {
+      const deleteIdx = callOrder.indexOf(`${model}.deleteMany`);
+      const upsertIdx = callOrder.indexOf(`${model}.upsert`);
+      expect(deleteIdx).toBeGreaterThanOrEqual(0);
+      expect(upsertIdx).toBeGreaterThan(deleteIdx);
+    }
+
+    expect(mockPrismaClient.$disconnect).toHaveBeenCalled();
+  });
+
+  test('without --reset flag skips deleteMany and still upserts', async () => {
+    await seedDatabase({ reset: false });
+
+    for (const model of ['user', 'webhook', 'paymentIntent', 'apiKey']) {
+      expect(mockPrismaClient[model].deleteMany).not.toHaveBeenCalled();
+      expect(mockPrismaClient[model].upsert).toHaveBeenCalled();
+    }
+
+    expect(mockPrismaClient.$disconnect).toHaveBeenCalled();
+  });
+
+  test('--reset with an error in writeSeedData still disconnects', async () => {
+    mockPrismaClient.user.upsert.mockRejectedValue(new Error('db error'));
+
+    await expect(seedDatabase({ reset: true })).rejects.toThrow('db error');
+
+    expect(mockPrismaClient.$disconnect).toHaveBeenCalled();
   });
 });
