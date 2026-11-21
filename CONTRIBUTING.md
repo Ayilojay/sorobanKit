@@ -1,142 +1,81 @@
-# Contributing to Stellar Tags
+# Contributing
 
-Thanks for your interest in improving Stellar Tags! This guide walks you through the development workflow, conventions, and review process so you can get productive quickly.
+Thanks for your interest in contributing! This guide covers local setup, the
+checks we run in CI, and the requirements for building and deploying Soroban
+contracts.
 
-> **Security:** Please do not report security vulnerabilities through public issues or pull requests. See [SECURITY.md](SECURITY.md) for our responsible disclosure process.
+## Getting started
 
-## Prerequisites
+1. Fork and clone the repository.
+2. Install dependencies with your package manager of choice (see the root
+   `package.json` for the supported toolchain).
+3. Create a branch off `main` for your change.
 
-- **Node.js** 18+ and **npm** (for the frontend)
-- **Rust** (stable toolchain) and **Cargo** (for the backend)
-- **Git**
+## Local checks
 
-## Local Setup
+Before opening a pull request, run the focused workspace tests and the
+applicable build, lint, and typecheck commands. Report the exact commands and
+results in the pull request description.
 
-1. Fork the repository and clone your fork:
-   ```bash
-   git clone https://github.com/<your-username>/stellar-tags.git
-   cd stellar-tags
-   ```
-2. Install frontend dependencies:
-   ```bash
-   npm install
-   ```
-3. Build the backend:
-   ```bash
-   cargo build
-   ```
-4. Start the development servers as described in the [README](./README.md).
+## Soroban WASM builds
 
-## Branching Strategy
+Soroban contract WASM artifacts must be **reproducible and hash-verifiable**.
+Anyone building the same source revision with the pinned toolchain must get a
+byte-identical artifact.
 
-- Branch off `main` for all work.
-- Use a descriptive, prefixed branch name:
-  - `feat/<short-description>` for new features
-  - `fix/<short-description>` for bug fixes
-  - `docs/<short-description>` for documentation
-  - `chore/<short-description>` for maintenance
-- Keep branches focused on a single issue or change.
+### Pinned inputs
 
-## Commit Message Format
+WASM builds are pinned to the following inputs. Do not bump these casually —
+changing any of them changes the resulting artifact hash and must be done in a
+dedicated pull request that updates the recorded checksums.
 
-We follow [Conventional Commits](https://www.conventionalcommits.org/):
+- **Rust toolchain**: pinned via `rust-toolchain.toml` (see the file for the
+  exact channel and components). Build with the pinned toolchain, not a
+  locally-installed default.
+- **Soroban SDK**: pinned in the contract crate's `Cargo.toml` / `Cargo.lock`.
+  Commit `Cargo.lock` so dependency resolution is deterministic.
+- **Optimizer**: `stellar contract optimize` from the pinned Stellar CLI
+  version. Record the CLI version alongside the artifact metadata.
 
-```
-<type>(<optional scope>): <short summary>
+### Building
 
-### All workspaces at once
+Build contracts with the pinned toolchain and optimizer, for example:
 
-Run every test suite in sequence from the repo root with a single command:
-
-```bash
-npm run test:all
+```sh
+cargo build --target wasm32-unknown-unknown --release
+stellar contract optimize --wasm target/wasm32-unknown-unknown/release/<contract>.wasm
 ```
 
-This runs the frontend tests, then the backend tests, then the Soroban contract tests (`cargo test`). The command exits non-zero as soon as any suite fails, so a red result always tells you which workspace broke. CI runs this same command in the `test-all` job.
+### Source revision metadata and checksums
 
-### Frontend
+Every built WASM artifact must ship with metadata that makes it verifiable:
 
-```bash
-cd payment-dashboard
-npm test
+- the **source revision** (git commit SHA) the artifact was built from, and
+- the **sha256 checksum** of the final (optimized) WASM.
+
+Emit these alongside the artifact so downstream consumers and the deploy
+pipeline can verify provenance. Do not commit artifacts without their
+metadata.
+
+### Verifying reproducibility
+
+Before deploying, the pipeline rebuilds the contract from the same source
+revision and compares the result against the recorded artifact. The build
+**must fail** if the repeat build is not byte-identical (checksum mismatch).
+
+To verify locally, build twice from a clean checkout and compare checksums:
+
+```sh
+sha256sum target/wasm32-unknown-unknown/release/<contract>.wasm
 ```
 
-Common types: `feat`, `fix`, `docs`, `style`, `refactor`, `test`, `chore`.
+If the checksums differ, the build is not reproducible — investigate the
+toolchain, SDK, or optimizer version before proceeding. Never deploy an
+artifact whose checksum cannot be reproduced.
 
-```bash
-cd stellar-payment-platform
-npm test
-```
+## Pull requests
 
-## Code Style
-
-- **Frontend (TypeScript/JavaScript):** run ESLint before committing:
-  ```bash
-  npm run lint
-  ```
-- **Backend (Rust):** format and lint with Clippy:
-  ```bash
-  cargo fmt
-  cargo clippy -- -D warnings
-  ```
-- Match the existing structure, naming, and patterns in the codebase.
-
-## Pre-commit Hook
-
-This repository uses [Husky](https://typicode.github.io/husky/) to run checks before each commit (see `.husky/pre-commit`). The hook runs:
-
-1. **Lint** — `npm run lint` (ESLint).
-2. **Unit tests** — `npm run test:unit`, which runs Jest against `tests/unit` only (`--testPathPattern=tests/unit --passWithNoTests`).
-
-The hook is intentionally limited to a fast subset of tests so it completes in under 30 seconds on a modern developer machine. Integration and e2e tests, as well as Rust tests, are **not** run in the hook — they are covered by CI. A failing unit test will block the commit; fix the failure (or, if you must, bypass with `git commit --no-verify`, though CI will still enforce the checks).
-
-## Tests
-
-All changes should include or update tests where appropriate. Run the full test suite before opening a PR:
-
-```bash
-cd payment_router
-cargo test
-```
-
-## Instruction and Storage Budgets
-
-Public contract methods on the routing and governance paths are covered by reproducible resource budgets so that regressions are caught before they reach `main`. The budgets record CPU instructions, memory, ledger read/write counts, and entry size for each public method, and are enforced by focused tests in the contract workspace.
-
-### What is recorded
-
-For every public routing and governance method the budget suite captures:
-
-- **CPU instructions** — total instructions consumed by the invocation.
-- **Memory** — peak memory bytes used during execution.
-- **Read/write counts** — number of ledger entries read and written.
-- **Entry size** — serialized size of the largest entry written.
-
-Budgets are stored alongside the contract tests and are deterministic: they are derived from the same inputs on every run, so a diff in the recorded numbers always reflects a real change in behavior.
-
-### Worst-case failures
-
-The budget tests also exercise worst-case scenarios (maximum batch sizes, largest payloads, and full-capacity governance operations) so that the recorded ceilings reflect the true upper bound of each method rather than a best-case path. Expected-failure cases (e.g. exceeding a configured limit) are asserted to fail with the documented error rather than silently consuming unbounded resources.
-
-### Running the budget tests
-
-```bash
-cd payment_router
-cargo test budget
-```
-
-### Updating budgets
-
-If a change intentionally alters resource usage, update the recorded budgets in the same PR and explain the delta in the PR description. CI fails on material regressions against the recorded budgets, so an unexplained increase will block the merge. Keep budget updates in their own commit where practical to make review easier.
-
-## Pull Requests
-
-1. Push your branch to your fork and open a PR against `main`.
-2. Fill out the PR template (`.github/pull_request_template.md`) completely.
-3. Link the issue your PR addresses (e.g. `Closes #123`).
-4. Ensure CI passes and all tests are green.
-5. Respond to review feedback promptly. A maintainer will review and merge once approved.
-
-## Questions?
-
-If anything here is unclear, open an issue or start a discussion — we're happy to help.
+- Keep changes focused and scoped to the linked issue.
+- Include tests covering success, boundary, and expected-failure cases, plus
+  concurrency or recovery behavior where relevant.
+- Update documentation and generated artifacts affected by your change.

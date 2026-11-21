@@ -4,6 +4,13 @@ on:
   push:
     branches: [main]
 
+env:
+  # Pinned toolchain inputs for reproducible Soroban WASM builds.
+  RUST_TOOLCHAIN: "1.81.0"
+  STELLAR_CLI_VERSION: "22.0.1"
+  SOROBAN_SDK_VERSION: "22.0.0"
+  WASM_ARTIFACT: payment_router.wasm
+
 jobs:
   deploy-testnet:
     name: Deploy to Testnet
@@ -17,10 +24,13 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: wasm32-unknown-unknown
 
       - name: Cache cargo registry and build artifacts
@@ -29,10 +39,67 @@ jobs:
           workspaces: ./payment_router
 
       - name: Install Stellar CLI
-        run: cargo install --locked stellar-cli
+        run: cargo install --locked stellar-cli --version "$STELLAR_CLI_VERSION"
+
+      - name: Verify pinned Soroban SDK version
+        run: |
+          if ! grep -Eq 'soroban-sdk[^=]*=\s*\{[^}]*version\s*=\s*"=?${SOROBAN_SDK_VERSION}"' Cargo.toml; then
+            echo "::error::Cargo.toml does not pin soroban-sdk to ${SOROBAN_SDK_VERSION}; reproducible builds require a pinned SDK."
+            exit 1
+          fi
 
       - name: Build contract to WASM
         run: cargo build --target wasm32-unknown-unknown --release
+
+      - name: Optimize WASM
+        run: |
+          stellar contract optimize \
+            --wasm target/wasm32-unknown-unknown/release/payment_router.wasm
+
+      - name: Emit source revision metadata and checksums
+        run: |
+          mkdir -p target/reproducible
+          OPTIMIZED=target/wasm32-unknown-unknown/release/payment_router.optimized.wasm
+          cp "$OPTIMIZED" "target/reproducible/${WASM_ARTIFACT}"
+          SHA256=$(sha256sum "target/reproducible/${WASM_ARTIFACT}" | awk '{print $1}')
+          cat > target/reproducible/build-metadata.json <<EOF
+          {
+            "git_commit": "${GITHUB_SHA}",
+            "git_ref": "${GITHUB_REF}",
+            "rust_toolchain": "${RUST_TOOLCHAIN}",
+            "stellar_cli_version": "${STELLAR_CLI_VERSION}",
+            "soroban_sdk_version": "${SOROBAN_SDK_VERSION}",
+            "wasm_artifact": "${WASM_ARTIFACT}",
+            "sha256": "${SHA256}"
+          }
+          EOF
+          echo "${SHA256}  ${WASM_ARTIFACT}" > target/reproducible/${WASM_ARTIFACT}.sha256
+          cat target/reproducible/build-metadata.json
+
+      - name: Verify reproducible build (byte-identical WASM)
+        run: |
+          FIRST_SHA=$(sha256sum "target/reproducible/${WASM_ARTIFACT}" | awk '{print $1}')
+          cargo clean
+          cargo build --target wasm32-unknown-unknown --release
+          stellar contract optimize \
+            --wasm target/wasm32-unknown-unknown/release/payment_router.wasm
+          SECOND_SHA=$(sha256sum "target/wasm32-unknown-unknown/release/payment_router.optimized.wasm" | awk '{print $1}')
+          echo "First build sha256:  $FIRST_SHA"
+          echo "Second build sha256: $SECOND_SHA"
+          if [ "$FIRST_SHA" != "$SECOND_SHA" ]; then
+            echo "::error::Reproducible build check failed: WASM hashes differ between builds."
+            exit 1
+          fi
+          echo "✅ Repeat builds produced byte-identical WASM ($FIRST_SHA)."
+
+      - name: Upload reproducible WASM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: payment-router-wasm
+          path: |
+            payment_router/target/reproducible/payment_router.wasm
+            payment_router/target/reproducible/payment_router.wasm.sha256
+            payment_router/target/reproducible/build-metadata.json
 
       - name: Deploy to Testnet
         run: |
@@ -44,13 +111,14 @@ jobs:
           
           # Deploy contract
           CONTRACT_ID=$(stellar contract deploy \
-            --wasm target/wasm32-unknown-unknown/release/payment_router.wasm \
+            --wasm target/reproducible/payment_router.wasm \
             --source deployer \
             --network testnet)
           
           # Output to GitHub Step Summary
           echo "### 🚀 Output from Testnet Deployment" >> $GITHUB_STEP_SUMMARY
           echo "**Contract ID**: \`$CONTRACT_ID\`" >> $GITHUB_STEP_SUMMARY
+          echo "**WASM sha256**: \`$(cat target/reproducible/payment_router.wasm.sha256 | awk '{print $1}')\`" >> $GITHUB_STEP_SUMMARY
 
       - name: Post-Deploy Health Check
         env:
@@ -86,4 +154,3 @@ jobs:
           fi
 
           echo "✅ Testnet API is live and healthy (status: up)."
-

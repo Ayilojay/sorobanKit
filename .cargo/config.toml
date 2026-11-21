@@ -33,3 +33,26 @@ rustflags = [
   "-Aclippy::map_unwrap_or",
   "-Aclippy::ignore_without_reason",
 ]
+
+# Reproducible Soroban WASM builds (issue #429).
+#
+# The release profile is pinned so that the optimizer and the Rust compiler
+# produce byte-identical artifacts across machines and CI runs. Any change to
+# these knobs is a build-input change and must be accompanied by a regenerated
+# checksum manifest (see `scripts/verify-wasm.sh`).
+[profile.release]
+opt-level = "z"
+codegen-units = 1
+lto = true
+debug = false
+strip = "symbols"
+panic = "abort"
+overflow-checks = true
+incremental = false
+
+# Pin the target used for Soroban contract builds so the toolchain resolves the
+# same std/core artifacts everywhere. `wasm32-unknown-unknown` is the only
+# target the Soroban optimizer accepts.
+[build.target]
+# (intentionally left unset here; the build script passes `--target` explicitly
+# so host-side `cargo test` keeps working. See `scripts/build-wasm.sh`.)
