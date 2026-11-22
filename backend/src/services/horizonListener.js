@@ -29,7 +29,7 @@ async function verifyNetwork(server, network) {
 
   let root;
   try {
-    root = await server.serverURL ? await fetchRoot(server) : await fetchRoot(server);
+    root = await fetchRoot(server);
   } catch (err) {
     logger.error(`Failed to fetch Horizon root for network verification: ${err.message}`);
     throw err;
@@ -178,6 +178,19 @@ function handlePayment(payment, config) {
       logger.error(`Error recording reporting watermark: ${err.message}`);
     }
   }
+}
+
+// Emit exactly one receipt for a successful routed payment and none on failure.
+// Returns the receipt on success, or null when the payment did not succeed.
+function emitReceipt(payment, config) {
+  if (!payment || payment.successful === false) {
+    return null;
+  }
+  const receipt = buildReceipt(payment);
+  if (config && typeof config.onReceipt === 'function') {
+    config.onReceipt(receipt);
+  }
+  return receipt;
 }
 
 module.exports = {

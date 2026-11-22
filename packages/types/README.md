@@ -22,6 +22,43 @@ const balance = await contract.get_refund_balance({ user, token });
 
 These already require auth and are unchanged.
 
+## Versioned event schemas
+
+Soroban events emitted by the contract are versioned so consumers can decode
+payloads across contract upgrades. Each event symbol carries a `_v<N>` suffix
+and the payload is a versioned struct. New versions are additive: the contract
+emits the latest version, and consumers must continue to decode older versions.
+
+### Payment events
+
+| Symbol | Payload |
+| --- | --- |
+| `payment_v1` | `{ user: Address, token: Address, amount: i128 }` |
+| `payment_v2` | `{ user: Address, token: Address, amount: i128, memo: Option<Bytes> }` |
+
+### Refund events
+
+| Symbol | Payload |
+| --- | --- |
+| `refund_v1` | `{ user: Address, token: Address, amount: i128 }` |
+| `refund_v2` | `{ user: Address, token: Address, amount: i128, reason: Option<Bytes> }` |
+
+### Admin / governance events
+
+| Symbol | Payload |
+| --- | --- |
+| `admin_v1` | `{ action: Symbol, actor: Address }` |
+| `admin_v2` | `{ action: Symbol, actor: Address, target: Option<Address> }` |
+
+### Compatibility
+
+- The `_v<N>` suffix is part of the event symbol; parsers should match on the
+  base name and read the trailing version rather than matching exact strings.
+- Payload fields are only ever added, never removed or reordered, so a decoder
+  for `_v1` remains valid for `_v2` payloads (extra fields are ignored).
+- Parser fixtures under the contract test suite cover both `_v1` and `_v2`
+  symbols for payment, refund, and admin events.
+
 ## Regenerating bindings
 
 After contract changes, regenerate the TypeScript bindings so the client
