@@ -324,7 +324,7 @@
       "CursorParam": {
         "name": "cursor",
         "in": "query",
-        "description": "Opaque cursor for cursor-based pagination",
+        "description": "Opaque cursor for pagination",
         "schema": { "type": "string" }
       },
       "TagIdParam": {
@@ -338,33 +338,48 @@
         "name": "address",
         "in": "path",
         "required": true,
-        "description": "Stellar account address (G...)",
-        "schema": { "type": "string", "pattern": "^G[A-Z2-7]{55}$" }
+        "description": "Stellar account address",
+        "schema": { "type": "string" }
+      },
+      "TokenParam": {
+        "name": "token",
+        "in": "path",
+        "required": true,
+        "description": "Token identifier (asset code or contract address)",
+        "schema": { "type": "string" }
       }
     },
     "responses": {
       "BadRequest": {
         "description": "Invalid request",
         "content": {
-          "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
         }
       },
       "Unauthorized": {
         "description": "Authentication required or invalid credentials",
         "content": {
-          "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
         }
       },
       "Forbidden": {
         "description": "Authenticated but not permitted (e.g. not the original owner)",
         "content": {
-          "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
         }
       },
       "NotFound": {
         "description": "Resource not found",
         "content": {
-          "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
         }
       },
       "Conflict": {

@@ -841,3 +841,6 @@ See [LICENSE](LICENSE).
 
 <!-- handsoff-issue-424 -->
 - #424: Define a renewal strategy for persistent Soroban ledger entries
+
+<!-- handsoff-issue-414 -->
+- #414: Verify refund liabilities remain fully backed by token balances
