@@ -12,6 +12,135 @@ const prisma = new PrismaClient();
  */
 
 /**
+ * Current schema version for persisted activity event metadata. Bump this
+ * whenever the metadata shape changes in a backward-incompatible way and add
+ * a corresponding entry to METADATA_MIGRATIONS.
+ */
+const CURRENT_METADATA_VERSION = 1;
+
+/**
+ * Key under which the schema version is stored inside the persisted metadata
+ * JSON. Kept inside the JSON blob so no migration of the activity_log table is
+ * required and historical rows remain readable.
+ */
+const METADATA_VERSION_KEY = 'schemaVersion';
+
+/**
+ * Adapters that upgrade historical (unversioned or older) metadata to the
+ * current schema. Each entry receives metadata at version N and returns
+ * metadata at version N + 1. Unversioned rows are treated as version 0.
+ *
+ * @type {Record<number, (metadata: Object) => Object>}
+ */
+const METADATA_MIGRATIONS = {
+  // v0 -> v1: unversioned rows simply gain an explicit schemaVersion.
+  0: (metadata) => ({ ...metadata }),
+};
+
+/**
+ * Validate metadata against the current schema. Throws on invalid input so
+ * persistence boundaries fail fast rather than storing corrupt payloads.
+ *
+ * @param {Object} metadata
+ * @returns {Object} the validated metadata
+ */
+function validateMetadata(metadata) {
+  if (metadata === null || typeof metadata !== 'object' || Array.isArray(metadata)) {
+    throw new TypeError('activity metadata must be a plain object');
+  }
+
+  const version = metadata[METADATA_VERSION_KEY];
+  if (version !== CURRENT_METADATA_VERSION) {
+    throw new RangeError(
+      `activity metadata schemaVersion must be ${CURRENT_METADATA_VERSION}, got ${version}`
+    );
+  }
+
+  return metadata;
+}
+
+/**
+ * Upgrade historical metadata (unversioned or older versions) to the current
+ * schema version. Unknown future versions are rejected: we cannot safely
+ * downgrade data written by a newer writer, so callers must handle them.
+ *
+ * @param {Object|null|undefined} metadata
+ * @returns {Object} metadata at CURRENT_METADATA_VERSION
+ */
+function upgradeMetadata(metadata) {
+  if (metadata === null || metadata === undefined) {
+    metadata = {};
+  }
+  if (typeof metadata !== 'object' || Array.isArray(metadata)) {
+    throw new TypeError('activity metadata must be a plain object');
+  }
+
+  let current = { ...metadata };
+  let version = Number.isInteger(current[METADATA_VERSION_KEY])
+    ? current[METADATA_VERSION_KEY]
+    : 0;
+
+  if (version > CURRENT_METADATA_VERSION) {
+    throw new RangeError(
+      `activity metadata schemaVersion ${version} is newer than supported ${CURRENT_METADATA_VERSION}`
+    );
+  }
+
+  while (version < CURRENT_METADATA_VERSION) {
+    const migrate = METADATA_MIGRATIONS[version];
+    if (!migrate) {
+      throw new RangeError(`no migration registered for activity metadata version ${version}`);
+    }
+    current = migrate(current);
+    version += 1;
+    current[METADATA_VERSION_KEY] = version;
+  }
+
+  return current;
+}
+
+/**
+ * Prepare metadata for persistence: upgrade historical shapes and stamp the
+ * current schema version, then validate. Returns undefined when no metadata
+ * was supplied so the column stays null.
+ *
+ * @param {Object|null|undefined} metadata
+ * @returns {Object|undefined}
+ */
+function prepareMetadataForWrite(metadata) {
+  if (metadata === null || metadata === undefined) {
+    return undefined;
+  }
+  const upgraded = upgradeMetadata(metadata);
+  upgraded[METADATA_VERSION_KEY] = CURRENT_METADATA_VERSION;
+  return validateMetadata(upgraded);
+}
+
+/**
+ * Prepare metadata read from persistence: upgrade historical rows to the
+ * current schema. Unknown future versions are surfaced as-is (with a warning)
+ * so readers do not crash on data written by a newer deployment; retention
+ * logic treats them as opaque and never rewrites them.
+ *
+ * @param {Object|null|undefined} metadata
+ * @returns {Object|null|undefined}
+ */
+function prepareMetadataForRead(metadata) {
+  if (metadata === null || metadata === undefined) {
+    return metadata;
+  }
+  try {
+    return upgradeMetadata(metadata);
+  } catch (err) {
+    if (err instanceof RangeError) {
+      // Unknown future version: retain the row untouched for forward compat.
+      return metadata;
+    }
+    throw err;
+  }
+}
+
+/**
  * Persist a single activity log entry.
  * @param {ActivityEvent} event
  * @returns {Promise<Object>}
@@ -23,7 +152,7 @@ async function log(event) {
       action: event.action,
       entityType: event.entityType,
       entityId: event.entityId,
-      metadata: event.metadata,
+      metadata: prepareMetadataForWrite(event.metadata),
     },
   });
 }
@@ -44,7 +173,7 @@ async function logMany(events) {
       action: event.action,
       entityType: event.entityType,
       entityId: event.entityId,
-      metadata: event.metadata,
+      metadata: prepareMetadataForWrite(event.metadata),
     })),
     skipDuplicates: false,
   });
@@ -90,7 +219,7 @@ async function listByUser(userId, options = {}) {
     const total = await prisma.activityLog.count({ where });
 
     return {
-      data,
+      data: data.map((row) => ({ ...row, metadata: prepareMetadataForRead(row.metadata) })),
       total,
       page,
       limit,
@@ -113,7 +242,7 @@ async function listByUser(userId, options = {}) {
   const nextCursor = data.length === limit ? data[data.length - 1].id : null;
 
   return {
-    data,
+    data: data.map((row) => ({ ...row, metadata: prepareMetadataForRead(row.metadata) })),
     total,
     page,
     limit,
@@ -231,180 +360,39 @@ async function cleanupCompletedRecords(options = {}) {
 }
 
 /**
- * Supported activity-log ledger state versions. Each version maps to the
- * shape of the `activityLog` records that version produced. Snapshots whose
- * `stateVersion` is not listed here are rejected before any mutation.
+ * Action recorded when an operator applies a payment data repair. Used to
+ * detect already-applied repairs so re-runs stay idempotent.
  */
-const SUPPORTED_STATE_VERSIONS = ['1.0.0', '1.1.0', '2.0.0'];
+const PAYMENT_REPAIR_ACTION = 'payment.repair.applied';
 
 /**
- * Candidate migrations keyed by the state version they upgrade FROM. Each
- * migration is a pure function that receives a snapshot record and returns
- * the upgraded record (or throws if the record is malformed).
+ * Default maximum number of payment records examined per repair run.
  */
-const ACTIVITY_MIGRATIONS = {
-  '1.0.0': (record) => ({
-    ...record,
-    metadata: record.metadata || {},
-    entityType: record.entityType || null,
-    entityId: record.entityId || null,
-  }),
-  '1.1.0': (record) => ({
-    ...record,
-    metadata: record.metadata || {},
-  }),
-};
+const DEFAULT_REPAIR_BATCH_SIZE = 200;
 
 /**
- * Invariant checks run against a migrated snapshot. Each check returns true
- * when the invariant holds. A failing check aborts the simulation.
+ * Hard upper bound on the repair batch size, regardless of caller input.
  */
-const ACTIVITY_INVARIANTS = [
-  {
-    name: 'userId is a non-empty string',
-    check: (record) => typeof record.userId === 'string' && record.userId.length > 0,
-  },
-  {
-    name: 'action is a non-empty string',
-    check: (record) => typeof record.action === 'string' && record.action.length > 0,
-  },
-  {
-    name: 'metadata is an object when present',
-    check: (record) =>
-      record.metadata === undefined ||
-      record.metadata === null ||
-      (typeof record.metadata === 'object' && !Array.isArray(record.metadata)),
-  },
-];
+const MAX_REPAIR_BATCH_SIZE = 2000;
 
 /**
- * Validate that a snapshot has a supported layout before any mutation.
- * @param {Object} snapshot
- * @returns {{ ok: boolean, reason?: string }}
- */
-function validateSnapshot(snapshot) {
-  if (!snapshot || typeof snapshot !== 'object') {
-    return { ok: false, reason: 'snapshot must be an object' };
-  }
-  if (!SUPPORTED_STATE_VERSIONS.includes(snapshot.stateVersion)) {
-    return {
-      ok: false,
-      reason: `unsupported stateVersion: ${String(snapshot.stateVersion)}`,
-    };
-  }
-  if (!Array.isArray(snapshot.records)) {
-    return { ok: false, reason: 'snapshot.records must be an array' };
-  }
-  return { ok: true };
-}
-
-/**
- * Apply candidate migrations to a single snapshot record, walking forward
- * through each supported version until the latest is reached.
- * @param {Object} record
- * @param {string} fromVersion
- * @returns {Object}
- */
-function migrateRecord(record, fromVersion) {
-  let current = { ...record };
-  let version = fromVersion;
-  const latest = SUPPORTED_STATE_VERSIONS[SUPPORTED_STATE_VERSIONS.length - 1];
-
-  while (version !== latest) {
-    const migration = ACTIVITY_MIGRATIONS[version];
-    if (!migration) {
-      throw new Error(`no migration path from stateVersion ${version}`);
-    }
-    current = migration(current);
-    const idx = SUPPORTED_STATE_VERSIONS.indexOf(version);
-    version = SUPPORTED_STATE_VERSIONS[idx + 1];
-  }
-
-  return current;
-}
-
-/**
- * Simulate a contract upgrade against a representative ledger snapshot.
+ * Build a stable, deterministic key for a repair proposal so the same
+ * underlying defect always maps to the same key across runs. This is what
+ * makes resumption idempotent: an applied repair is recorded under this key
+ * and skipped on subsequent runs.
  *
- * The simulation:
- * - Rejects unsupported snapshot layouts / state versions BEFORE mutation.
- * - Applies candidate migrations to every record in the snapshot.
- * - Runs critical reads and invariant checks on the migrated records.
- * - Never touches the live database; operates purely on the supplied snapshot.
- *
- * @param {Object} snapshot
- * @param {string} snapshot.stateVersion
- * @param {Object[]} snapshot.records
- * @returns {Promise<{ ok: boolean, stateVersion: string, migrated: Object[], checks: Object[], reason?: string }>}
+ * @param {Object} payment
+ * @returns {string}
  */
-async function simulateUpgrade(snapshot) {
-  const validation = validateSnapshot(snapshot);
-  if (!validation.ok) {
-    return {
-      ok: false,
-      stateVersion: snapshot && snapshot.stateVersion,
-      migrated: [],
-      checks: [],
-      reason: validation.reason,
-    };
-  }
-
-  const migrated = [];
-  const checks = [];
-
-  for (const record of snapshot.records) {
-    let upgraded;
-    try {
-      upgraded = migrateRecord(record, snapshot.stateVersion);
-    } catch (err) {
-      return {
-        ok: false,
-        stateVersion: snapshot.stateVersion,
-        migrated,
-        checks,
-        reason: err.message,
-      };
-    }
-
-    for (const invariant of ACTIVITY_INVARIANTS) {
-      const passed = invariant.check(upgraded);
-      checks.push({ name: invariant.name, passed });
-      if (!passed) {
-        return {
-          ok: false,
-          stateVersion: snapshot.stateVersion,
-          migrated,
-          checks,
-          reason: `invariant failed: ${invariant.name}`,
-        };
-      }
-    }
-
-    migrated.push(upgraded);
-  }
-
-  return {
-    ok: true,
-    stateVersion: snapshot.stateVersion,
-    migrated,
-    checks,
-  };
+function repairKeyFor(payment) {
+  return `payment:${payment.id}:amount`;
 }
 
-module.exports = {
-  log,
-  logMany,
-  listByUser,
-  cleanupCompletedRecords,
-  simulateUpgrade,
-  validateSnapshot,
-  migrateRecord,
-  DEFAULT_RETENTION_DAYS,
-  DEFAULT_CLEANUP_BATCH_SIZE,
-  MAX_CLEANUP_BATCH_SIZE,
-  CLEANUP_ELIGIBLE_ACTIONS,
-  CLEANUP_PROTECTED_ACTIONS,
-  SUPPORTED_STATE_VERSIONS,
-  ACTIVITY_MIGRATIONS,
-  ACTIVITY_INVARIANTS,
-};
+/**
+ * Determine whether a payment record needs an amount repair. A record is
+ * considered defective when its stored amount is missing, non-numeric, or
+ * negative. The proposed value is the absolute, rounded amount.
+ *
+ * @param {Object} payment
+
+/* … truncated 4010 chars — edit only what you need near the top … */

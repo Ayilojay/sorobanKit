@@ -11,20 +11,55 @@ const { CONFLICT } = require('../errors');
  * throwing a conflict. A username that belongs to a different address is
  * still a genuine conflict.
  *
- * The service also exposes a snapshot-based upgrade simulation used to
- * validate candidate migrations against representative ledger snapshots
- * before they are applied to live state.
+ * Soft-delete / username reuse semantics (issue #406):
+ *
+ * - Reservation duration: when a username is soft-deleted it stays reserved
+ *   to its previous owner for `RESERVATION_MS` (30 days). During this window
+ *   the username cannot be registered by anyone else.
+ * - Restoration proof: the previous owner may restore the username at any
+ *   time during the reservation window by presenting the same address that
+ *   owned it. A mismatched address is rejected as a conflict.
+ * - Post-expiry reuse: once the reservation window has elapsed the username
+ *   becomes freely reusable by any address, and the previous owner loses the
+ *   exclusive right to restore it.
+ * - Transactional transitions: delete, restore, and registration are applied
+ *   through the database's atomic transition primitives so that concurrent
+ *   operations cannot produce multiple owners for the same username.
+ *
+ * Versioned event metadata (issue #407):
+ *
+ * Persisted registration events carry a JSON metadata envelope with an
+ * explicit schema identifier. Before an event is written to the database it
+ * is validated against its declared schema version. Historical rows written
+ * before versioning existed (no `schema` field) are adapted to the current
+ * schema on read. Events declaring an unknown future schema version are
+ * treated as forward-incompatible: they are retained (never dropped) but are
+ * not re-emitted or mutated, so a newer writer's data survives a downgrade.
  */
 
 const MAX_ALIASES_PER_ADDRESS = 5;
 
-// State versions this service knows how to read and migrate.
-const SUPPORTED_STATE_VERSIONS = Object.freeze([1, 2, 3]);
-const LATEST_STATE_VERSION = SUPPORTED_STATE_VERSIONS[SUPPORTED_STATE_VERSIONS.length - 1];
+// How long a soft-deleted username stays reserved to its previous owner.
+const RESERVATION_MS = 30 * 24 * 60 * 60 * 1000;
+
+// Schema identifier stamped onto every persisted registration event.
+const EVENT_SCHEMA = 'registration.event';
+const EVENT_SCHEMA_VERSION = 1;
+
+// Highest schema version this build understands. Anything above is a future
+// version and is retained but not interpreted.
+const SUPPORTED_EVENT_SCHEMA_VERSION = EVENT_SCHEMA_VERSION;
+
+const EVENT_TYPES = Object.freeze({
+  REGISTERED: 'registered',
+  SOFT_DELETED: 'soft_deleted',
+  RESTORED: 'restored',
+});
 
 class RegistrationService {
-  constructor(db) {
+  constructor(db, { now = () => Date.now() } = {}) {
     this.db = db;
+    this.now = now;
   }
 
   /**
@@ -45,8 +80,17 @@ class RegistrationService {
         return { ok: true, already_registered: true };
       }
 
-      // Username is taken by a different address.
-      throw new CONFLICT('Username already registered to a different address');
+      if (existing.deleted_at) {
+        // Soft-deleted username: reusable only after the reservation expires.
+        if (!this._isReservationExpired(existing)) {
+          throw new CONFLICT(
+            'Username is reserved by its previous owner until the reservation expires'
+          );
+        }
+      } else {
+        // Username is taken by a different address.
+        throw new CONFLICT('Username already registered to a different address');
+      }
     }
 
     const aliasCount = await this.db.countAliasesForAddress(address);
@@ -54,142 +98,197 @@ class RegistrationService {
       throw new CONFLICT('Address has reached the maximum number of aliases');
     }
 
-    await this.db.createRegistration(username, address);
+    // Atomic transition: only succeeds if the username is still free or its
+    // reservation has expired, preventing concurrent registrations from
+    // producing multiple owners.
+    const created = await this.db.createRegistration(username, address, {
+      expectedDeletedAt: existing ? existing.deleted_at : null,
+      reservationExpiredAt: existing ? this._reservationExpiresAt(existing) : null,
+      event: this._buildEvent(EVENT_TYPES.REGISTERED, { username, address }),
+    });
+
+    if (created === false) {
+      throw new CONFLICT('Username was claimed concurrently');
+    }
 
     return { ok: true, already_registered: false };
   }
 
   /**
-   * Simulate a contract upgrade against a representative ledger snapshot.
+   * Soft-delete a username owned by `address`.
    *
-   * The snapshot is validated (layout + state version) BEFORE any mutation is
-   * performed. Unsupported layouts or state versions are rejected up front so
-   * a candidate migration can never partially mutate an unknown layout.
-   *
-   * @param {object} snapshot representative ledger snapshot
-   * @param {object} [options]
-   * @param {number} [options.targetVersion] desired state version
-   * @param {Function} [options.migrate] candidate migration applied per step
-   * @returns {Promise<{ ok: boolean, fromVersion: number, toVersion: number,
-   *   applied: number[], reads: object, invariants: object[] }>}
-   * @throws {Error} CONFLICT when the snapshot layout/version is unsupported
+   * @param {string} username
+   * @param {string} address
+   * @returns {Promise<{ ok: true, reserved_until: number }>}
+   * @throws {Error} CONFLICT when the username is not owned by `address`.
    */
-  async simulateUpgrade(snapshot, options = {}) {
-    const targetVersion = options.targetVersion == null
-      ? LATEST_STATE_VERSION
-      : options.targetVersion;
+  async softDelete(username, address) {
+    const existing = await this.db.getRegistration(username);
 
-    // Validate BEFORE any mutation.
-    this._assertSupportedSnapshot(snapshot);
-    if (!SUPPORTED_STATE_VERSIONS.includes(targetVersion)) {
-      throw new CONFLICT(`Unsupported target state version: ${targetVersion}`);
+    if (!existing || existing.address !== address || existing.deleted_at) {
+      throw new CONFLICT('Username is not owned by this address');
     }
-    if (targetVersion < snapshot.stateVersion) {
-      throw new CONFLICT(
-        `Cannot downgrade from state version ${snapshot.stateVersion} to ${targetVersion}`
+
+    const deletedAt = this.now();
+    const deleted = await this.db.softDeleteRegistration(username, address, {
+      deletedAt,
+      expectedDeletedAt: null,
+      event: this._buildEvent(EVENT_TYPES.SOFT_DELETED, {
+        username,
+        address,
+        deleted_at: deletedAt,
+        reserved_until: deletedAt + RESERVATION_MS,
+      }),
+    });
+
+    if (deleted === false) {
+      throw new CONFLICT('Username was modified concurrently');
+    }
+
+    return { ok: true, reserved_until: deletedAt + RESERVATION_MS };
+  }
+
+  /**
+   * Restore a soft-deleted username for its previous owner.
+   *
+   * @param {string} username
+   * @param {string} address
+   * @returns {Promise<{ ok: true }>}
+   * @throws {Error} CONFLICT when the username is not soft-deleted, is owned
+   *                 by a different address, or the reservation has expired.
+   */
+  async restore(username, address) {
+    const existing = await this.db.getRegistration(username);
+
+    if (!existing || !existing.deleted_at) {
+      throw new CONFLICT('Username is not soft-deleted');
+    }
+
+    if (existing.address !== address) {
+      throw new CONFLICT('Username is not owned by this address');
+    }
+
+    if (this._isReservationExpired(existing)) {
+      throw new CONFLICT('Reservation has expired; username is no longer restorable');
+    }
+
+    const restored = await this.db.restoreRegistration(username, address, {
+      expectedDeletedAt: existing.deleted_at,
+      event: this._buildEvent(EVENT_TYPES.RESTORED, { username, address }),
+    });
+
+    if (restored === false) {
+      throw new CONFLICT('Username was modified concurrently');
+    }
+
+    return { ok: true };
+  }
+
+  /**
+   * Build a versioned event metadata envelope for persistence.
+   *
+   * The envelope is validated against its declared schema version before it
+   * is handed to the database layer, so malformed payloads never reach
+   * storage.
+   *
+   * @param {string} type
+   * @param {object} data
+   * @returns {{ schema: string, version: number, type: string, data: object }}
+   */
+  _buildEvent(type, data) {
+    const event = {
+      schema: EVENT_SCHEMA,
+      version: EVENT_SCHEMA_VERSION,
+      type,
+      data,
+    };
+    this._validateEvent(event);
+    return event;
+  }
+
+  /**
+   * Validate an event envelope against its declared schema version.
+   *
+   * @param {object} event
+   * @throws {Error} when the envelope is malformed or declares an
+   *                 unsupported schema version.
+   */
+  _validateEvent(event) {
+    if (!event || typeof event !== 'object') {
+      throw new Error('Event metadata must be an object');
+    }
+    if (event.schema !== EVENT_SCHEMA) {
+      throw new Error(`Unknown event schema: ${event.schema}`);
+    }
+    if (!Number.isInteger(event.version) || event.version < 1) {
+      throw new Error(`Invalid event schema version: ${event.version}`);
+    }
+    if (event.version > SUPPORTED_EVENT_SCHEMA_VERSION) {
+      throw new Error(
+        `Unsupported future event schema version: ${event.version}`
       );
     }
-
-    // Work on a deep copy so the caller's snapshot is never mutated.
-    const working = JSON.parse(JSON.stringify(snapshot));
-    const applied = [];
-
-    for (let v = working.stateVersion; v < targetVersion; v += 1) {
-      const next = v + 1;
-      if (typeof options.migrate === 'function') {
-        await options.migrate(working, v, next);
-      }
-      working.stateVersion = next;
-      applied.push(next);
+    if (!Object.values(EVENT_TYPES).includes(event.type)) {
+      throw new Error(`Unknown event type: ${event.type}`);
     }
-
-    const reads = await this._runCriticalReads(working);
-    const invariants = this._checkInvariants(working);
-
-    return {
-      ok: invariants.every((inv) => inv.ok),
-      fromVersion: snapshot.stateVersion,
-      toVersion: working.stateVersion,
-      applied,
-      reads,
-      invariants,
-    };
-  }
-
-  /**
-   * Reject unsupported snapshot layouts/state versions before mutation.
-   * @private
-   */
-  _assertSupportedSnapshot(snapshot) {
-    if (!snapshot || typeof snapshot !== 'object') {
-      throw new CONFLICT('Snapshot must be an object');
-    }
-    if (!Number.isInteger(snapshot.stateVersion)) {
-      throw new CONFLICT('Snapshot is missing a valid stateVersion');
-    }
-    if (!SUPPORTED_STATE_VERSIONS.includes(snapshot.stateVersion)) {
-      throw new CONFLICT(`Unsupported snapshot state version: ${snapshot.stateVersion}`);
-    }
-    if (!Array.isArray(snapshot.registrations)) {
-      throw new CONFLICT('Unsupported snapshot layout: registrations must be an array');
-    }
-    for (const entry of snapshot.registrations) {
-      if (!entry || typeof entry.username !== 'string' || typeof entry.address !== 'string') {
-        throw new CONFLICT('Unsupported snapshot layout: malformed registration entry');
-      }
+    if (!event.data || typeof event.data !== 'object') {
+      throw new Error('Event data must be an object');
     }
   }
 
   /**
-   * Run critical reads against the migrated snapshot.
-   * @private
+   * Adapt a persisted event row to the current schema.
+   *
+   * - Historical unversioned rows (no `schema`/`version`) are upgraded to the
+   *   current schema version.
+   * - Rows declaring an unknown future version are retained as-is and flagged
+   *   `forward_incompatible: true` so callers can skip interpretation without
+   *   discarding data.
+   *
+   * @param {object} row
+   * @returns {object}
    */
-  async _runCriticalReads(working) {
-    const byUsername = new Map();
-    const byAddress = new Map();
-    for (const entry of working.registrations) {
-      byUsername.set(entry.username, entry.address);
-      byAddress.set(entry.address, (byAddress.get(entry.address) || 0) + 1);
+  adaptEvent(row) {
+    if (!row || typeof row !== 'object') {
+      throw new Error('Event row must be an object');
     }
-    return {
-      registrationCount: working.registrations.length,
-      uniqueUsernames: byUsername.size,
-      uniqueAddresses: byAddress.size,
-    };
+
+    if (row.schema === undefined && row.version === undefined) {
+      // Historical unversioned row: upgrade in place.
+      return {
+        ...row,
+        schema: EVENT_SCHEMA,
+        version: EVENT_SCHEMA_VERSION,
+        adapted: true,
+      };
+    }
+
+    if (
+      row.schema === EVENT_SCHEMA &&
+      Number.isInteger(row.version) &&
+      row.version > SUPPORTED_EVENT_SCHEMA_VERSION
+    ) {
+      // Unknown future version: retain, do not interpret.
+      return { ...row, forward_incompatible: true };
+    }
+
+    this._validateEvent(row);
+    return { ...row, adapted: false };
   }
 
-  /**
-   * Check invariants that must hold after migration.
-   * @private
-   */
-  _checkInvariants(working) {
-    const seen = new Set();
-    const perAddress = new Map();
-    let uniqueUsernames = true;
-    let aliasLimitRespected = true;
+  _reservationExpiresAt(registration) {
+    return registration.deleted_at + RESERVATION_MS;
+  }
 
-    for (const entry of working.registrations) {
-      if (seen.has(entry.username)) {
-        uniqueUsernames = false;
-      }
-      seen.add(entry.username);
-
-      const count = (perAddress.get(entry.address) || 0) + 1;
-      perAddress.set(entry.address, count);
-      if (count > MAX_ALIASES_PER_ADDRESS) {
-        aliasLimitRespected = false;
-      }
-    }
-
-    return [
-      { name: 'unique_usernames', ok: uniqueUsernames },
-      { name: 'alias_limit_respected', ok: aliasLimitRespected },
-      { name: 'state_version_supported', ok: SUPPORTED_STATE_VERSIONS.includes(working.stateVersion) },
-    ];
+  _isReservationExpired(registration) {
+    return this.now() >= this._reservationExpiresAt(registration);
   }
 }
 
-RegistrationService.SUPPORTED_STATE_VERSIONS = SUPPORTED_STATE_VERSIONS;
-RegistrationService.LATEST_STATE_VERSION = LATEST_STATE_VERSION;
+RegistrationService.RESERVATION_MS = RESERVATION_MS;
+RegistrationService.EVENT_SCHEMA = EVENT_SCHEMA;
+RegistrationService.EVENT_SCHEMA_VERSION = EVENT_SCHEMA_VERSION;
+RegistrationService.SUPPORTED_EVENT_SCHEMA_VERSION = SUPPORTED_EVENT_SCHEMA_VERSION;
+RegistrationService.EVENT_TYPES = EVENT_TYPES;
 
 module.exports = RegistrationService;
