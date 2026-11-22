@@ -1,4 +1,7 @@
 #![no_std]
+#[cfg(test)]
+extern crate std;
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, symbol_short, token, Address, BytesN,
     Env, Symbol, Vec,
@@ -124,9 +127,8 @@ pub struct Payment {
 // The freeze mechanism is the complementary emergency tool: calling
 // emergency_freeze instantly blocks all payments and all timelock executions.
 // A freeze does NOT require going through the timelock itself so it is always
-// available to the admin as an immediate last resort.  Unfreezing likewise
-// takes effect immediately so the admin can restore service once the threat is
-// resolved.
+// available to the admin as an immediate last resort. Unfreezing is timelocked
+// so observers can review the recovery before routing resumes.
 
 /// Describes which administrative parameter change a timelock entry represents.
 /// Each variant carries all the arguments needed to apply that change when the
@@ -144,7 +146,19 @@ pub enum ActionType {
     SetGovernance(Address),
     /// Change the minimum routing limit.
     SetMinLimit(i128),
-    /// Transfer admin rights to a new address.
+    /// Change the minimum individual payment amount.
+    SetMinAmount(i128),
+    /// Change the maximum individual payment amount.
+    SetMaxAmount(i128),
+    /// Add or remove a recipient from the blacklist.
+    SetBlacklist(Address, bool),
+    /// Block or unblock a token contract. Tokens are unblocked by default.
+    SetTokenBlocked(Address, bool),
+    /// Pause or resume routing.
+    SetPaused(bool),
+    /// Remove an emergency freeze.
+    Unfreeze,
+    /// Nominate a new admin; the nominee must separately accept.
     TransferAdmin(Address),
     /// Upgrade the contract WASM.
     Upgrade(BytesN<32>),
@@ -158,6 +172,16 @@ pub struct TimelockEntry {
     pub queued_at: u64,
     /// The action payload to apply once the delay has elapsed.
     pub action: ActionType,
+}
+
+/// An admin nomination awaiting explicit acceptance by the proposed address.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdminTransfer {
+    pub proposed_admin: Address,
+    pub proposed_at: u64,
+    pub expires_at: u64,
+    pub action_nonce: u64,
 }
 
 /// Storage keys for all contract instance and persistent data.
@@ -188,6 +212,8 @@ pub enum DataKey {
     UserSpending(Address),
     /// Whether a given recipient address is blacklisted.
     Blacklist(Address),
+    /// Whether a given token contract is blocked from routing.
+    TokenBlocked(Address),
     /// Internal refund balance for a (user, token) pair, credited when a
     /// direct transfer to the recipient fails.
     RefundBalance(Address, Address),
@@ -197,6 +223,10 @@ pub enum DataKey {
     /// A pending timelock entry keyed by its nonce ID.
     /// Stored in persistent storage so it survives instance eviction.
     TimelockEntry(u64),
+    /// The nonce for an identical action that is already queued.
+    PendingAction(ActionType),
+    /// An admin transfer awaiting acceptance.
+    PendingAdminTransfer,
     /// When `true` the contract is frozen: payments and timelock executions
     /// are blocked.  Stored as `bool` in instance storage.
     Frozen,
@@ -229,8 +259,7 @@ pub enum Error {
     /// Requested refund withdrawal amount is zero or exceeds available refund balance.
     NoRefundAvailable = 10,
     /// An action is already pending in the timelock queue; it must be executed
-    /// or cancelled before a duplicate can be queued (not currently enforced,
-    /// but reserved for future deduplication logic).
+    /// or cancelled before an identical action can be queued.
     TimelockPending = 11,
     /// The 24-hour delay for the given timelock entry has not elapsed yet.
     TimelockNotReady = 12,
@@ -240,6 +269,16 @@ pub enum Error {
     ContractFrozen = 14,
     /// The payment amount is below the admin-configured minimum transfer amount.
     AmountBelowMinimum = 15,
+    /// A sensitive setting must be changed through the timelock.
+    TimelockRequired = 16,
+    /// A different admin nomination is still awaiting acceptance.
+    AdminTransferPending = 17,
+    /// The proposed admin is already the current admin.
+    InvalidAdminTransfer = 18,
+    /// The admin nomination has expired.
+    AdminTransferExpired = 19,
+    /// The token has been blocked from routing.
+    TokenBlocked = 20,
 }
 
 /// Soroban contract that routes token payments between addresses while
@@ -256,9 +295,11 @@ impl PaymentRouter {
     const DAILY_MAX_LIMIT: i128 = 1_000_000 * Self::XLM_DECIMALS; // 1M tokens limit
     const VOLUME_THRESHOLD: i128 = 10_000 * Self::XLM_DECIMALS; // 10,000 XLM threshold for tiered fee discount
     const SECONDS_IN_24H: u64 = 24 * 3600;
+    const ADMIN_TRANSFER_EXPIRY_SECONDS: u64 = 7 * Self::SECONDS_IN_24H;
     /// Length of the daily spending window, in seconds (24 hours).
     const DAY_SECONDS: u64 = 86_400;
     const VERSION: u32 = 1;
+    const INTERFACE_VERSION: u32 = 1;
 
     const DAY_IN_LEDGERS: u32 = 17280;
     const INSTANCE_BUMP_AMOUNT: u32 = 7 * Self::DAY_IN_LEDGERS;
@@ -281,17 +322,53 @@ impl PaymentRouter {
     /// Fee authority helper: if a Governance address is set it takes exclusive
     /// control over fee updates; otherwise the admin retains that right.
     fn require_fee_authority(env: &Env) -> Result<(), Error> {
-        if let Some(gov) = env
+        let authority = if let Some(gov) = env
             .storage()
             .instance()
             .get::<DataKey, Address>(&DataKey::Governance)
         {
-            gov.require_auth();
-            Ok(())
+            gov
         } else {
-            let admin = Self::require_admin(env)?;
-            admin.require_auth();
-            Ok(())
+            Self::require_admin(env)?
+        };
+        authority.require_auth();
+        Ok(())
+    }
+
+    fn fee_authority(env: &Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Governance)
+            .map(Ok)
+            .unwrap_or_else(|| Self::require_admin(env))
+    }
+
+    fn action_authority(env: &Env, action: &ActionType) -> Result<Address, Error> {
+        match action {
+            ActionType::SetFeeConfig(_, _) | ActionType::SetFeeBps(_) => Self::fee_authority(env),
+            _ => Self::require_admin(env),
+        }
+    }
+
+    fn validate_action(action: &ActionType) -> Result<(), Error> {
+        match action {
+            ActionType::SetFeeConfig(fee_bps, fee_cap)
+                if !(0..=Self::BPS_DIVISOR).contains(fee_bps) || *fee_cap < 0 =>
+            {
+                Err(Error::InvalidFeeRate)
+            }
+            ActionType::SetFeeBps(fee_bps) if !(0..=Self::BPS_DIVISOR).contains(fee_bps) => {
+                Err(Error::InvalidFeeRate)
+            }
+            ActionType::SetMinLimit(amount) | ActionType::SetMinAmount(amount)
+                if *amount < 0 || *amount > Self::MAX_AMOUNT =>
+            {
+                Err(Error::LimitExceeded)
+            }
+            ActionType::SetMaxAmount(amount) if *amount <= 0 || *amount > Self::MAX_AMOUNT => {
+                Err(Error::LimitExceeded)
+            }
+            _ => Ok(()),
         }
     }
 
@@ -390,6 +467,14 @@ impl PaymentRouter {
         // Check if recipient is blacklisted
         if Self::is_blacklisted(env.clone(), recipient.clone()) {
             return Err(Error::Blacklisted);
+        }
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::TokenBlocked(token_address.clone()))
+            .unwrap_or(false)
+        {
+            return Err(Error::TokenBlocked);
         }
 
         // Validate amount bounds
@@ -597,21 +682,31 @@ impl PaymentRouter {
     /// nonce to `execute_action` after 24 hours, or to `cancel_action` to
     /// abort the intent.
     ///
-    /// Sensitive parameter changes (`set_platform_treasury`, `set_fee_config`,
-    /// `set_fee_bps`, `set_governance`, `set_min_limit`, `transfer_admin`,
-    /// `upgrade`) must go through the timelock.  Use the direct setter
-    /// functions only for actions that are not sensitive (e.g. `set_pause`
-    /// which can also be called directly for immediate operational pauses).
-    ///
-    /// The contract must not be frozen when queuing, and the admin must
-    /// authorize the call.
+    /// Sensitive configuration, routing-policy, and admin-transfer changes
+    /// must go through the timelock. Identical pending actions are rejected.
+    /// Fee actions are authorized by governance when configured, otherwise by
+    /// the admin; other actions require the admin. `Unfreeze` may be queued
+    /// while frozen, but all other actions are blocked until the contract is
+    /// unfrozen.
     pub fn queue_action(env: Env, action: ActionType) -> Result<u64, Error> {
-        if Self::is_frozen_internal(&env) {
+        if Self::is_frozen_internal(&env) && !matches!(&action, ActionType::Unfreeze) {
             return Err(Error::ContractFrozen);
         }
 
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
+        let authority = Self::action_authority(&env, &action)?;
+        authority.require_auth();
+        Self::validate_action(&action)?;
+
+        if let ActionType::TransferAdmin(ref new_admin) = action {
+            if new_admin == &authority {
+                return Err(Error::InvalidAdminTransfer);
+            }
+        }
+
+        let pending_action_key = DataKey::PendingAction(action.clone());
+        if env.storage().persistent().has(&pending_action_key) {
+            return Err(Error::TimelockPending);
+        }
 
         let nonce = Self::next_nonce(&env);
         let queued_at = env.ledger().timestamp();
@@ -628,6 +723,12 @@ impl PaymentRouter {
             Self::PERSISTENT_LIFETIME_THRESHOLD,
             Self::PERSISTENT_BUMP_AMOUNT,
         );
+        env.storage().persistent().set(&pending_action_key, &nonce);
+        env.storage().persistent().extend_ttl(
+            &pending_action_key,
+            Self::PERSISTENT_LIFETIME_THRESHOLD,
+            Self::PERSISTENT_BUMP_AMOUNT,
+        );
 
         env.storage().instance().extend_ttl(
             Self::INSTANCE_LIFETIME_THRESHOLD,
@@ -635,7 +736,7 @@ impl PaymentRouter {
         );
 
         env.events().publish(
-            (Symbol::new(&env, "action_queued"), admin),
+            (Symbol::new(&env, "action_queued"), authority),
             (nonce, queued_at),
         );
 
@@ -663,19 +764,17 @@ impl PaymentRouter {
     ///
     /// On success the entry is removed and the underlying setter is invoked.
     pub fn execute_action(env: Env, nonce: u64) -> Result<(), Error> {
-        if Self::is_frozen_internal(&env) {
-            return Err(Error::ContractFrozen);
-        }
-
-        let admin = Self::require_admin(&env)?;
-        admin.require_auth();
-
         let key = DataKey::TimelockEntry(nonce);
         let entry: TimelockEntry = env
             .storage()
             .persistent()
             .get(&key)
             .ok_or(Error::TimelockNotFound)?;
+        if Self::is_frozen_internal(&env) && !matches!(&entry.action, ActionType::Unfreeze) {
+            return Err(Error::ContractFrozen);
+        }
+        let authority = Self::action_authority(&env, &entry.action)?;
+        authority.require_auth();
 
         let now = env.ledger().timestamp();
         if now < entry.queued_at + Self::SECONDS_IN_24H {
@@ -684,6 +783,9 @@ impl PaymentRouter {
 
         // Remove the entry before applying the action (checks-effects-interactions).
         env.storage().persistent().remove(&key);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingAction(entry.action.clone()));
 
         // Apply the action.
         match entry.action {
@@ -705,8 +807,92 @@ impl PaymentRouter {
             ActionType::SetMinLimit(min_limit) => {
                 env.storage().instance().set(&DataKey::MinLimit, &min_limit);
             }
+            ActionType::SetMinAmount(min_amount) => {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::MinAmount, &min_amount);
+            }
+            ActionType::SetMaxAmount(max_amount) => {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::MaxAmount, &max_amount);
+            }
+            ActionType::SetBlacklist(address, blacklisted) => {
+                let blacklist_key = DataKey::Blacklist(address.clone());
+                if blacklisted {
+                    env.storage().persistent().set(&blacklist_key, &true);
+                    env.storage().persistent().extend_ttl(
+                        &blacklist_key,
+                        Self::PERSISTENT_LIFETIME_THRESHOLD,
+                        Self::PERSISTENT_BUMP_AMOUNT,
+                    );
+                } else {
+                    env.storage().persistent().remove(&blacklist_key);
+                }
+            }
+            ActionType::SetTokenBlocked(token, blocked) => {
+                let token_key = DataKey::TokenBlocked(token.clone());
+                if blocked {
+                    env.storage().persistent().set(&token_key, &true);
+                    env.storage().persistent().extend_ttl(
+                        &token_key,
+                        Self::PERSISTENT_LIFETIME_THRESHOLD,
+                        Self::PERSISTENT_BUMP_AMOUNT,
+                    );
+                } else {
+                    env.storage().persistent().remove(&token_key);
+                }
+            }
+            ActionType::SetPaused(paused) => {
+                env.storage().instance().set(&DataKey::Paused, &paused);
+                env.events().publish((symbol_short!("pause"),), (paused,));
+            }
+            ActionType::Unfreeze => {
+                env.storage().instance().set(&DataKey::Frozen, &false);
+                env.events().publish(
+                    (Symbol::new(&env, "unfreeze"), authority.clone()),
+                    env.ledger().timestamp(),
+                );
+            }
             ActionType::TransferAdmin(new_admin) => {
-                env.storage().instance().set(&DataKey::Admin, &new_admin);
+                let pending_key = DataKey::PendingAdminTransfer;
+                if let Some(pending) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, PendingAdminTransfer>(&pending_key)
+                {
+                    if now <= pending.expires_at {
+                        return Err(Error::AdminTransferPending);
+                    }
+                    env.storage().persistent().remove(&pending_key);
+                    env.events().publish(
+                        (
+                            Symbol::new(&env, "admin_transfer_expired"),
+                            pending.proposed_admin,
+                        ),
+                        (pending.action_nonce, pending.expires_at),
+                    );
+                }
+                let pending = PendingAdminTransfer {
+                    proposed_admin: new_admin.clone(),
+                    proposed_at: now,
+                    expires_at: now + Self::ADMIN_TRANSFER_EXPIRY_SECONDS,
+                    action_nonce: nonce,
+                };
+                env.storage().persistent().set(&pending_key, &pending);
+                env.storage().persistent().extend_ttl(
+                    &pending_key,
+                    Self::PERSISTENT_LIFETIME_THRESHOLD,
+                    Self::PERSISTENT_BUMP_AMOUNT,
+                );
+                env.events().publish(
+                    (
+                        Symbol::new(&env, "admin_transfer_proposed"),
+                        authority.clone(),
+                        new_admin,
+                    ),
+                    (nonce, pending.expires_at),
+                );
             }
             ActionType::Upgrade(new_wasm_hash) => {
                 env.deployer().update_current_contract_wasm(new_wasm_hash);
@@ -719,7 +905,7 @@ impl PaymentRouter {
         );
 
         env.events()
-            .publish((Symbol::new(&env, "action_executed"), admin), nonce);
+            .publish((Symbol::new(&env, "action_executed"), authority), nonce);
 
         log!(&env, "Timelock action executed for nonce {}", nonce);
         Ok(())
@@ -737,16 +923,103 @@ impl PaymentRouter {
         admin.require_auth();
 
         let key = DataKey::TimelockEntry(nonce);
-        if !env.storage().persistent().has(&key) {
-            return Err(Error::TimelockNotFound);
-        }
+        let entry: TimelockEntry = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::TimelockNotFound)?;
 
         env.storage().persistent().remove(&key);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingAction(entry.action));
 
         env.events()
             .publish((Symbol::new(&env, "action_cancelled"), admin), nonce);
 
         log!(&env, "Timelock action cancelled for nonce {}", nonce);
+        Ok(())
+    }
+
+    /// Returns the current admin nomination, if one is awaiting acceptance.
+    pub fn get_pending_admin_transfer(env: Env) -> Option<PendingAdminTransfer> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingAdminTransfer)
+    }
+
+    /// Accepts an unexpired admin nomination. The current admin remains active
+    /// until the nominated address authorizes this call.
+    pub fn accept_admin(env: Env) -> Result<(), Error> {
+        let key = DataKey::PendingAdminTransfer;
+        let pending: PendingAdminTransfer = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::TimelockNotFound)?;
+        if env.ledger().timestamp() > pending.expires_at {
+            return Err(Error::AdminTransferExpired);
+        }
+        pending.proposed_admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::Admin, &pending.proposed_admin);
+        env.storage().persistent().remove(&key);
+        env.storage().instance().extend_ttl(
+            Self::INSTANCE_LIFETIME_THRESHOLD,
+            Self::INSTANCE_BUMP_AMOUNT,
+        );
+        env.events().publish(
+            (
+                Symbol::new(&env, "admin_transfer_accepted"),
+                pending.proposed_admin,
+            ),
+            (pending.action_nonce, env.ledger().timestamp()),
+        );
+        Ok(())
+    }
+
+    /// Cancels an admin nomination while the current admin is still active.
+    pub fn cancel_admin_transfer(env: Env) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+        let key = DataKey::PendingAdminTransfer;
+        let pending: PendingAdminTransfer = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::TimelockNotFound)?;
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (
+                Symbol::new(&env, "admin_transfer_cancelled"),
+                admin,
+                pending.proposed_admin,
+            ),
+            pending.action_nonce,
+        );
+        Ok(())
+    }
+
+    /// Clears an expired nomination. Anyone may call this after its expiry.
+    pub fn expire_admin_transfer(env: Env) -> Result<(), Error> {
+        let key = DataKey::PendingAdminTransfer;
+        let pending: PendingAdminTransfer = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::TimelockNotFound)?;
+        if env.ledger().timestamp() <= pending.expires_at {
+            return Err(Error::TimelockNotReady);
+        }
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (
+                Symbol::new(&env, "admin_transfer_expired"),
+                pending.proposed_admin,
+            ),
+            (pending.action_nonce, pending.expires_at),
+        );
         Ok(())
     }
 
@@ -780,29 +1053,12 @@ impl PaymentRouter {
         Ok(())
     }
 
-    /// Removes the frozen state, restoring normal contract operation.
-    ///
-    /// Like `emergency_freeze`, this takes effect immediately and does not
-    /// go through the timelock.
-    ///
-    /// Admin authorization is required.
+    /// Deprecated immediate unfreeze path. Queue `ActionType::Unfreeze` and
+    /// execute it after the 24-hour delay instead.
     pub fn unfreeze(env: Env) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
-
-        env.storage().instance().set(&DataKey::Frozen, &false);
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
-
-        env.events().publish(
-            (Symbol::new(&env, "unfreeze"), admin),
-            env.ledger().timestamp(),
-        );
-
-        log!(&env, "Contract unfrozen by admin");
-        Ok(())
+        Err(Error::TimelockRequired)
     }
 
     /// Returns whether the contract is currently frozen.
@@ -812,27 +1068,18 @@ impl PaymentRouter {
 
     // ── Sensitive admin setters (now require timelock) ───────────────────────
     //
-    // The functions below are intentionally kept as thin wrappers that apply
-    // the change *directly* but only when called from execute_action (i.e.
-    // after the timelock has been satisfied).  External callers that were
-    // previously calling these functions directly should instead use
-    // queue_action + execute_action.
-    //
-    // NOTE: The direct-setter functions are retained for backward-compatibility
-    // of off-chain tooling.  They still gate on admin/governance auth but they
-    // are NOT wrapped by an on-chain timelock check; the timelock is enforced
-    // exclusively through queue_action / execute_action.
+    // Legacy setter entry points remain available for ABI compatibility, but
+    // reject direct mutation. Changes must be represented by ActionType and
+    // applied only by execute_action.
 
-    /// Updates the treasury address that receives the platform fee.
-    ///
-    /// Updates the treasury address that receives the platform fee. Admin-only.
+    /// Deprecated direct treasury update. Queue `SetPlatformTreasury` instead.
     ///
     /// # Parameters
     /// - `new_treasury`: Address to receive platform fees going forward.
     ///
     /// # Returns
-    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
-    /// has no admin set yet.
+    /// `Err(Error::TimelockRequired)` after admin authorization. Queue the
+    /// corresponding `ActionType` instead.
     ///
     /// # Panics
     /// Panics if the current admin does not authorize the call.
@@ -843,15 +1090,8 @@ impl PaymentRouter {
     pub fn set_platform_treasury(env: Env, new_treasury: Address) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
-
-        env.storage()
-            .instance()
-            .set(&DataKey::PlatformTreasury, &new_treasury);
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
-        Ok(())
+        let _ = new_treasury;
+        Err(Error::TimelockRequired)
     }
 
     /// Updates the fee basis points and fee cap.
@@ -862,8 +1102,7 @@ impl PaymentRouter {
     /// - `fee_cap`: New maximum fee taken from a single payment.
     ///
     /// # Returns
-    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
-    /// has no admin set yet.
+    /// `Err(Error::TimelockRequired)` after fee-authority authorization.
     ///
     /// # Panics
     /// Panics if the caller does not authorize the call.
@@ -871,14 +1110,8 @@ impl PaymentRouter {
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetFeeConfig(…))`.
     pub fn set_fee_config_legacy(env: Env, fee_bps: i128, fee_cap: i128) -> Result<(), Error> {
         Self::require_fee_authority(&env)?;
-
-        env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
-        env.storage().instance().set(&DataKey::FeeCap, &fee_cap);
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
-        Ok(())
+        let _ = (fee_bps, fee_cap);
+        Err(Error::TimelockRequired)
     }
 
     /// Alias for `set_fee_config_legacy`. Admin-only.
@@ -905,8 +1138,7 @@ impl PaymentRouter {
     /// - `new_fee_bps`: New platform fee rate, in basis points.
     ///
     /// # Returns
-    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
-    /// has no admin set yet.
+    /// `Err(Error::TimelockRequired)` after fee-authority authorization.
     ///
     /// # Panics
     /// Panics if the caller does not authorize the call.
@@ -914,39 +1146,28 @@ impl PaymentRouter {
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetFeeBps(…))`.
     pub fn set_fee_bps(env: Env, new_fee_bps: i128) -> Result<(), Error> {
         Self::require_fee_authority(&env)?;
-
-        env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
-        Ok(())
+        let _ = new_fee_bps;
+        Err(Error::TimelockRequired)
     }
 
-    /// Sets the governance contract address. After this call, only the governance
-    /// contract can update fees. Admin-only — can only be set once per governance cycle.
+    /// Deprecated direct governance update. Queue `SetGovernance` instead.
     ///
     /// DEPRECATED for direct use.  Queue via `queue_action(ActionType::SetGovernance(…))`.
     pub fn set_governance(env: Env, gov: Address) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
-        env.storage().instance().set(&DataKey::Governance, &gov);
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
-        Ok(())
+        let _ = gov;
+        Err(Error::TimelockRequired)
     }
 
-    /// Sets the minimum allowed routing amount. Admin-only.
+    /// Deprecated direct minimum-limit update. Queue `SetMinLimit` instead.
     ///
     /// # Parameters
     /// - `min_limit`: Smallest `amount` that `route_payment` /
     ///   `route_payments` will accept going forward.
     ///
     /// # Returns
-    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
-    /// has no admin set yet.
+    /// `Err(Error::TimelockRequired)` after admin authorization.
     ///
     /// # Panics
     /// Panics if the current admin does not authorize the call.
@@ -955,16 +1176,11 @@ impl PaymentRouter {
     pub fn set_min_limit(env: Env, min_limit: i128) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
-
-        env.storage().instance().set(&DataKey::MinLimit, &min_limit);
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
-        Ok(())
+        let _ = min_limit;
+        Err(Error::TimelockRequired)
     }
 
-    /// Sets the minimum transfer amount enforced by `route_payment`. Admin-only.
+    /// Deprecated direct minimum transfer update. Queue `SetMinAmount` instead.
     ///
     /// # Parameters
     /// - `amount`: Smallest `amount` that `route_payment` will accept going
@@ -972,23 +1188,23 @@ impl PaymentRouter {
     ///   `Error::AmountBelowMinimum`.
     ///
     /// # Returns
-    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
-    /// has no admin set yet.
+    /// `Err(Error::TimelockRequired)` after admin authorization.
     ///
     /// # Panics
     /// Panics if the current admin does not authorize the call.
     pub fn set_min_amount(env: Env, amount: i128) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
+        let _ = amount;
+        Err(Error::TimelockRequired)
+    }
 
-        env.storage()
-            .instance()
-            .set(&DataKey::MinAmount, &amount);
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
-        Ok(())
+    /// Deprecated direct maximum payment update. Queue `SetMaxAmount` instead.
+    pub fn set_max_amount(env: Env, amount: i128) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+        let _ = amount;
+        Err(Error::TimelockRequired)
     }
 
     /// Returns the current protocol fee percentage in basis points.
@@ -1003,33 +1219,24 @@ impl PaymentRouter {
         env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0)
     }
 
-    /// Pauses or unpauses the payment router. Admin-only.
+    /// Deprecated direct pause update. Queue `SetPaused` instead.
     ///
     /// # Parameters
     /// - `paused`: `true` to reject `route_payment` / `route_payments`
     ///   calls, `false` to allow them again.
     ///
     /// # Returns
-    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
-    /// has no admin set yet.
+    /// `Err(Error::TimelockRequired)` after admin authorization.
     ///
     /// # Panics
     /// Panics if the current admin does not authorize the call.
     ///
-    /// This is NOT timelocked — operational pausing must remain instant.
+    /// Emergency freeze remains immediately available through `emergency_freeze`.
     pub fn set_pause(env: Env, paused: bool) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
-
-        env.storage().instance().set(&DataKey::Paused, &paused);
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
-
-        env.events().publish((symbol_short!("pause"),), (paused,));
-
-        Ok(())
+        let _ = paused;
+        Err(Error::TimelockRequired)
     }
 
     /// Alias for `set_pause`. Admin-only.
@@ -1078,54 +1285,47 @@ impl PaymentRouter {
             .unwrap_or(0)
     }
 
-    /// Adds an address to the blacklist. Admin-only.
+    /// Deprecated direct blacklist mutation. Queue `SetBlacklist` instead.
     ///
     /// # Parameters
     /// - `address`: Address to blacklist; subsequent payments to it as a
     ///   recipient will be rejected.
     ///
     /// # Returns
-    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
-    /// has no admin set yet.
+    /// `Err(Error::TimelockRequired)` after admin authorization.
     ///
     /// # Panics
     /// Panics if the current admin does not authorize the call.
     pub fn blacklist_address(env: Env, address: Address) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Blacklist(address.clone()), &true);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Blacklist(address),
-            Self::PERSISTENT_LIFETIME_THRESHOLD,
-            Self::PERSISTENT_BUMP_AMOUNT,
-        );
-
-        Ok(())
+        let _ = address;
+        Err(Error::TimelockRequired)
     }
 
-    /// Removes an address from the blacklist. Admin-only.
+    /// Deprecated direct blacklist mutation. Queue `SetBlacklist` instead.
     ///
     /// # Parameters
     /// - `address`: Address to remove from the blacklist.
     ///
     /// # Returns
-    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
-    /// has no admin set yet.
+    /// `Err(Error::TimelockRequired)` after admin authorization.
     ///
     /// # Panics
     /// Panics if the current admin does not authorize the call.
     pub fn unblacklist_address(env: Env, address: Address) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
+        let _ = address;
+        Err(Error::TimelockRequired)
+    }
 
-        env.storage()
-            .persistent()
-            .remove(&DataKey::Blacklist(address));
-
-        Ok(())
+    /// Direct token policy changes are disabled; queue SetTokenBlocked instead.
+    pub fn set_token_blocked(env: Env, token: Address, blocked: bool) -> Result<(), Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+        let _ = (token, blocked);
+        Err(Error::TimelockRequired)
     }
 
     /// Returns whether an address is blacklisted.
@@ -1167,40 +1367,30 @@ impl PaymentRouter {
         }
     }
 
-    /// Set a new admin. Gated by the current admin if one exists.
+    /// Deprecated direct admin mutation. Use the timelocked two-step transfer.
     ///
     /// # Parameters
     /// - `new_admin`: Address to install as the new admin.
     ///
     /// # Returns
-    /// Always `Ok(())`.
+    /// `Err(Error::TimelockRequired)` after requiring current-admin authorization.
     ///
     /// # Panics
     /// Panics if an admin is already set and it does not authorize the call.
     pub fn set_admin(env: Env, new_admin: Address) -> Result<(), Error> {
-        if let Some(admin) = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::Admin)
-        {
-            admin.require_auth();
-        }
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
-        Ok(())
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+        let _ = new_admin;
+        Err(Error::TimelockRequired)
     }
 
-    /// Transfers admin rights to a new address. Requires the current admin's authorization.
+    /// Deprecated direct admin transfer. Queue `TransferAdmin` instead.
     ///
     /// # Parameters
     /// - `new_admin`: Address to become the new admin.
     ///
     /// # Returns
-    /// `Ok(())` on success, or `Err(Error::NotInitialized)` if the contract
-    /// has no admin set yet.
+    /// `Err(Error::TimelockRequired)` after current-admin authorization.
     ///
     /// # Panics
     /// Panics if the current admin does not authorize the call.
@@ -1209,12 +1399,8 @@ impl PaymentRouter {
     pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), Error> {
         let current_admin = Self::require_admin(&env)?;
         current_admin.require_auth();
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
-        env.storage().instance().extend_ttl(
-            Self::INSTANCE_LIFETIME_THRESHOLD,
-            Self::INSTANCE_BUMP_AMOUNT,
-        );
-        Ok(())
+        let _ = new_admin;
+        Err(Error::TimelockRequired)
     }
 
     /// Recovers tokens accidentally sent directly to the contract address. Admin-only.
@@ -1253,6 +1439,11 @@ impl PaymentRouter {
     /// Does not panic.
     pub fn add_supported_token(_env: Env, _token: Address) -> Result<(), Error> {
         Ok(())
+    }
+
+    /// Returns the current administrator.
+    pub fn get_admin(env: Env) -> Result<Address, Error> {
+        Self::require_admin(&env)
     }
 
     /// Routes a payment from a sender to a recipient, deducting a platform fee.
@@ -1491,9 +1682,13 @@ impl PaymentRouter {
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
         let admin = Self::require_admin(&env)?;
         admin.require_auth();
+        let _ = new_wasm_hash;
+        Err(Error::TimelockRequired)
+    }
 
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
-        Ok(())
+    /// Queues a contract upgrade for execution after the timelock delay.
+    pub fn queue_upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<u64, Error> {
+        Self::queue_action(env, ActionType::Upgrade(new_wasm_hash))
     }
 
     /// Returns the contract version.
@@ -1522,6 +1717,11 @@ impl PaymentRouter {
     pub fn get_version(env: Env) -> soroban_sdk::String {
         soroban_sdk::String::from_str(&env, env!("CARGO_PKG_VERSION"))
     }
+
+    /// Returns the stable Soroban interface version for release-manifest checks.
+    pub fn interface_version(_env: Env) -> u32 {
+        Self::INTERFACE_VERSION
+    }
 }
 
 #[cfg(test)]
@@ -1532,6 +1732,77 @@ mod test {
         token::StellarAssetClient,
         Address, Env, Symbol, TryIntoVal,
     };
+
+    #[contract]
+    struct RefundTestToken;
+
+    #[contracttype]
+    enum RefundTokenKey {
+        Balance(Address),
+        RejectedRecipient,
+    }
+
+    #[contracterror]
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+    #[repr(u32)]
+    enum RefundTokenError {
+        InsufficientBalance = 1,
+        RejectedRecipient = 2,
+    }
+
+    #[contractimpl]
+    impl RefundTestToken {
+        pub fn init(env: Env, rejected_recipient: Address) {
+            env.storage()
+                .instance()
+                .set(&RefundTokenKey::RejectedRecipient, &rejected_recipient);
+        }
+
+        pub fn mint(env: Env, recipient: Address, amount: i128) {
+            let key = RefundTokenKey::Balance(recipient.clone());
+            let balance: i128 = env.storage().instance().get(&key).unwrap_or(0);
+            env.storage().instance().set(&key, &(balance + amount));
+        }
+
+        pub fn balance(env: Env, owner: Address) -> i128 {
+            env.storage()
+                .instance()
+                .get(&RefundTokenKey::Balance(owner))
+                .unwrap_or(0)
+        }
+
+        pub fn transfer(
+            env: Env,
+            from: Address,
+            to: Address,
+            amount: i128,
+        ) -> Result<(), RefundTokenError> {
+            from.require_auth();
+            if env
+                .storage()
+                .instance()
+                .get::<RefundTokenKey, Address>(&RefundTokenKey::RejectedRecipient)
+                == Some(to.clone())
+            {
+                return Err(RefundTokenError::RejectedRecipient);
+            }
+
+            let from_key = RefundTokenKey::Balance(from);
+            let from_balance: i128 = env.storage().instance().get(&from_key).unwrap_or(0);
+            if amount <= 0 || from_balance < amount {
+                return Err(RefundTokenError::InsufficientBalance);
+            }
+            let to_key = RefundTokenKey::Balance(to);
+            let to_balance: i128 = env.storage().instance().get(&to_key).unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&from_key, &(from_balance - amount));
+            env.storage()
+                .instance()
+                .set(&to_key, &(to_balance + amount));
+            Ok(())
+        }
+    }
 
     /// Returns (env, client, contract_id).
     fn setup_env() -> (Env, PaymentRouterClient<'static>, Address) {
@@ -1556,6 +1827,30 @@ mod test {
         let token_client = token::Client::new(env, &token_address);
         let token_admin_client = token::StellarAssetClient::new(env, &token_address);
         (token_address, token_client, token_admin_client)
+    }
+
+    fn has_event(env: &Env, expected: Symbol) -> bool {
+        let events = env.events().all();
+        events.iter().any(|(_, topics, _)| {
+            topics
+                .get(0)
+                .map(|raw| {
+                    let symbol: Result<Symbol, _> = raw.try_into_val(env);
+                    symbol.map(|value| value == expected).unwrap_or(false)
+                })
+                .unwrap_or(false)
+        })
+    }
+
+    fn execute_after_delay(
+        env: &Env,
+        client: &PaymentRouterClient<'_>,
+        action: &ActionType,
+    ) -> u64 {
+        let nonce = client.queue_action(action);
+        advance_time(env, PaymentRouter::SECONDS_IN_24H);
+        client.execute_action(&nonce);
+        nonce
     }
 
     // ── Timelock tests ───────────────────────────────────────────────────────
@@ -1681,6 +1976,89 @@ mod test {
     }
 
     #[test]
+    fn test_identical_timelock_action_cannot_be_queued_twice() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let action = ActionType::SetMinAmount(25);
+        let nonce = client.queue_action(&action);
+        assert_eq!(
+            client.try_queue_action(&action).unwrap_err().unwrap(),
+            Error::TimelockPending
+        );
+
+        client.cancel_action(&nonce);
+        assert!(client.try_queue_action(&action).is_ok());
+    }
+
+    #[test]
+    fn test_admin_transfer_requires_nominee_acceptance() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let nominee = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let nonce = client.queue_action(&ActionType::TransferAdmin(nominee.clone()));
+        advance_time(&env, PaymentRouter::SECONDS_IN_24H);
+        client.execute_action(&nonce);
+
+        assert_eq!(client.get_admin(), admin);
+        let pending = client.get_pending_admin_transfer().unwrap();
+        assert_eq!(pending.proposed_admin, nominee);
+        assert_eq!(pending.action_nonce, nonce);
+        advance_time(&env, pending.expires_at - env.ledger().timestamp());
+
+        client.accept_admin();
+        assert_eq!(client.get_admin(), nominee);
+        assert!(client.get_pending_admin_transfer().is_none());
+
+        assert!(has_event(
+            &env,
+            Symbol::new(&env, "admin_transfer_proposed")
+        ));
+        assert!(has_event(
+            &env,
+            Symbol::new(&env, "admin_transfer_accepted")
+        ));
+    }
+
+    #[test]
+    fn test_admin_transfer_can_be_cancelled_or_expired() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let nominee = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        let cancelled_nonce = client.queue_action(&ActionType::TransferAdmin(nominee.clone()));
+        advance_time(&env, PaymentRouter::SECONDS_IN_24H);
+        client.execute_action(&cancelled_nonce);
+        client.cancel_admin_transfer();
+        assert!(client.get_pending_admin_transfer().is_none());
+        assert_eq!(client.get_admin(), admin);
+        assert!(has_event(
+            &env,
+            Symbol::new(&env, "admin_transfer_cancelled")
+        ));
+
+        let expired_nonce = client.queue_action(&ActionType::TransferAdmin(nominee));
+        advance_time(&env, PaymentRouter::SECONDS_IN_24H);
+        client.execute_action(&expired_nonce);
+        advance_time(&env, PaymentRouter::ADMIN_TRANSFER_EXPIRY_SECONDS + 1);
+        assert_eq!(
+            client.try_accept_admin().unwrap_err().unwrap(),
+            Error::AdminTransferExpired
+        );
+        client.expire_admin_transfer();
+        assert!(client.get_pending_admin_transfer().is_none());
+        assert_eq!(client.get_admin(), admin);
+        assert!(has_event(&env, Symbol::new(&env, "admin_transfer_expired")));
+    }
+
+    #[test]
     fn test_nonce_increments() {
         let (env, client, _) = setup_env();
         let admin = Address::generate(&env);
@@ -1768,11 +2146,36 @@ mod test {
         client.emergency_freeze();
         assert!(client.is_frozen());
 
-        client.unfreeze();
+        let nonce = client.queue_action(&ActionType::Unfreeze);
+        advance_time(&env, PaymentRouter::SECONDS_IN_24H);
+        client.execute_action(&nonce);
         assert!(!client.is_frozen());
 
         // Payments should work again.
         client.route_payment(&sender, &recipient, &token_address, &1000);
+    }
+
+    #[test]
+    fn test_emergency_freeze_remains_immediate() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
+
+        client.emergency_freeze();
+        assert!(client.is_frozen());
+
+        let unfreeze_nonce = client.queue_action(&ActionType::Unfreeze);
+        assert_eq!(
+            client
+                .try_execute_action(&unfreeze_nonce)
+                .unwrap_err()
+                .unwrap(),
+            Error::TimelockNotReady
+        );
+        advance_time(&env, PaymentRouter::SECONDS_IN_24H);
+        client.execute_action(&unfreeze_nonce);
+        assert!(!client.is_frozen());
     }
 
     #[test]
@@ -1869,12 +2272,11 @@ mod test {
         client.initialize(&admin, &treasury, &150, &5000, &PaymentRouter::MAX_AMOUNT);
         assert_eq!(client.get_fee(), 150);
 
-        // Update via set_fee_bps
-        client.set_fee_bps(&250);
+        // Fee updates are applied only by a matured timelock action.
+        execute_after_delay(&env, &client, &ActionType::SetFeeBps(250));
         assert_eq!(client.get_fee(), 250);
 
-        // Update via set_fee_config
-        client.set_fee_config(&300, &10000);
+        execute_after_delay(&env, &client, &ActionType::SetFeeConfig(300, 10_000));
         assert_eq!(client.get_fee(), 300);
     }
 
@@ -1903,15 +2305,19 @@ mod test {
         let res = client.try_initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
         assert_eq!(res.unwrap_err().unwrap(), Error::AlreadyInitialized);
 
-        client.set_admin(&new_admin);
-
-        // Modify config
-        client.set_fee_config(&200, &2000);
-        client.set_fee_bps(&200);
+        assert_eq!(
+            client.try_set_admin(&new_admin).unwrap_err().unwrap(),
+            Error::TimelockRequired
+        );
+        execute_after_delay(&env, &client, &ActionType::SetFeeConfig(200, 2000));
         assert_eq!(client.get_fee(), 200);
 
         let new_treasury = Address::generate(&env);
-        client.set_platform_treasury(&new_treasury);
+        execute_after_delay(
+            &env,
+            &client,
+            &ActionType::SetPlatformTreasury(new_treasury),
+        );
     }
 
     #[test]
@@ -1952,14 +2358,22 @@ mod test {
 
         client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
 
-        client.set_pause(&true);
+        execute_after_delay(&env, &client, &ActionType::SetPaused(true));
 
         let events = env.events().all();
-        assert!(!events.is_empty());
-        let (_, topics, _) = events.get(0).unwrap();
-        assert_eq!(topics.len(), 1);
-        let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
-        assert_eq!(topic, symbol_short!("pause"));
+        let pause_event_found = events.iter().any(|(_, topics, _)| {
+            topics.len() == 1
+                && topics
+                    .get(0)
+                    .map(|raw| {
+                        let symbol: Result<Symbol, _> = raw.try_into_val(&env);
+                        symbol
+                            .map(|value| value == symbol_short!("pause"))
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false)
+        });
+        assert!(pause_event_found);
     }
 
     #[test]
@@ -2068,7 +2482,7 @@ mod test {
         assert!(!client.is_paused());
 
         // Pause
-        client.set_pause(&true);
+        execute_after_delay(&env, &client, &ActionType::SetPaused(true));
         assert!(client.is_paused());
 
         // Route payment should fail when paused
@@ -2076,7 +2490,7 @@ mod test {
         assert_eq!(res.unwrap_err().unwrap(), Error::Paused);
 
         // Unpause via set_paused alias
-        client.set_paused(&false);
+        execute_after_delay(&env, &client, &ActionType::SetPaused(false));
         assert!(!client.is_paused());
 
         // Route payment should succeed now
@@ -2122,6 +2536,104 @@ mod test {
             initial_balance - amount_1 - amount_2
         );
         assert_eq!(client.get_user_volume(&sender), amount_1 + amount_2);
+    }
+
+    fn assert_batch_failure_rolls_back(failing_index: u32) {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let (token_address, token_client, sac) = setup_token(&env);
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        let mut payments = Vec::new(&env);
+        let mut senders = Vec::new(&env);
+        let mut recipients = Vec::new(&env);
+        for index in 0..3 {
+            let sender = Address::generate(&env);
+            let recipient = Address::generate(&env);
+            senders.push_back(sender.clone());
+            sac.mint(&sender, &10_000);
+            recipients.push_back(recipient.clone());
+            payments.push_back(Payment {
+                sender,
+                recipient,
+                token_address: token_address.clone(),
+                amount: if index == failing_index { 0 } else { 1_000 },
+            });
+        }
+
+        let result = client.try_route_payments(&payments);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            Error::LimitExceeded,
+            "failing item index {failing_index}"
+        );
+        assert_eq!(token_client.balance(&treasury), 0);
+        for sender in senders.iter() {
+            assert_eq!(token_client.balance(&sender), 10_000);
+            assert_eq!(client.get_user_volume(&sender), 0);
+        }
+        for recipient in recipients.iter() {
+            assert_eq!(token_client.balance(&recipient), 0);
+        }
+        assert_eq!(Error::LimitExceeded as u32, 3);
+    }
+
+    #[test]
+    fn test_route_payments_roll_back_first_item_failure() {
+        assert_batch_failure_rolls_back(0);
+    }
+
+    #[test]
+    fn test_route_payments_roll_back_middle_item_failure() {
+        assert_batch_failure_rolls_back(1);
+    }
+
+    #[test]
+    fn test_route_payments_roll_back_final_item_failure() {
+        assert_batch_failure_rolls_back(2);
+    }
+
+    #[test]
+    fn test_route_payments_failure_rolls_back_fee_and_refund_effects() {
+        let (env, client, contract_id) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let final_sender = Address::generate(&env);
+        let blocked_recipient = Address::generate(&env);
+        let final_recipient = Address::generate(&env);
+        let token_address = env.register_contract(None, RefundTestToken);
+        let mock_token = RefundTestTokenClient::new(&env, &token_address);
+        mock_token.init(&blocked_recipient);
+        mock_token.mint(&sender, &10_000);
+        mock_token.mint(&final_sender, &10_000);
+        let token_client = token::Client::new(&env, &token_address);
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        let mut payments = Vec::new(&env);
+        payments.push_back(Payment {
+            sender: final_sender.clone(),
+            recipient: blocked_recipient,
+            token_address: token_address.clone(),
+            amount: 2_000,
+        });
+        payments.push_back(Payment {
+            sender: sender.clone(),
+            recipient: final_recipient,
+            token_address: token_address.clone(),
+            amount: 0,
+        });
+
+        let result = client.try_route_payments(&payments);
+        assert_eq!(result.unwrap_err().unwrap(), Error::LimitExceeded);
+        assert_eq!(token_client.balance(&sender), 10_000);
+        assert_eq!(token_client.balance(&final_sender), 10_000);
+        assert_eq!(token_client.balance(&treasury), 0);
+        assert_eq!(token_client.balance(&contract_id), 0);
+        assert_eq!(client.get_refund_balance(&sender, &token_address), 0);
+        assert_eq!(client.get_user_volume(&final_sender), 0);
+        assert_eq!(client.get_user_volume(&sender), 0);
     }
 
     #[test]
@@ -2529,8 +3041,12 @@ mod test {
 
         client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
 
-        // Blacklist the recipient
-        client.blacklist_address(&recipient);
+        // Blacklist changes are only applied through the timelock.
+        execute_after_delay(
+            &env,
+            &client,
+            &ActionType::SetBlacklist(recipient.clone(), true),
+        );
         assert!(client.is_blacklisted(&recipient));
 
         // Route payment should fail
@@ -2538,12 +3054,64 @@ mod test {
         assert_eq!(res.unwrap_err().unwrap(), Error::Blacklisted);
 
         // Unblacklist and try again
-        client.unblacklist_address(&recipient);
+        execute_after_delay(
+            &env,
+            &client,
+            &ActionType::SetBlacklist(recipient.clone(), false),
+        );
         assert!(!client.is_blacklisted(&recipient));
 
         client
             .mock_all_auths()
             .route_payment(&sender, &recipient, &token_address, &1000);
+    }
+
+    #[test]
+    fn test_token_and_amount_policy_changes_are_timelocked() {
+        let (env, client, _) = setup_env();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let (token_address, token_client, sac) = setup_token(&env);
+        sac.mint(&sender, &10_000);
+        client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
+
+        assert_eq!(
+            client
+                .try_queue_action(&ActionType::SetMaxAmount(0))
+                .unwrap_err()
+                .unwrap(),
+            Error::LimitExceeded
+        );
+        execute_after_delay(
+            &env,
+            &client,
+            &ActionType::SetTokenBlocked(token_address.clone(), true),
+        );
+        assert_eq!(
+            client
+                .try_route_payment(&sender, &recipient, &token_address, &100)
+                .unwrap_err()
+                .unwrap(),
+            Error::TokenBlocked
+        );
+
+        execute_after_delay(
+            &env,
+            &client,
+            &ActionType::SetTokenBlocked(token_address.clone(), false),
+        );
+        execute_after_delay(&env, &client, &ActionType::SetMaxAmount(500));
+        assert_eq!(
+            client
+                .try_route_payment(&sender, &recipient, &token_address, &501)
+                .unwrap_err()
+                .unwrap(),
+            Error::LimitExceeded
+        );
+        client.route_payment(&sender, &recipient, &token_address, &500);
+        assert_eq!(token_client.balance(&recipient), 495);
     }
 
     #[test]
@@ -2664,18 +3232,15 @@ mod test {
         let sender = Address::generate(&env);
         let recipient = Address::generate(&env);
 
-        let (token_address, token_client, stellar_asset_client) = setup_token(&env);
-
-        // Fund the sender.
-        let initial_balance = 10_000i128;
-        stellar_asset_client.mint(&sender, &initial_balance);
+        let token_address = env.register_contract(None, RefundTestToken);
+        let mock_token = RefundTestTokenClient::new(&env, &token_address);
+        mock_token.init(&recipient);
+        mock_token.mint(&sender, &10_000);
+        let token_client = token::Client::new(&env, &token_address);
 
         // Initialize with 1 % fee (100 bps), cap 50, and a large per-day limit.
         client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
         client.add_supported_token(&token_address);
-
-        // Deauthorize the recipient's trustline so any transfer to them fails.
-        stellar_asset_client.set_authorized(&recipient, &false);
 
         // route_payment must succeed (not abort).
         let amount = 2_000i128;
@@ -2684,7 +3249,7 @@ mod test {
         // Fee (1 % of 2000 = 20) still reaches the treasury.
         assert_eq!(token_client.balance(&treasury), 20);
 
-        // Recipient received nothing — trustline was deauthorized.
+        // The rejected recipient received nothing.
         assert_eq!(token_client.balance(&recipient), 0);
 
         // Remainder (1980) must be held by the contract.
@@ -2692,13 +3257,16 @@ mod test {
         assert_eq!(token_client.balance(&contract_id), remainder);
 
         // Sender's refund ledger must reflect the full remainder.
-        assert_eq!(client.get_refund_balance(&sender, &token_address), remainder);
+        assert_eq!(
+            client.get_refund_balance(&sender, &token_address),
+            remainder
+        );
 
         // A "refunded" event must have been published.
         let events = env.events().all();
         let refunded_found = events.iter().any(|evt| {
             let (_cid, topics, _data) = evt;
-            if topics.len() < 1 {
+            if topics.is_empty() {
                 return false;
             }
             let t0: soroban_sdk::Symbol = match topics.get(0).unwrap().try_into_val(&env) {
@@ -2707,7 +3275,10 @@ mod test {
             };
             t0 == symbol_short!("refunded")
         });
-        assert!(refunded_found, "route_payment should publish a \"refunded\" event on trustline failure");
+        assert!(
+            refunded_found,
+            "route_payment should publish a \"refunded\" event on trustline failure"
+        );
     }
 
     #[test]
@@ -2775,7 +3346,7 @@ mod test {
         sac.mint(&sender, &10_000);
 
         client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
-        client.set_min_amount(&100);
+        execute_after_delay(&env, &client, &ActionType::SetMinAmount(100));
 
         // Amount below the minimum must be rejected.
         let res = client.try_route_payment(&sender, &recipient, &token_address, &99);
@@ -2799,7 +3370,7 @@ mod test {
         sac.mint(&sender, &10_000);
 
         client.initialize(&admin, &treasury, &100, &50, &PaymentRouter::MAX_AMOUNT);
-        client.set_min_amount(&100);
+        execute_after_delay(&env, &client, &ActionType::SetMinAmount(100));
 
         // Exactly at the minimum succeeds.
         client.route_payment(&sender, &recipient, &token_address, &100);
@@ -2822,10 +3393,12 @@ mod test {
 
         client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
 
-        client.set_min_amount(&250);
+        let result = client.try_set_min_amount(&250);
+        assert_eq!(result.unwrap_err().unwrap(), Error::TimelockRequired);
 
-        // The invocation must have recorded an authorization for the admin,
-        // proving set_min_amount gates on the admin address.
+        let nonce = client.queue_action(&ActionType::SetMinAmount(250));
+
+        // Queueing the supported action records authorization for the admin.
         let auths = env.auths();
         let admin_auth_present = auths.iter().any(|(addr, _)| *addr == admin);
         assert!(
@@ -2833,12 +3406,13 @@ mod test {
             "set_min_amount must require the admin address to authorize"
         );
 
-        // The stored value must be readable back through routing behaviour.
+        advance_time(&env, PaymentRouter::SECONDS_IN_24H);
+        client.execute_action(&nonce);
+
         let sender = Address::generate(&env);
         let recipient = Address::generate(&env);
         let (token_address, _token_client, sac) = setup_token(&env);
         sac.mint(&sender, &10_000);
-
         let res = client.try_route_payment(&sender, &recipient, &token_address, &249);
         assert_eq!(res.unwrap_err().unwrap(), Error::AmountBelowMinimum);
     }
@@ -2853,15 +3427,18 @@ mod test {
 
         client.initialize(&admin, &treasury, &100, &1000, &PaymentRouter::MAX_AMOUNT);
 
-        // Admin can still update fees before governance is set
-        client.set_fee_bps(&150);
+        // Admin controls fees until governance is installed.
+        execute_after_delay(&client.env, &client, &ActionType::SetFeeBps(150));
         assert_eq!(client.get_fee(), 150);
 
-        // Admin hands control over to governance
-        client.set_governance(&gov);
+        execute_after_delay(
+            &client.env,
+            &client,
+            &ActionType::SetGovernance(gov.clone()),
+        );
 
-        // Governance address can now update the fee
-        client.set_fee_bps(&200);
+        // Governance controls fee actions after it is installed.
+        execute_after_delay(&client.env, &client, &ActionType::SetFeeBps(200));
         assert_eq!(client.get_fee(), 200);
     }
 
@@ -2883,6 +3460,12 @@ mod test {
         assert_eq!(version, expected);
     }
 
+    #[test]
+    fn test_interface_version_is_stable() {
+        let (_env, client, _) = setup_env();
+        assert_eq!(client.interface_version(), PaymentRouter::INTERFACE_VERSION);
+    }
+
     /// The version string must be in MAJOR.MINOR.PATCH format (three
     /// dot-separated numeric components).
     #[test]
@@ -2899,8 +3482,12 @@ mod test {
         let version_str = std::str::from_utf8(&bytes).expect("version should be valid UTF-8");
 
         // Must have exactly two dots (MAJOR.MINOR.PATCH).
-        let parts: Vec<&str> = version_str.split('.').collect();
-        assert_eq!(parts.len(), 3, "version must have three components, got: {version_str}");
+        let parts: std::vec::Vec<&str> = version_str.split('.').collect();
+        assert_eq!(
+            parts.len(),
+            3,
+            "version must have three components, got: {version_str}"
+        );
 
         // Each part must be a non-negative integer.
         for part in &parts {

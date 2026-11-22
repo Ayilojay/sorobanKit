@@ -3,7 +3,7 @@
   "info": {
     "title": "Stellar Tags API",
     "version": "1.0.0",
-    "description": "OpenAPI specification for the Stellar Tags API. Covers the documented endpoints for tags, addresses, activity, and stats.",
+    "description": "OpenAPI specification for the Stellar Tags API. Covers the documented endpoints for tags, addresses, activity, and stats.\n\n## Soft-delete, restore, and username reuse semantics\n\n- **Reservation window**: when a tag (username) is soft-deleted, its name is reserved for a fixed `SOFT_DELETE_RESERVATION_DAYS` (default 30 days) from `deletedAt`. During this window the name cannot be claimed by any other owner.\n- **Restoration proof**: restoring a soft-deleted tag requires the original owner's authenticated identity (bearer token whose subject matches the tag's `ownerId`). The restore request must reference the tag id and the `deletedAt` value observed at deletion time; a mismatch (stale or already-restored) is rejected with `409 Conflict`.\n- **Post-expiry reuse**: once the reservation window elapses, the name becomes reusable. A new registration may claim it; the prior soft-deleted record is retained for audit but can no longer be restored (`410 Gone`).\n- **Transactional transitions**: delete, restore, and registration are enforced transactionally (row-level lock on the name). Concurrent delete/restore/registration cannot produce multiple active owners; losers receive `409 Conflict`.",
     "license": {
       "name": "MIT"
     }
@@ -52,6 +52,7 @@
         "tags": ["Tags"],
         "summary": "Create a tag",
         "operationId": "createTag",
+        "description": "Registers a new tag (username). If the name was soft-deleted and its reservation window has not expired, registration is rejected with `409 Conflict`. Once the window expires the name is reusable.",
         "requestBody": {
           "required": true,
           "content": {
@@ -70,7 +71,8 @@
             }
           },
           "400": { "$ref": "#/components/responses/BadRequest" },
-          "401": { "$ref": "#/components/responses/Unauthorized" }
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "409": { "$ref": "#/components/responses/Conflict" }
         }
       }
     },
@@ -122,12 +124,50 @@
       },
       "delete": {
         "tags": ["Tags"],
-        "summary": "Delete a tag",
+        "summary": "Soft-delete a tag",
         "operationId": "deleteTag",
+        "description": "Soft-deletes the tag and starts the reservation window (`SOFT_DELETE_RESERVATION_DAYS`, default 30 days) during which the name cannot be reused. The transition is transactional; concurrent deletes/restores/registrations cannot create multiple owners.",
         "responses": {
-          "204": { "description": "Tag deleted" },
+          "204": { "description": "Tag soft-deleted" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
-          "404": { "$ref": "#/components/responses/NotFound" }
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/api/tags/{id}/restore": {
+      "parameters": [
+        { "$ref": "#/components/parameters/TagIdParam" }
+      ],
+      "post": {
+        "tags": ["Tags"],
+        "summary": "Restore a soft-deleted tag",
+        "operationId": "restoreTag",
+        "description": "Restores a soft-deleted tag within its reservation window. Requires the original owner's authenticated identity and the `deletedAt` value observed at deletion time as restoration proof. Fails with `409 Conflict` on stale/already-restored state and `410 Gone` after the reservation window expires.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RestoreTagInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Tag restored",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Tag" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "410": { "$ref": "#/components/responses/Gone" }
         }
       }
     },
@@ -179,10 +219,11 @@
       "get": {
         "tags": ["Stats"],
         "summary": "Get platform statistics",
+        "description": "Returns aggregate statistics served from the refreshable reporting read model. The response includes the source watermark and refresh status so clients can reason about staleness. Reporting refreshes run asynchronously and never block payment writes.",
         "operationId": "getStats",
         "responses": {
           "200": {
-            "description": "Aggregate platform statistics",
+            "description": "Aggregate platform statistics from the reporting read model",
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Stats" }
@@ -204,6 +245,52 @@
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Stats" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/api/admin/stats/refresh": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Trigger a reporting read model refresh",
+        "description": "Enqueues an asynchronous refresh of the reporting read model. The refresh runs decoupled from the payment write path and records the source watermark on completion. Returns the current refresh status.",
+        "operationId": "refreshStats",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "202": {
+            "description": "Refresh accepted and running asynchronously",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StatsRefreshStatus" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "409": {
+            "description": "A refresh is already in progress",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/StatsRefreshStatus" } }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Get reporting read model refresh status",
+        "description": "Returns the current refresh status and source watermark of the reporting read model.",
+        "operationId": "getStatsRefreshStatus",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Current refresh status",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StatsRefreshStatus" }
               }
             }
           },
@@ -237,7 +324,7 @@
       "CursorParam": {
         "name": "cursor",
         "in": "query",
-        "description": "Opaque cursor for cursor-based pagination",
+        "description": "Opaque cursor for pagination",
         "schema": { "type": "string" }
       },
       "TagIdParam": {
@@ -251,110 +338,73 @@
         "name": "address",
         "in": "path",
         "required": true,
-        "description": "Stellar account address (G...)",
-        "schema": { "type": "string", "pattern": "^G[A-Z2-7]{55}$" }
+        "description": "Stellar account address",
+        "schema": { "type": "string" }
+      },
+      "TokenParam": {
+        "name": "token",
+        "in": "path",
+        "required": true,
+        "description": "Token identifier (asset code or contract address)",
+        "schema": { "type": "string" }
       }
     },
     "responses": {
       "BadRequest": {
         "description": "Invalid request",
         "content": {
-          "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
         }
       },
       "Unauthorized": {
-        "description": "Authentication required",
+        "description": "Authentication required or invalid credentials",
         "content": {
-          "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
         }
       },
       "Forbidden": {
-        "description": "Insufficient permissions",
+        "description": "Authenticated but not permitted (e.g. not the original owner)",
         "content": {
-          "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
         }
       },
       "NotFound": {
         "description": "Resource not found",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
+        }
+      },
+      "Conflict": {
+        "description": "State transition conflict (name reserved, stale restore proof, or concurrent transition lost)",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+        }
+      },
+      "Gone": {
+        "description": "Reservation window expired; the tag can no longer be restored",
         "content": {
           "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
         }
       }
     },
     "schemas": {
-      "Tag": {
+      "RestoreTagInput": {
         "type": "object",
-        "required": ["id", "address", "name"],
+        "required": ["deletedAt"],
         "properties": {
-          "id": { "type": "string" },
-          "address": { "type": "string" },
-          "name": { "type": "string" },
-          "description": { "type": "string" },
-          "createdAt": { "type": "string", "format": "date-time" },
-          "updatedAt": { "type": "string", "format": "date-time" }
-        }
-      },
-      "TagInput": {
-        "type": "object",
-        "required": ["address", "name"],
-        "properties": {
-          "address": { "type": "string" },
-          "name": { "type": "string" },
-          "description": { "type": "string" }
-        }
-      },
-      "TagList": {
-        "type": "object",
-        "required": ["data"],
-        "properties": {
-          "data": {
-            "type": "array",
-            "items": { "$ref": "#/components/schemas/Tag" }
-          },
-          "page": { "type": "integer" },
-          "limit": { "type": "integer" },
-          "total": { "type": "integer" }
-        }
-      },
-      "Activity": {
-        "type": "object",
-        "required": ["id", "type", "createdAt"],
-        "properties": {
-          "id": { "type": "string" },
-          "type": { "type": "string" },
-          "address": { "type": "string" },
-          "tagId": { "type": "string" },
-          "createdAt": { "type": "string", "format": "date-time" }
-        }
-      },
-      "ActivityList": {
-        "type": "object",
-        "required": ["data"],
-        "properties": {
-          "data": {
-            "type": "array",
-            "items": { "$ref": "#/components/schemas/Activity" }
-          },
-          "nextCursor": { "type": ["string", "null"] },
-          "hasMore": { "type": "boolean" }
-        }
-      },
-      "Stats": {
-        "type": "object",
-        "properties": {
-          "totalTags": { "type": "integer" },
-          "totalAddresses": { "type": "integer" },
-          "totalActivity": { "type": "integer" },
-          "period": { "type": "string" }
-        }
-      },
-      "Error": {
-        "type": "object",
-        "required": ["error"],
-        "properties": {
-          "error": { "type": "string" },
-          "message": { "type": "string" },
-          "details": { "type": "object" }
+          "deletedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The `deletedAt` value observed at deletion time; used as restoration proof. A mismatch is rejected with 409 Conflict."
+          }
         }
       }
     }
