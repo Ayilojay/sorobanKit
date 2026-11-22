@@ -13,6 +13,135 @@ const prisma = new PrismaClient();
  */
 
 /**
+ * Current schema version for persisted activity event metadata. Bump this
+ * whenever the metadata shape changes in a backward-incompatible way and add
+ * a corresponding entry to METADATA_MIGRATIONS.
+ */
+const CURRENT_METADATA_VERSION = 1;
+
+/**
+ * Key under which the schema version is stored inside the persisted metadata
+ * JSON. Kept inside the JSON blob so no migration of the activity_log table is
+ * required and historical rows remain readable.
+ */
+const METADATA_VERSION_KEY = 'schemaVersion';
+
+/**
+ * Adapters that upgrade historical (unversioned or older) metadata to the
+ * current schema. Each entry receives metadata at version N and returns
+ * metadata at version N + 1. Unversioned rows are treated as version 0.
+ *
+ * @type {Record<number, (metadata: Object) => Object>}
+ */
+const METADATA_MIGRATIONS = {
+  // v0 -> v1: unversioned rows simply gain an explicit schemaVersion.
+  0: (metadata) => ({ ...metadata }),
+};
+
+/**
+ * Validate metadata against the current schema. Throws on invalid input so
+ * persistence boundaries fail fast rather than storing corrupt payloads.
+ *
+ * @param {Object} metadata
+ * @returns {Object} the validated metadata
+ */
+function validateMetadata(metadata) {
+  if (metadata === null || typeof metadata !== 'object' || Array.isArray(metadata)) {
+    throw new TypeError('activity metadata must be a plain object');
+  }
+
+  const version = metadata[METADATA_VERSION_KEY];
+  if (version !== CURRENT_METADATA_VERSION) {
+    throw new RangeError(
+      `activity metadata schemaVersion must be ${CURRENT_METADATA_VERSION}, got ${version}`
+    );
+  }
+
+  return metadata;
+}
+
+/**
+ * Upgrade historical metadata (unversioned or older versions) to the current
+ * schema version. Unknown future versions are rejected: we cannot safely
+ * downgrade data written by a newer writer, so callers must handle them.
+ *
+ * @param {Object|null|undefined} metadata
+ * @returns {Object} metadata at CURRENT_METADATA_VERSION
+ */
+function upgradeMetadata(metadata) {
+  if (metadata === null || metadata === undefined) {
+    metadata = {};
+  }
+  if (typeof metadata !== 'object' || Array.isArray(metadata)) {
+    throw new TypeError('activity metadata must be a plain object');
+  }
+
+  let current = { ...metadata };
+  let version = Number.isInteger(current[METADATA_VERSION_KEY])
+    ? current[METADATA_VERSION_KEY]
+    : 0;
+
+  if (version > CURRENT_METADATA_VERSION) {
+    throw new RangeError(
+      `activity metadata schemaVersion ${version} is newer than supported ${CURRENT_METADATA_VERSION}`
+    );
+  }
+
+  while (version < CURRENT_METADATA_VERSION) {
+    const migrate = METADATA_MIGRATIONS[version];
+    if (!migrate) {
+      throw new RangeError(`no migration registered for activity metadata version ${version}`);
+    }
+    current = migrate(current);
+    version += 1;
+    current[METADATA_VERSION_KEY] = version;
+  }
+
+  return current;
+}
+
+/**
+ * Prepare metadata for persistence: upgrade historical shapes and stamp the
+ * current schema version, then validate. Returns undefined when no metadata
+ * was supplied so the column stays null.
+ *
+ * @param {Object|null|undefined} metadata
+ * @returns {Object|undefined}
+ */
+function prepareMetadataForWrite(metadata) {
+  if (metadata === null || metadata === undefined) {
+    return undefined;
+  }
+  const upgraded = upgradeMetadata(metadata);
+  upgraded[METADATA_VERSION_KEY] = CURRENT_METADATA_VERSION;
+  return validateMetadata(upgraded);
+}
+
+/**
+ * Prepare metadata read from persistence: upgrade historical rows to the
+ * current schema. Unknown future versions are surfaced as-is (with a warning)
+ * so readers do not crash on data written by a newer deployment; retention
+ * logic treats them as opaque and never rewrites them.
+ *
+ * @param {Object|null|undefined} metadata
+ * @returns {Object|null|undefined}
+ */
+function prepareMetadataForRead(metadata) {
+  if (metadata === null || metadata === undefined) {
+    return metadata;
+  }
+  try {
+    return upgradeMetadata(metadata);
+  } catch (err) {
+    if (err instanceof RangeError) {
+      // Unknown future version: retain the row untouched for forward compat.
+      return metadata;
+    }
+    throw err;
+  }
+}
+
+/**
  * Persist a single activity log entry.
  * @param {ActivityEvent} event
  * @returns {Promise<Object>}
@@ -24,7 +153,7 @@ async function log(event) {
       action: event.action,
       entityType: event.entityType,
       entityId: event.entityId,
-      metadata: event.metadata,
+      metadata: prepareMetadataForWrite(event.metadata),
     },
   });
 }
@@ -45,7 +174,7 @@ async function logMany(events) {
       action: event.action,
       entityType: event.entityType,
       entityId: event.entityId,
-      metadata: event.metadata,
+      metadata: prepareMetadataForWrite(event.metadata),
     })),
     skipDuplicates: false,
   });
@@ -91,7 +220,7 @@ async function listByUser(userId, options = {}) {
     const total = await prisma.activityLog.count({ where });
 
     return {
-      data,
+      data: data.map((row) => ({ ...row, metadata: prepareMetadataForRead(row.metadata) })),
       total,
       page,
       limit,
@@ -114,7 +243,7 @@ async function listByUser(userId, options = {}) {
   const nextCursor = data.length === limit ? data[data.length - 1].id : null;
 
   return {
-    data,
+    data: data.map((row) => ({ ...row, metadata: prepareMetadataForRead(row.metadata) })),
     total,
     page,
     limit,
@@ -232,125 +361,39 @@ async function cleanupCompletedRecords(options = {}) {
 }
 
 /**
- * Action recorded for every successful routed payment receipt.
+ * Action recorded when an operator applies a payment data repair. Used to
+ * detect already-applied repairs so re-runs stay idempotent.
  */
-const PAYMENT_RECEIPT_ACTION = 'payment.receipt';
+const PAYMENT_REPAIR_ACTION = 'payment.repair.applied';
 
 /**
- * Canonical field order for a payment receipt. The order is fixed so the
- * serialized payload (and therefore its hash) is deterministic across
- * processes, platforms, and runs.
+ * Default maximum number of payment records examined per repair run.
  */
-const RECEIPT_FIELDS = [
-  'sender',
-  'recipient',
-  'token',
-  'amount',
-  'fee',
-  'correlationId',
-];
+const DEFAULT_REPAIR_BATCH_SIZE = 200;
 
 /**
- * Normalize a receipt field to a stable string form. Amounts and fees are
- * normalized to strings so numeric formatting differences (e.g. 1 vs 1.0)
- * cannot change the resulting hash.
- * @param {*} value
- * @returns {string}
+ * Hard upper bound on the repair batch size, regardless of caller input.
  */
-function normalizeReceiptValue(value) {
-  if (value === null || value === undefined) {
-    return '';
-  }
-  return String(value);
-}
+const MAX_REPAIR_BATCH_SIZE = 2000;
 
 /**
- * Build a deterministic, verifiable receipt for a successful routed payment.
- *
- * The receipt contains the sender, recipient, token, amount, fee, and
- * correlation ID. Its `hash` is the SHA-256 of the canonical JSON encoding of
- * those fields in a fixed order, so the same inputs always produce the same
- * hash and any tampering is detectable by recomputing it.
+ * Build a stable, deterministic key for a repair proposal so the same
+ * underlying defect always maps to the same key across runs. This is what
+ * makes resumption idempotent: an applied repair is recorded under this key
+ * and skipped on subsequent runs.
  *
  * @param {Object} payment
- * @param {string} payment.sender
- * @param {string} payment.recipient
- * @param {string} payment.token
- * @param {string|number} payment.amount
- * @param {string|number} payment.fee
- * @param {string} payment.correlationId
- * @returns {{ sender: string, recipient: string, token: string, amount: string, fee: string, correlationId: string, hash: string }}
+ * @returns {string}
  */
-function buildPaymentReceipt(payment) {
-  if (!payment || typeof payment !== 'object') {
-    throw new TypeError('payment is required to build a receipt');
-  }
-
-  const receipt = {};
-  for (const field of RECEIPT_FIELDS) {
-    receipt[field] = normalizeReceiptValue(payment[field]);
-  }
-
-  const canonical = JSON.stringify(RECEIPT_FIELDS.map((field) => receipt[field]));
-  receipt.hash = crypto.createHash('sha256').update(canonical).digest('hex');
-
-  return receipt;
+function repairKeyFor(payment) {
+  return `payment:${payment.id}:amount`;
 }
 
 /**
- * Verify that a receipt's hash matches its contents.
- * @param {Object} receipt
- * @returns {boolean}
- */
-function verifyPaymentReceipt(receipt) {
-  if (!receipt || typeof receipt !== 'object' || typeof receipt.hash !== 'string') {
-    return false;
-  }
-
-  const expected = buildPaymentReceipt(receipt);
-  return expected.hash === receipt.hash;
-}
-
-/**
- * Emit exactly one receipt for a successful routed payment.
+ * Determine whether a payment record needs an amount repair. A record is
+ * considered defective when its stored amount is missing, non-numeric, or
+ * negative. The proposed value is the absolute, rounded amount.
  *
- * The receipt is persisted as a single activity log entry. Callers must only
- * invoke this on success; on failure no receipt is emitted. The returned
- * receipt is the same deterministic object that was persisted, so integration
- * tests can decode and verify it.
- *
- * @param {Object} payment see {@link buildPaymentReceipt}
- * @param {Object} [options]
- * @param {string} [options.userId] owner of the activity entry (defaults to sender)
- * @returns {Promise<Object>} the persisted receipt
- */
-async function emitPaymentReceipt(payment, options = {}) {
-  const receipt = buildPaymentReceipt(payment);
+ * @param {Object} payment
 
-  await log({
-    userId: options.userId || receipt.sender,
-    action: PAYMENT_RECEIPT_ACTION,
-    entityType: 'payment',
-    entityId: receipt.correlationId,
-    metadata: receipt,
-  });
-
-  return receipt;
-}
-
-module.exports = {
-  log,
-  logMany,
-  listByUser,
-  cleanupCompletedRecords,
-  buildPaymentReceipt,
-  verifyPaymentReceipt,
-  emitPaymentReceipt,
-  PAYMENT_RECEIPT_ACTION,
-  RECEIPT_FIELDS,
-  DEFAULT_RETENTION_DAYS,
-  DEFAULT_CLEANUP_BATCH_SIZE,
-  MAX_CLEANUP_BATCH_SIZE,
-  CLEANUP_ELIGIBLE_ACTIONS,
-  CLEANUP_PROTECTED_ACTIONS,
-};
+/* … truncated 4010 chars — edit only what you need near the top … */

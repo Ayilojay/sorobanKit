@@ -11,7 +11,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { execSync } = require('child_process');
+const { execFileSync, execSync } = require('child_process');
 
 // ── Network Configurations ───────────────────────────────────────────────────
 
@@ -61,6 +61,340 @@ const DEFAULT_OPTIMIZED_WASM_PATH = path.join(
   'payment_router.optimized.wasm'
 );
 const WASM_HASH_MANIFEST_PATH = path.join(CONTRACT_DIR, 'wasm.sha256');
+const DEFAULT_RELEASE_MANIFEST_PATH = path.join(
+  CONTRACT_DIR,
+  'release-manifest.json'
+);
+
+const hashesEqual = (left, right) => {
+  if (!/^[a-f0-9]{64}$/i.test(left) || !/^[a-f0-9]{64}$/i.test(right)) {
+    return false;
+  }
+  return crypto.timingSafeEqual(
+    Buffer.from(left.toLowerCase(), 'hex'),
+    Buffer.from(right.toLowerCase(), 'hex')
+  );
+};
+
+const topologicallySortContracts = (contracts) => {
+  const contractsByName = new Map(contracts.map((contract) => [contract.name, contract]));
+  const state = new Map();
+  const ordered = [];
+
+  const visit = (contract) => {
+    const visitState = state.get(contract.name);
+    if (visitState === 'visiting') {
+      throw new Error(`Release manifest dependency cycle includes "${contract.name}".`);
+    }
+    if (visitState === 'visited') {
+      return;
+    }
+
+    state.set(contract.name, 'visiting');
+    for (const dependencyName of contract.dependencies) {
+      const dependency = contractsByName.get(dependencyName);
+      if (!dependency) {
+        throw new Error(
+          `Contract "${contract.name}" depends on unknown contract "${dependencyName}".`
+        );
+      }
+      visit(dependency);
+    }
+    state.set(contract.name, 'visited');
+    ordered.push(contract);
+  };
+
+  for (const contract of contracts) {
+    visit(contract);
+  }
+  return ordered;
+};
+
+/**
+ * Loads and fully validates a coordinated-release manifest and every local
+ * WASM artifact before any network operation is attempted.
+ */
+const loadReleaseManifest = (manifestPath, selectedNetwork) => {
+  const absoluteManifestPath = path.resolve(manifestPath);
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(absoluteManifestPath, 'utf8'));
+  } catch (error) {
+    throw new Error(`Cannot read release manifest ${absoluteManifestPath}: ${error.message}`);
+  }
+
+  if (!manifest || manifest.schema_version !== 1) {
+    throw new Error('Release manifest must have schema_version 1.');
+  }
+  if (!NETWORKS[manifest.network]) {
+    throw new Error(`Release manifest has unsupported network "${manifest.network}".`);
+  }
+  if (selectedNetwork && manifest.network !== selectedNetwork) {
+    throw new Error(
+      `Release manifest network "${manifest.network}" does not match selected network "${selectedNetwork}".`
+    );
+  }
+  if (!Array.isArray(manifest.contracts) || manifest.contracts.length === 0) {
+    throw new Error('Release manifest must contain at least one contract.');
+  }
+
+  const names = new Set();
+  const contractIds = new Set();
+  const contracts = manifest.contracts.map((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new Error('Every release manifest contract must be an object.');
+    }
+    if (typeof entry.name !== 'string' || !/^[a-z][a-z0-9_-]*$/.test(entry.name)) {
+      throw new Error('Contract names must start with a lowercase letter and use lowercase letters, digits, "_" or "-".');
+    }
+    if (names.has(entry.name)) {
+      throw new Error(`Duplicate contract name "${entry.name}" in release manifest.`);
+    }
+    names.add(entry.name);
+
+    if (typeof entry.contract_id !== 'string' || !/^C[A-Z2-7]{55}$/.test(entry.contract_id)) {
+      throw new Error(`Contract "${entry.name}" must have a valid-format contract_id.`);
+    }
+    if (contractIds.has(entry.contract_id)) {
+      throw new Error(`Duplicate contract_id "${entry.contract_id}" in release manifest.`);
+    }
+    contractIds.add(entry.contract_id);
+
+    if (typeof entry.wasm_path !== 'string' || entry.wasm_path.length === 0) {
+      throw new Error(`Contract "${entry.name}" must have a wasm_path.`);
+    }
+    if (typeof entry.wasm_sha256 !== 'string' || !/^[a-fA-F0-9]{64}$/.test(entry.wasm_sha256)) {
+      throw new Error(`Contract "${entry.name}" must have a 64-character wasm_sha256.`);
+    }
+    if (!Number.isSafeInteger(entry.interface_version) || entry.interface_version < 1) {
+      throw new Error(`Contract "${entry.name}" must have a positive integer interface_version.`);
+    }
+    if (!Array.isArray(entry.dependencies) ||
+        entry.dependencies.some((dependency) => typeof dependency !== 'string') ||
+        new Set(entry.dependencies).size !== entry.dependencies.length) {
+      throw new Error(`Contract "${entry.name}" must have a unique dependencies array.`);
+    }
+
+    const wasmPath = path.resolve(path.dirname(absoluteManifestPath), entry.wasm_path);
+    if (!fs.existsSync(wasmPath)) {
+      throw new Error(`WASM file for contract "${entry.name}" does not exist: ${wasmPath}`);
+    }
+    const actualHash = computeLocalWasmHash(wasmPath);
+    if (!hashesEqual(actualHash, entry.wasm_sha256)) {
+      throw new Error(
+        `WASM hash mismatch for "${entry.name}": manifest=${entry.wasm_sha256.toLowerCase()} local=${actualHash}.`
+      );
+    }
+    if (entry.dependencies.includes(entry.name)) {
+      throw new Error(`Contract "${entry.name}" cannot depend on itself.`);
+    }
+    if (entry.queued_action_nonce !== undefined &&
+        (!Number.isSafeInteger(entry.queued_action_nonce) || entry.queued_action_nonce < 1)) {
+      throw new Error(`Contract "${entry.name}" has an invalid queued_action_nonce.`);
+    }
+
+    return {
+      ...entry,
+      resolved_wasm_path: wasmPath,
+      wasm_sha256: entry.wasm_sha256.toLowerCase(),
+    };
+  });
+
+  return {
+    manifest: { ...manifest, contracts },
+    manifestPath: absoluteManifestPath,
+    orderedContracts: topologicallySortContracts(contracts),
+  };
+};
+
+const writeReleaseManifest = (manifestPath, manifest) => {
+  const temporaryPath = `${manifestPath}.${process.pid}.tmp`;
+  const serializableManifest = {
+    ...manifest,
+    contracts: manifest.contracts.map((entry) => {
+      const contract = { ...entry };
+      delete contract.resolved_wasm_path;
+      return contract;
+    }),
+  };
+  try {
+    fs.writeFileSync(temporaryPath, `${JSON.stringify(serializableManifest, null, 2)}\n`, 'utf8');
+    fs.renameSync(temporaryPath, manifestPath);
+  } catch (error) {
+    if (fs.existsSync(temporaryPath)) {
+      fs.unlinkSync(temporaryPath);
+    }
+    throw new Error(`Could not persist release manifest ${manifestPath}: ${error.message}`);
+  }
+};
+
+const readOnChainContractWasmHash = (contractId, network, runCommand = execFileSync) => {
+  const output = String(
+    runCommand(
+      'stellar',
+      ['contract', 'info', '--id', contractId, '--network', network.name, '--rpc-url', network.rpcUrl],
+      { cwd: CONTRACT_DIR, encoding: 'utf8' }
+    )
+  );
+  const match = output.match(/(?:wasm(?:_hash)?|wasm hash)\s*[:=]\s*["']?([a-f0-9]{64})/i);
+  if (!match) {
+    throw new Error(`Could not read the deployed WASM hash for contract ${contractId}.`);
+  }
+  return match[1].toLowerCase();
+};
+
+const readOnChainInterfaceVersion = (contractId, network, runCommand = execFileSync) => {
+  const output = String(
+    runCommand(
+      'stellar',
+      ['contract', 'invoke', '--id', contractId, '--network', network.name, '--rpc-url', network.rpcUrl, '--', 'interface_version'],
+      { cwd: CONTRACT_DIR, encoding: 'utf8' }
+    )
+  );
+  const match = output.match(/(?:^|\n)\s*(\d+)\s*(?:\n|$)/);
+  if (!match) {
+    throw new Error(`Could not read the interface version for contract ${contractId}.`);
+  }
+  return Number(match[1]);
+};
+
+const upgradeReleaseManifest = async (options) => {
+  const { manifest, manifestPath, orderedContracts } = loadReleaseManifest(
+    options.manifestPath || DEFAULT_RELEASE_MANIFEST_PATH,
+    options.network
+  );
+  const network = NETWORKS[manifest.network];
+  const runCommand = options.runCommand || execFileSync;
+  if (options.dryRun) {
+    for (const contract of orderedContracts) {
+      if (options.execute) {
+        logDryRun(`execute queued upgrade ${contract.queued_action_nonce} for ${contract.name}`);
+        logDryRun(`verify deployed WASM hash and interface version for ${contract.name}`);
+      } else if (contract.queued_action_nonce) {
+        logDryRun(`keep existing queued upgrade ${contract.queued_action_nonce} for ${contract.name}`);
+      } else {
+        logDryRun(`install ${contract.name} WASM ${contract.wasm_sha256} on ${network.name}`);
+        logDryRun(`queue upgrade ${contract.contract_id} after dependencies`);
+      }
+    }
+    return;
+  }
+
+  const invoke = (contract, method, args, inheritOutput = false) => {
+    const invokeArgs = [
+      'contract',
+      'invoke',
+      '--id',
+      contract.contract_id,
+      '--network',
+      network.name,
+      '--rpc-url',
+      network.rpcUrl,
+    ];
+    if (options.source) {
+      invokeArgs.push('--source', options.source);
+    }
+    invokeArgs.push('--', method, ...args);
+    return runCommand(
+      'stellar',
+      invokeArgs,
+      inheritOutput
+        ? { cwd: CONTRACT_DIR, stdio: 'inherit' }
+        : { cwd: CONTRACT_DIR, encoding: 'utf8' }
+    );
+  };
+
+  const getContractHash = options.getContractHash || ((contractId) =>
+    readOnChainContractWasmHash(contractId, network, runCommand));
+  const getInterfaceVersion = options.getInterfaceVersion || ((contractId) =>
+    readOnChainInterfaceVersion(contractId, network, runCommand));
+
+  if (options.execute) {
+    if (!orderedContracts.some((contract) => contract.queued_action_nonce)) {
+      throw new Error('No queued upgrades are recorded in the release manifest.');
+    }
+    for (const contract of orderedContracts) {
+      if (contract.queued_action_nonce) {
+        const currentHash = String(await getContractHash(contract.contract_id)).toLowerCase();
+        if (!hashesEqual(currentHash, contract.wasm_sha256)) {
+          invoke(contract, 'execute_action', ['--nonce', String(contract.queued_action_nonce)], true);
+        }
+      }
+
+      const deployedHash = String(await getContractHash(contract.contract_id)).toLowerCase();
+      if (!hashesEqual(deployedHash, contract.wasm_sha256)) {
+        throw new Error(`Deployed contract WASM hash verification failed for "${contract.name}".`);
+      }
+      const interfaceVersion = Number(await getInterfaceVersion(contract.contract_id));
+      if (interfaceVersion !== contract.interface_version) {
+        throw new Error(
+          `Interface version mismatch for "${contract.name}": expected ${contract.interface_version}, got ${interfaceVersion}.`
+        );
+      }
+      if (contract.queued_action_nonce) {
+        const manifestContract = manifest.contracts.find(({ name }) => name === contract.name);
+        delete manifestContract.queued_action_nonce;
+        writeReleaseManifest(manifestPath, manifest);
+      }
+      console.log(
+        `✅ Verified ${contract.name}: WASM ${deployedHash}, interface ${interfaceVersion}`
+      );
+    }
+    return;
+  }
+
+  const getUploadedHash = options.getUploadedHash || fetchOnChainWasmHash;
+  for (const contract of orderedContracts) {
+    if (contract.queued_action_nonce) {
+      console.log(
+        `ℹ️  Keeping existing queued upgrade ${contract.queued_action_nonce} for ${contract.name}`
+      );
+      continue;
+    }
+    const installArgs = [
+      'contract',
+      'install',
+      '--wasm',
+      contract.resolved_wasm_path,
+      '--network',
+      network.name,
+      '--rpc-url',
+      network.rpcUrl,
+    ];
+    if (options.source) {
+      installArgs.push('--source', options.source);
+    }
+    const installedHash = String(
+      runCommand('stellar', installArgs, { cwd: CONTRACT_DIR, encoding: 'utf8' })
+    ).trim().toLowerCase();
+    if (!hashesEqual(installedHash, contract.wasm_sha256)) {
+      throw new Error(
+        `Installed WASM hash for "${contract.name}" does not match its release manifest entry.`
+      );
+    }
+    const uploadedHash = String(await getUploadedHash(installedHash, network)).toLowerCase();
+    if (!hashesEqual(uploadedHash, contract.wasm_sha256)) {
+      throw new Error(`Uploaded WASM hash verification failed for "${contract.name}".`);
+    }
+
+    const queueOutput = String(
+      invoke(contract, 'queue_upgrade', ['--new_wasm_hash', installedHash])
+    ).trim();
+    const nonceMatch = queueOutput.match(/(?:^|\n)\s*"?(\d+)"?\s*(?:\n|$)/g);
+    if (!nonceMatch) {
+      throw new Error(`Could not read the timelock nonce for "${contract.name}" upgrade.`);
+    }
+    const nonce = Number(nonceMatch[nonceMatch.length - 1].trim().replace(/"/g, ''));
+    if (!Number.isSafeInteger(nonce) || nonce < 1) {
+      throw new Error(`Invalid timelock nonce returned for "${contract.name}" upgrade.`);
+    }
+    manifest.contracts.find(({ name }) => name === contract.name).queued_action_nonce = nonce;
+    writeReleaseManifest(manifestPath, manifest);
+    console.log(
+      `✅ Queued ${contract.name} upgrade as action ${nonce}; execute after the 24-hour delay.`
+    );
+  }
+};
 
 // ── WASM Hash Verification ───────────────────────────────────────────────────
 
@@ -104,16 +438,27 @@ const fetchOnChainWasmHash = async (wasmHash, network) => {
   }
 
   const result = payload.result;
-  const onChainHash =
-    typeof result === 'string'
+  const reportedHash =
+    typeof result === 'string' && /^[a-fA-F0-9]{64}$/.test(result)
       ? result
       : result && (result.hash || result.wasmHash || result.wasm_hash);
-
-  if (!onChainHash) {
-    throw new Error('RPC response did not include a WASM hash');
+  if (reportedHash) {
+    return String(reportedHash).toLowerCase();
   }
 
-  return String(onChainHash).toLowerCase();
+  const wasmBase64 = typeof result === 'string' ? result : result && result.wasm;
+  if (typeof wasmBase64 !== 'string' || wasmBase64.length === 0) {
+    throw new Error('RPC response did not include a WASM blob or hash');
+  }
+  const normalizedBase64 = wasmBase64.replace(/\s/g, '');
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(normalizedBase64)) {
+    throw new Error('RPC response included an invalid WASM blob');
+  }
+  const wasm = Buffer.from(normalizedBase64, 'base64');
+  if (wasm.length === 0) {
+    throw new Error('RPC response included an invalid WASM blob');
+  }
+  return crypto.createHash('sha256').update(wasm).digest('hex');
 };
 
 /**
@@ -140,7 +485,7 @@ const verifyWasmHash = async (wasmPath, uploadedHash, network, options = {}) => 
   console.log(`🔎 Expected WASM hash (local):  ${expectedHash}`);
   console.log(`🔎 Actual WASM hash (on-chain): ${actualHash}`);
 
-  if (expectedHash !== actualHash) {
+  if (!hashesEqual(expectedHash, actualHash)) {
     console.error('❌ WASM hash mismatch: the uploaded contract does not match the local file.');
     console.error(`   Expected: ${expectedHash}`);
     console.error(`   Actual:   ${actualHash}`);
@@ -225,7 +570,7 @@ const verifyLocalWasmHash = (wasmPath, options = {}) => {
   console.log(`🔎 Expected WASM hash (manifest): ${expectedHash}`);
   console.log(`🔎 Actual WASM hash (local):     ${actualHash}`);
 
-  if (expectedHash !== actualHash) {
+  if (!hashesEqual(expectedHash, actualHash)) {
     console.error('❌ WASM hash mismatch: the compiled WASM does not match the committed manifest.');
     console.error(`   Expected: ${expectedHash}`);
     console.error(`   Actual:   ${actualHash}`);
@@ -257,6 +602,8 @@ const parseArgs = (argv = process.argv.slice(2)) => {
     maxAmount: '1000000000000000',
     contractId: process.env.CONTRACT_ID || process.env.PAYMENT_ROUTER_CONTRACT_ID || null,
     wasmPath: null,
+    manifestPath: null,
+    timelockNonce: null,
     dryRun: false,
     skipBuild: false,
     skipHashCheck: false,
@@ -296,6 +643,12 @@ const parseArgs = (argv = process.argv.slice(2)) => {
       options.contractId = argv[++i];
     } else if (arg === '--wasm') {
       options.wasmPath = argv[++i];
+    } else if (arg === '--manifest') {
+      options.manifestPath = path.resolve(argv[++i]);
+    } else if (arg === '--nonce') {
+      options.timelockNonce = Number(argv[++i]);
+    } else if (arg === '--execute') {
+      options.execute = true;
     } else if (arg === '--dry-run') {
       options.dryRun = true;
     } else if (arg === '--skip-build') {
@@ -311,7 +664,7 @@ const parseArgs = (argv = process.argv.slice(2)) => {
 
   if (positional.length > 0) {
     const cmd = positional[0].toLowerCase();
-    if (['build', 'deploy', 'upgrade', 'init', 'status', 'verify-hash'].includes(cmd)) {
+    if (['build', 'deploy', 'upgrade', 'upgrade-manifest', 'execute-action', 'init', 'status', 'verify-hash'].includes(cmd)) {
       options.command = cmd;
     }
     if (positional[1] && !options.contractId) {
@@ -555,11 +908,7 @@ const readContractAdmin = (network, contractId) => {
 };
 
 /**
- * Upgrades an existing contract to a new WASM hash, preserving the admin.
- *
- * The admin address is read from the live contract before the upgrade.  After
- * the upgrade the same address is written back via set_admin so that a WASM
- * migration that resets instance storage cannot silently remove the admin.
+ * Queues an existing contract's WASM upgrade for the 24-hour timelock.
  *
  * @param {object} options
  * @param {string} contractId
@@ -571,55 +920,51 @@ const upgradeContract = (options, contractId, wasmPath) => {
 
   if (options.dryRun) {
     logDryRun(
-      `stellar contract invoke --id ${contractId} --network ${network.name} -- get_admin`
-    );
-    logDryRun(
       `stellar contract install --wasm ${wasmPath} --network ${network.name} --rpc-url ${network.rpcUrl}`
     );
     logDryRun(
-      `stellar contract invoke --id ${contractId} --network ${network.name} ${sourceFlag} -- upgrade --new_wasm_hash <hash>`
-    );
-    logDryRun(
-      `stellar contract invoke --id ${contractId} --network ${network.name} ${sourceFlag} -- set_admin --new_admin <admin>`
+      `stellar contract invoke --id ${contractId} --network ${network.name} ${sourceFlag} -- queue_upgrade --new_wasm_hash <hash>`
     );
     return;
   }
 
-  // 1. Snapshot the admin before touching the contract.
-  const adminBefore = readContractAdmin(network, contractId) || options.admin;
-  if (adminBefore) {
-    console.log(`📋 Admin before upgrade: ${adminBefore}`);
-  } else {
-    console.warn('[deploy] Could not read admin before upgrade; admin may not be restored.');
+  const wasmHash = String(
+    execFileSync(
+      'stellar',
+      [
+        'contract',
+        'install',
+        '--wasm',
+        wasmPath,
+        '--network',
+        network.name,
+        '--rpc-url',
+        network.rpcUrl,
+      ],
+      { cwd: CONTRACT_DIR, encoding: 'utf8' }
+    )
+  ).trim();
+  if (!/^[a-fA-F0-9]{64}$/.test(wasmHash)) {
+    throw new Error(`Could not read the installed WASM hash: ${wasmHash}`);
   }
 
-  const installOutput = execSync(
-    `stellar contract install --wasm ${wasmPath} --network ${network.name} --rpc-url ${network.rpcUrl}`,
-    { cwd: CONTRACT_DIR, encoding: 'utf8' }
-  );
-  const wasmHash = installOutput.trim();
-
-  execSync(
-    `stellar contract invoke --id ${contractId} --network ${network.name} ${sourceFlag} -- upgrade --new_wasm_hash ${wasmHash}`,
-    { cwd: CONTRACT_DIR, stdio: 'inherit' }
-  );
-
-  // 2. Explicitly restore the admin so a migration that clears instance storage
-  //    cannot leave the contract without an owner.
-  if (adminBefore) {
-    try {
-      execSync(
-        `stellar contract invoke --id ${contractId} --network ${network.name} ${sourceFlag} -- set_admin --new_admin ${adminBefore}`,
-        { cwd: CONTRACT_DIR, stdio: 'inherit' }
-      );
-      console.log(`✅ Admin restored after upgrade: ${adminBefore}`);
-    } catch (err) {
-      console.warn(
-        '[deploy] set_admin call after upgrade failed — admin may already be set:',
-        err.message,
-      );
-    }
+  const invokeArgs = ['contract', 'invoke', '--id', contractId, '--network', network.name];
+  if (options.source) {
+    invokeArgs.push('--source', options.source);
   }
+  invokeArgs.push('--', 'queue_upgrade', '--new_wasm_hash', wasmHash);
+  const queueOutput = String(
+    execFileSync('stellar', invokeArgs, { cwd: CONTRACT_DIR, encoding: 'utf8' })
+  ).trim();
+  const nonceMatch = queueOutput.match(/^(?:"?)(\d+)(?:"?)$/);
+  if (!nonceMatch) {
+    throw new Error(`Could not read the timelock nonce from upgrade result: ${queueOutput}`);
+  }
+  const nonce = Number(nonceMatch[1]);
+  console.log(`✅ Upgrade queued as action ${nonce}. It can be executed after 24 hours with:`);
+  console.log(
+    `node scripts/deploy.js execute-action --contract-id ${contractId} --nonce ${nonce} --network ${network.name}${options.source ? ` --source ${options.source}` : ''}`
+  );
 };
 
 /**
@@ -670,11 +1015,22 @@ const validateOptions = (options) => {
     }
   }
 
-  if (options.command === 'upgrade' || options.command === 'status') {
+  if (options.command === 'upgrade' || options.command === 'status' || options.command === 'execute-action') {
     if (!options.contractId) {
       console.error('❌ Missing --contract-id.');
       return false;
     }
+  }
+
+  if (options.command === 'execute-action' &&
+      (!Number.isSafeInteger(options.timelockNonce) || options.timelockNonce < 1)) {
+    console.error('❌ Missing or invalid --nonce.');
+    return false;
+  }
+
+  if (options.command === 'upgrade-manifest' && !options.manifestPath) {
+    console.error('❌ Missing --manifest path for coordinated upgrade.');
+    return false;
   }
 
   return true;
@@ -693,7 +1049,9 @@ Commands:
   build                 Compile and optimize the contract WASM
   verify-hash           Verify the compiled WASM hash against payment_router/wasm.sha256
   deploy                Compile, deploy, and initialize the contract
-  upgrade               Upgrade an existing contract
+  upgrade               Queue a single-contract upgrade
+  upgrade-manifest      Validate and queue a coordinated upgrade
+  execute-action        Execute a matured timelock action
   init                  Initialize an existing contract
   status                Show current contract configuration
 
@@ -705,8 +1063,11 @@ Options:
       --fee-bps <n>     Fee in basis points (default: 100)
       --fee-cap <n>     Fee cap (default: 10000000)
       --max-amount <n>  Max transfer amount
-  -c, --contract-id <id> Contract ID (for upgrade/init/status)
+  -c, --contract-id <id> Contract ID (for upgrade/init/status/execute-action)
       --wasm <path>     Use a pre-built WASM file
+      --manifest <path> Release manifest for upgrade-manifest
+      --execute         Execute queued manifest upgrades after 24 hours
+      --nonce <number>  Timelock nonce for execute-action
       --dry-run         Simulate the workflow without RPC calls or on-chain transactions
       --skip-build      Skip WASM compilation
       --skip-hash-check Bypass the pre-deployment WASM hash verification
@@ -718,7 +1079,7 @@ Options:
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
-const main = () => {
+const main = async () => {
   const options = parseArgs();
 
   if (options.command === 'help') {
@@ -741,6 +1102,40 @@ const main = () => {
   console.log(`\n🌐 Network: ${network.name} (${network.rpcUrl})`);
   if (options.dryRun) {
     console.log('🧪 DRY RUN enabled — no RPC calls or on-chain transactions will be made.');
+  }
+
+  if (options.command === 'upgrade-manifest') {
+    await upgradeReleaseManifest(options);
+    return;
+  }
+
+  if (options.command === 'execute-action') {
+    const network = NETWORKS[options.network];
+    const sourceFlag = options.source ? `--source ${options.source}` : '';
+    if (options.dryRun) {
+      logDryRun(
+        `stellar contract invoke --id ${options.contractId} --network ${network.name} ${sourceFlag} -- execute_action --nonce ${options.timelockNonce}`
+      );
+    } else {
+      const invokeArgs = [
+        'contract',
+        'invoke',
+        '--id',
+        options.contractId,
+        '--network',
+        network.name,
+      ];
+      if (options.source) {
+        invokeArgs.push('--source', options.source);
+      }
+      invokeArgs.push('--', 'execute_action', '--nonce', String(options.timelockNonce));
+      execFileSync(
+        'stellar',
+        invokeArgs,
+        { cwd: CONTRACT_DIR, stdio: 'inherit' }
+      );
+    }
+    return;
   }
 
   let wasmPath = options.wasmPath;
@@ -811,7 +1206,7 @@ const main = () => {
       console.log('\n✅ Dry run complete. No transactions were submitted.');
       return;
     }
-    console.log('✅ Contract upgraded.');
+    console.log('✅ Upgrade action queued.');
     return;
   }
 
@@ -822,7 +1217,10 @@ const main = () => {
 };
 
 if (require.main === module) {
-  main();
+  main().catch((error) => {
+    console.error(`[deploy] ${error.message}`);
+    process.exitCode = 1;
+  });
 }
 
 module.exports = {
@@ -832,9 +1230,15 @@ module.exports = {
   updateAllConfigs,
   compileAndOptimizeWasm,
   computeLocalWasmHash,
+  fetchOnChainWasmHash,
   readExpectedWasmHash,
   writeExpectedWasmHash,
   verifyLocalWasmHash,
+  topologicallySortContracts,
+  loadReleaseManifest,
+  readOnChainContractWasmHash,
+  readOnChainInterfaceVersion,
+  upgradeReleaseManifest,
   deployContract,
   initializeContract,
   upgradeContract,

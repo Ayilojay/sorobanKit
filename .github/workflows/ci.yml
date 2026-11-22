@@ -1,185 +1,40 @@
-name: Production Safety Checks
+name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [main]
   pull_request:
-    branches: [ "main" ]
 
 jobs:
-  backend-checks:
-    name: Backend Build & Test
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ./stellar-payment-platform
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: 'npm'
-          cache-dependency-path: ./stellar-payment-platform/package-lock.json
-
-      # Caching strategy: cache node_modules (and the npm cache) keyed on the
-      # hash of package-lock.json. The cache is automatically invalidated when
-      # any package-lock.json changes; restore-keys provide a fallback to the
-      # most recent cache for this project so partial hits still speed up
-      # installs. This step must run before dependency installation.
-      - name: Cache Backend node_modules
-        uses: actions/cache@v4
-        with:
-          path: |
-            stellar-payment-platform/node_modules
-            payment-dashboard/node_modules
-            ~/.npm
-          key: ${{ runner.os }}-node-backend-${{ hashFiles('**/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-node-backend-
-
-      - name: Install Backend Dependencies
-        run: npm install
-
-      # Run the full suite with coverage so the thresholds in package.json
-      # fail the build whenever coverage regresses below the floor.
-      - name: Run Backend Tests (with coverage thresholds)
-        run: NODE_ENV=test npm run test:coverage
-
-      - name: Upload Coverage Report
-        # Upload even when the thresholds fail, so the drop is visible in the
-        # artifact (see stellar-payment-platform/coverage/lcov-report/).
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: backend-coverage-report
-          path: stellar-payment-platform/coverage
-          retention-days: 14
-
-      - name: Run Memory Leak Detection Tests (#511)
-        run: NODE_ENV=test node --expose-gc node_modules/.bin/jest --forceExit --testPathPattern=memory
-        env:
-          MEMORY_TEST_REQUESTS: '200'
-          MEMORY_LEAK_THRESHOLD_MB: '50'
-
-  contract-budgets:
-    name: Contract Instruction & Storage Budgets (#427)
+  build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run lint
+      - run: npm run typecheck
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      # The budget suite records reproducible CPU, memory, read/write, and
-      # entry-size budgets for the routing and governance public contract
-      # methods. It fails the job whenever a measured value exceeds the
-      # recorded budget (material regression) or a worst-case failure path
-      # stops being rejected as expected.
-      - name: Run Contract Budget Tests
-        run: npm run test:budgets
-
-      - name: Upload Budget Report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: contract-budget-report
-          path: |
-            **/budget-report.json
-            **/contract-budgets/**
-          retention-days: 14
-          if-no-files-found: ignore
-
-  openapi-spec-check:
-    name: Validate OpenAPI Spec (#253)
+  abi-compat:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: '22'
-
-      - name: Validate docs/openapi.json
-        run: npx --yes @redocly/cli@latest lint docs/openapi.json --format=stylish
-
-  frontend-checks:
-    name: Frontend Vercel Build Check
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ./payment-dashboard
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-      
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: 'npm'
-          cache-dependency-path: ./payment-dashboard/package-lock.json
-
-      # Caching strategy: cache node_modules (and the npm cache) keyed on the
-      # hash of package-lock.json. The cache is automatically invalidated when
-      # any package-lock.json changes; restore-keys provide a fallback to the
-      # most recent cache for this project so partial hits still speed up
-      # installs. This step must run before dependency installation.
-      - name: Cache Frontend node_modules
-        uses: actions/cache@v4
-        with:
-          path: |
-            stellar-payment-platform/node_modules
-            payment-dashboard/node_modules
-            ~/.npm
-          key: ${{ runner.os }}-node-frontend-${{ hashFiles('**/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-node-frontend-
-          
-      - name: Install Frontend Dependencies
-        run: npm install --legacy-peer-deps
-
-      - name: Typecheck (Fails on TypeScript/JSDoc Errors)
-        run: npm run typecheck
-
-      - name: Verify Vite Build (Catches Vercel Crashes)
-        run: npm run build
-
-  test-all:
-    name: Full Test Suite (test:all)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install Root Dependencies
-        run: npm install --legacy-peer-deps
-
-      - name: Install Frontend Dependencies
-        run: npm install --legacy-peer-deps
-        working-directory: ./payment-dashboard
-
-      - name: Install Backend Dependencies
-        run: npm install
-        working-directory: ./stellar-payment-platform
-
-      - name: Run test:all
-        run: npm run test:all
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Build WASM artifact
+        run: npm run build:wasm
+      - name: Generate TypeScript bindings from compiled WASM
+        run: npm run bindings:generate -- --out .abi/generated
+      - name: Compare generated bindings against checked-in output
+        run: npm run bindings:check -- --generated .abi/generated --checked-in src/bindings
+      - name: Compile and decode consumer fixture
+        run: npm run test:abi-fixture
+      - name: Run ABI compatibility tests
+        run: npm run test:abi

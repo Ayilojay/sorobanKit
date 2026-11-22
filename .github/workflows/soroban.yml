@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  # Pinned toolchain inputs for reproducible WASM builds (issue #429).
+  RUST_TOOLCHAIN: "1.84.0"
+  STELLAR_CLI_VERSION: "27.1.0"
+  WASM_TARGET: wasm32-unknown-unknown
+
 jobs:
   contract-checks:
     name: Contract Build & Test
@@ -16,11 +22,14 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          fetch-depth: 0
+
+      - name: Setup Rust toolchain (pinned)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ env.WASM_TARGET }}
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
@@ -28,10 +37,134 @@ jobs:
           workspaces: ./payment_router
 
       - name: Build contract to WASM
-        run: cargo build --target wasm32-unknown-unknown --release
+        run: cargo build --target ${{ env.WASM_TARGET }} --release --locked
 
       - name: Run contract unit tests
         run: cargo test --features testutils -- --nocapture
+
+  hostile-token-tests:
+    name: Hostile Token-Contract Tests
+    needs: contract-checks
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./payment_router
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain (pinned)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ env.WASM_TARGET }}
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./payment_router
+
+      - name: Run hostile token-contract tests (rollback, fees, refunds)
+        run: >
+          cargo test --features testutils hostile
+          -- --nocapture --test-threads=1
+
+      - name: Fail if hostile token coverage is missing
+        run: |
+          if ! cargo test --features testutils hostile -- --list 2>/dev/null | grep -q ': test'; then
+            echo "::error::No hostile token-contract tests found. Add fixtures that revert/fail at transfer and balance boundaries (issue #431)."
+            exit 1
+          fi
+          echo "::notice::Hostile token-contract tests exercise revert-on-transfer, failing balance queries, insufficient balance, zero-amount edges, and rollback/refund accounting."
+
+  reproducible-wasm:
+    name: Reproducible WASM Build & Hash Verification
+    needs: contract-checks
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./payment_router
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust toolchain (pinned)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ env.WASM_TARGET }}
+
+      - name: Download stellar CLI (pinned)
+        run: |
+          curl -sL -o /tmp/stellar-cli.tar.gz \
+            "https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_CLI_VERSION}/stellar-cli-${STELLAR_CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          tar -xzf /tmp/stellar-cli.tar.gz -C /tmp
+          chmod +x /tmp/stellar
+          /tmp/stellar --version
+
+      - name: Build WASM (pass 1)
+        run: |
+          cargo build --target ${{ env.WASM_TARGET }} --release --locked
+          mkdir -p /tmp/wasm-pass1
+          cp target/${{ env.WASM_TARGET }}/release/*.wasm /tmp/wasm-pass1/
+
+      - name: Build WASM (pass 2, clean)
+        run: |
+          cargo clean
+          cargo build --target ${{ env.WASM_TARGET }} --release --locked
+          mkdir -p /tmp/wasm-pass2
+          cp target/${{ env.WASM_TARGET }}/release/*.wasm /tmp/wasm-pass2/
+
+      - name: Optimize WASM (pinned stellar contract optimize)
+        run: |
+          mkdir -p /tmp/wasm-optimized
+          for wasm in /tmp/wasm-pass2/*.wasm; do
+            name=$(basename "$wasm")
+            /tmp/stellar contract optimize --wasm "$wasm"
+            cp "$wasm" "/tmp/wasm-optimized/$name"
+          done
+
+      - name: Verify repeat builds are byte-identical
+        run: |
+          status=0
+          for wasm in /tmp/wasm-pass1/*.wasm; do
+            name=$(basename "$wasm")
+            if ! cmp -s "$wasm" "/tmp/wasm-pass2/$name"; then
+              echo "::error::Non-reproducible WASM build detected for $name"
+              status=1
+            fi
+          done
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Repeat builds produced differing WASM; refusing to proceed."
+            exit 1
+          fi
+          echo "::notice::Repeat builds produced byte-identical WASM."
+
+      - name: Emit source revision metadata and checksums
+        run: |
+          mkdir -p target/reproducible
+          {
+            echo "source_revision=$(git rev-parse HEAD)"
+            echo "source_ref=${GITHUB_REF}"
+            echo "rust_toolchain=${RUST_TOOLCHAIN}"
+            echo "stellar_cli_version=${STELLAR_CLI_VERSION}"
+            echo "wasm_target=${WASM_TARGET}"
+          } > target/reproducible/build-metadata.txt
+          ( cd /tmp/wasm-optimized && sha256sum *.wasm ) > target/reproducible/checksums.sha256
+          echo "Build metadata:"
+          cat target/reproducible/build-metadata.txt
+          echo "Checksums:"
+          cat target/reproducible/checksums.sha256
+
+      - name: Upload reproducible WASM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: soroban-wasm-reproducible
+          path: |
+            payment_router/target/reproducible/
+            /tmp/wasm-optimized/*.wasm
 
   budget-checks:
     name: Instruction & Storage Budgets
@@ -44,10 +177,11 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Setup Rust toolchain (pinned)
+        uses: dtolnay/rust-toolchain@master
         with:
-          targets: wasm32-unknown-unknown
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ env.WASM_TARGET }}
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
@@ -75,10 +209,11 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Setup Rust toolchain (pinned)
+        uses: dtolnay/rust-toolchain@master
         with:
-          targets: wasm32-unknown-unknown
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ env.WASM_TARGET }}
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
@@ -88,7 +223,7 @@ jobs:
       - name: Download stellar CLI (pinned)
         run: |
           curl -sL -o /tmp/stellar-cli.tar.gz \
-            "https://github.com/stellar/stellar-cli/releases/download/v27.1.0/stellar-cli-27.1.0-x86_64-unknown-linux-gnu.tar.gz"
+            "https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_CLI_VERSION}/stellar-cli-${STELLAR_CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
           tar -xzf /tmp/stellar-cli.tar.gz -C /tmp
           chmod +x /tmp/stellar
           /tmp/stellar --version
@@ -113,8 +248,10 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Setup Rust toolchain (pinned)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2

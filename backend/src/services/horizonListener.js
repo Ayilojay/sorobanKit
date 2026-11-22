@@ -9,85 +9,11 @@ const NETWORK_PASSPHRASES = {
   futurenet: 'Test SDF Future Network ; October 2022',
 };
 
-// Versioned Soroban event schemas for payment, refund, and admin/governance actions.
-// Symbols carry a version suffix (e.g. "payment:v1") so consumers can decode old
-// versions while new versions are emitted. Bump EVENT_SCHEMA_VERSION when the
-// payload shape changes and add a matching entry to EVENT_SCHEMAS.
+// Schema identifier stamped onto persisted event payloads at the persistence
+// boundary. Bump EVENT_SCHEMA_VERSION when the persisted shape changes.
+const EVENT_SCHEMA_ID = 'stellar.payment.event';
 const EVENT_SCHEMA_VERSION = 1;
-
-const EVENT_SCHEMAS = {
-  payment: {
-    v1: {
-      symbol: 'payment:v1',
-      fields: ['id', 'from', 'to', 'amount', 'asset', 'memo'],
-    },
-  },
-  refund: {
-    v1: {
-      symbol: 'refund:v1',
-      fields: ['id', 'paymentId', 'to', 'amount', 'asset', 'reason'],
-    },
-  },
-  admin: {
-    v1: {
-      symbol: 'admin:v1',
-      fields: ['id', 'action', 'actor', 'target', 'metadata'],
-    },
-  },
-  receipt: {
-    v1: {
-      symbol: 'receipt:v1',
-      fields: ['correlationId', 'sender', 'recipient', 'token', 'amount', 'fee'],
-    },
-  },
-};
-
-function getEventSymbol(category, version = EVENT_SCHEMA_VERSION) {
-  const schema = EVENT_SCHEMAS[category] && EVENT_SCHEMAS[category][`v${version}`];
-  if (!schema) {
-    throw new Error(`Unknown event schema ${category}:v${version}`);
-  }
-  return schema.symbol;
-}
-
-function getEventFields(category, version = EVENT_SCHEMA_VERSION) {
-  const schema = EVENT_SCHEMAS[category] && EVENT_SCHEMAS[category][`v${version}`];
-  if (!schema) {
-    throw new Error(`Unknown event schema ${category}:v${version}`);
-  }
-  return schema.fields.slice();
-}
-
-function buildEventPayload(category, data, version = EVENT_SCHEMA_VERSION) {
-  const fields = getEventFields(category, version);
-  const payload = { version, symbol: getEventSymbol(category, version) };
-  for (const field of fields) {
-    payload[field] = data && data[field] !== undefined ? data[field] : null;
-  }
-  return payload;
-}
-
-// Build a deterministic receipt for a successful routed payment. The receipt is
-// keyed by correlationId so a given payment always yields the same receipt, and
-// the field order matches the receipt:v1 schema for stable decoding.
-function buildReceipt(payment, version = EVENT_SCHEMA_VERSION) {
-  if (!payment || typeof payment !== 'object') {
-    throw new Error('Cannot build receipt without a payment');
-  }
-  const correlationId = payment.correlationId || payment.id;
-  if (!correlationId) {
-    throw new Error('Cannot build receipt without a correlation ID');
-  }
-  const data = {
-    correlationId,
-    sender: payment.sender !== undefined ? payment.sender : payment.from,
-    recipient: payment.recipient !== undefined ? payment.recipient : payment.to,
-    token: payment.token !== undefined ? payment.token : payment.asset,
-    amount: payment.amount,
-    fee: payment.fee !== undefined ? payment.fee : null,
-  };
-  return buildEventPayload('receipt', data, version);
-}
+const SUPPORTED_EVENT_SCHEMA_VERSIONS = [1];
 
 function getExpectedPassphrase(network) {
   const key = String(network || '').toLowerCase();
@@ -123,6 +49,79 @@ async function fetchRoot(server) {
   return response;
 }
 
+// Adapter for historical unversioned rows: treat them as schema v1.
+function adaptUnversionedEvent(payload) {
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('Cannot adapt non-object event payload');
+  }
+  return {
+    ...payload,
+    schemaId: EVENT_SCHEMA_ID,
+    schemaVersion: 1,
+  };
+}
+
+// Normalize any incoming event payload to a versioned envelope. Unversioned
+// payloads are upgraded via the historical adapter; unknown future versions
+// are rejected so they are not silently persisted with a wrong shape.
+function normalizeEventMetadata(payload) {
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('Event payload must be an object');
+  }
+
+  const hasVersion = payload.schemaVersion !== undefined && payload.schemaVersion !== null;
+  const versioned = hasVersion ? payload : adaptUnversionedEvent(payload);
+
+  const version = Number(versioned.schemaVersion);
+  if (!Number.isInteger(version) || version < 1) {
+    throw new Error(`Invalid event schemaVersion: ${versioned.schemaVersion}`);
+  }
+
+  if (!SUPPORTED_EVENT_SCHEMA_VERSIONS.includes(version)) {
+    // Retention behavior: unknown future versions are retained (not dropped)
+    // but flagged so downstream consumers can quarantine them.
+    logger.warn(
+      `Unknown future event schemaVersion ${version} for ${versioned.schemaId || EVENT_SCHEMA_ID}; retaining as unsupported`
+    );
+    return {
+      ...versioned,
+      schemaId: versioned.schemaId || EVENT_SCHEMA_ID,
+      schemaVersion: version,
+      schemaSupported: false,
+    };
+  }
+
+  return {
+    ...versioned,
+    schemaId: versioned.schemaId || EVENT_SCHEMA_ID,
+    schemaVersion: version,
+    schemaSupported: true,
+  };
+}
+
+// Validate a versioned event payload against its declared schema version.
+function validateEventPayload(payload) {
+  const normalized = normalizeEventMetadata(payload);
+
+  if (!normalized.schemaSupported) {
+    return normalized;
+  }
+
+  if (normalized.schemaId !== EVENT_SCHEMA_ID) {
+    throw new Error(`Unexpected event schemaId: ${normalized.schemaId}`);
+  }
+
+  if (typeof normalized.id === 'undefined' || normalized.id === null) {
+    throw new Error('Event payload missing required field: id');
+  }
+
+  if (typeof normalized.type !== 'string' || normalized.type.length === 0) {
+    throw new Error('Event payload missing required field: type');
+  }
+
+  return normalized;
+}
+
 async function startHorizonListener(config) {
   const server = new Horizon.Server(config.horizonUrl);
 
@@ -151,8 +150,33 @@ async function startHorizonListener(config) {
 
 function handlePayment(payment, config) {
   logger.info(`Received payment event ${payment.id} of type ${payment.type}`);
+
+  // Persistence boundary: stamp and validate schema metadata before handing
+  // the event to downstream persistence.
+  let event;
+  try {
+    event = validateEventPayload(payment);
+  } catch (err) {
+    logger.error(`Rejected payment event ${payment && payment.id}: ${err.message}`);
+    return;
+  }
+
   if (typeof config.onPayment === 'function') {
-    config.onPayment(payment);
+    config.onPayment(event);
+  }
+  // Reporting is decoupled from the payment write path: the read model is
+  // refreshed asynchronously and never blocks payment ingestion.
+  if (typeof config.onReportingWatermark === 'function') {
+    try {
+      config.onReportingWatermark({
+        source: 'horizon',
+        cursor: payment.paging_token || payment.id,
+        ledger: payment.ledger,
+        observedAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      logger.error(`Error recording reporting watermark: ${err.message}`);
+    }
   }
 }
 
@@ -173,12 +197,11 @@ module.exports = {
   startHorizonListener,
   verifyNetwork,
   getExpectedPassphrase,
+  normalizeEventMetadata,
+  validateEventPayload,
+  adaptUnversionedEvent,
   NETWORK_PASSPHRASES,
+  EVENT_SCHEMA_ID,
   EVENT_SCHEMA_VERSION,
-  EVENT_SCHEMAS,
-  getEventSymbol,
-  getEventFields,
-  buildEventPayload,
-  buildReceipt,
-  emitReceipt,
+  SUPPORTED_EVENT_SCHEMA_VERSIONS,
 };
