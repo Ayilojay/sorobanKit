@@ -3,7 +3,7 @@
   "info": {
     "title": "Stellar Tags API",
     "version": "1.0.0",
-    "description": "OpenAPI specification for the Stellar Tags API. Covers the documented endpoints for tags, addresses, activity, and stats.",
+    "description": "OpenAPI specification for the Stellar Tags API. Covers the documented endpoints for tags, addresses, activity, and stats.\n\n## Soft-delete, restore, and username reuse semantics\n\n- **Reservation window**: when a tag (username) is soft-deleted, its name is reserved for a fixed `SOFT_DELETE_RESERVATION_DAYS` (default 30 days) from `deletedAt`. During this window the name cannot be claimed by any other owner.\n- **Restoration proof**: restoring a soft-deleted tag requires the original owner's authenticated identity (bearer token whose subject matches the tag's `ownerId`). The restore request must reference the tag id and the `deletedAt` value observed at deletion time; a mismatch (stale or already-restored) is rejected with `409 Conflict`.\n- **Post-expiry reuse**: once the reservation window elapses, the name becomes reusable. A new registration may claim it; the prior soft-deleted record is retained for audit but can no longer be restored (`410 Gone`).\n- **Transactional transitions**: delete, restore, and registration are enforced transactionally (row-level lock on the name). Concurrent delete/restore/registration cannot produce multiple active owners; losers receive `409 Conflict`.",
     "license": {
       "name": "MIT"
     }
@@ -52,6 +52,7 @@
         "tags": ["Tags"],
         "summary": "Create a tag",
         "operationId": "createTag",
+        "description": "Registers a new tag (username). If the name was soft-deleted and its reservation window has not expired, registration is rejected with `409 Conflict`. Once the window expires the name is reusable.",
         "requestBody": {
           "required": true,
           "content": {
@@ -70,7 +71,8 @@
             }
           },
           "400": { "$ref": "#/components/responses/BadRequest" },
-          "401": { "$ref": "#/components/responses/Unauthorized" }
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "409": { "$ref": "#/components/responses/Conflict" }
         }
       }
     },
@@ -122,12 +124,50 @@
       },
       "delete": {
         "tags": ["Tags"],
-        "summary": "Delete a tag",
+        "summary": "Soft-delete a tag",
         "operationId": "deleteTag",
+        "description": "Soft-deletes the tag and starts the reservation window (`SOFT_DELETE_RESERVATION_DAYS`, default 30 days) during which the name cannot be reused. The transition is transactional; concurrent deletes/restores/registrations cannot create multiple owners.",
         "responses": {
-          "204": { "description": "Tag deleted" },
+          "204": { "description": "Tag soft-deleted" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
-          "404": { "$ref": "#/components/responses/NotFound" }
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/api/tags/{id}/restore": {
+      "parameters": [
+        { "$ref": "#/components/parameters/TagIdParam" }
+      ],
+      "post": {
+        "tags": ["Tags"],
+        "summary": "Restore a soft-deleted tag",
+        "operationId": "restoreTag",
+        "description": "Restores a soft-deleted tag within its reservation window. Requires the original owner's authenticated identity and the `deletedAt` value observed at deletion time as restoration proof. Fails with `409 Conflict` on stale/already-restored state and `410 Gone` after the reservation window expires.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RestoreTagInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Tag restored",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Tag" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "410": { "$ref": "#/components/responses/Gone" }
         }
       }
     },
@@ -179,10 +219,11 @@
       "get": {
         "tags": ["Stats"],
         "summary": "Get platform statistics",
+        "description": "Returns aggregate statistics served from the refreshable reporting read model. The response includes the source watermark and refresh status so clients can reason about staleness. Reporting refreshes run asynchronously and never block payment writes.",
         "operationId": "getStats",
         "responses": {
           "200": {
-            "description": "Aggregate platform statistics",
+            "description": "Aggregate platform statistics from the reporting read model",
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Stats" }
@@ -212,94 +253,49 @@
         }
       }
     },
-    "/api/admin/token-allowlist": {
-      "get": {
+    "/api/admin/stats/refresh": {
+      "post": {
         "tags": ["Admin"],
-        "summary": "List token allowlist entries",
-        "description": "Returns the governance-controlled token allowlist used to gate payment routing eligibility, including pending timelocked updates and emergency removals.",
-        "operationId": "listTokenAllowlist",
+        "summary": "Trigger a reporting read model refresh",
+        "description": "Enqueues an asynchronous refresh of the reporting read model. The refresh runs decoupled from the payment write path and records the source watermark on completion. Returns the current refresh status.",
+        "operationId": "refreshStats",
         "security": [{ "bearerAuth": [] }],
         "responses": {
-          "200": {
-            "description": "Token allowlist entries",
+          "202": {
+            "description": "Refresh accepted and running asynchronously",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/TokenAllowlist" }
-              }
-            }
-          },
-          "401": { "$ref": "#/components/responses/Unauthorized" },
-          "403": { "$ref": "#/components/responses/Forbidden" }
-        }
-      }
-    },
-    "/api/admin/token-allowlist/{token}": {
-      "parameters": [
-        { "$ref": "#/components/parameters/TokenParam" }
-      ],
-      "get": {
-        "tags": ["Admin"],
-        "summary": "Get a token allowlist entry",
-        "operationId": "getTokenAllowlistEntry",
-        "security": [{ "bearerAuth": [] }],
-        "responses": {
-          "200": {
-            "description": "Token allowlist entry",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/TokenAllowlistEntry" }
+                "schema": { "$ref": "#/components/schemas/StatsRefreshStatus" }
               }
             }
           },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "$ref": "#/components/responses/Forbidden" },
-          "404": { "$ref": "#/components/responses/NotFound" }
+          "409": {
+            "description": "A refresh is already in progress",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/StatsRefreshStatus" } }
+            }
+          }
         }
-      }
-    },
-    "/api/admin/fee-policies": {
+      },
       "get": {
         "tags": ["Admin"],
-        "summary": "List versioned per-asset fee policies",
-        "description": "Returns the governance-controlled fee policies. Each asset may have a token-specific fee basis points and cap; assets without a policy fall back to the global configuration. Pending changes are queued through governance and applied only after approval.",
-        "operationId": "listFeePolicies",
+        "summary": "Get reporting read model refresh status",
+        "description": "Returns the current refresh status and source watermark of the reporting read model.",
+        "operationId": "getStatsRefreshStatus",
         "security": [{ "bearerAuth": [] }],
         "responses": {
           "200": {
-            "description": "Fee policies including the global fallback and per-asset overrides",
+            "description": "Current refresh status",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/FeePolicyList" }
+                "schema": { "$ref": "#/components/schemas/StatsRefreshStatus" }
               }
             }
           },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "$ref": "#/components/responses/Forbidden" }
-        }
-      }
-    },
-    "/api/admin/fee-policies/{token}": {
-      "parameters": [
-        { "$ref": "#/components/parameters/TokenParam" }
-      ],
-      "get": {
-        "tags": ["Admin"],
-        "summary": "Get the effective fee policy for an asset",
-        "description": "Returns the effective fee policy for the asset. When no asset-specific policy exists, the global configuration is returned with source set to global.",
-        "operationId": "getFeePolicy",
-        "security": [{ "bearerAuth": [] }],
-        "responses": {
-          "200": {
-            "description": "Effective fee policy for the asset",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/FeePolicy" }
-              }
-            }
-          },
-          "401": { "$ref": "#/components/responses/Unauthorized" },
-          "403": { "$ref": "#/components/responses/Forbidden" },
-          "404": { "$ref": "#/components/responses/NotFound" }
         }
       }
     }
@@ -363,7 +359,7 @@
         }
       },
       "Unauthorized": {
-        "description": "Authentication required",
+        "description": "Authentication required or invalid credentials",
         "content": {
           "application/json": {
             "schema": { "$ref": "#/components/schemas/Error" }
@@ -371,7 +367,7 @@
         }
       },
       "Forbidden": {
-        "description": "Insufficient permissions",
+        "description": "Authenticated but not permitted (e.g. not the original owner)",
         "content": {
           "application/json": {
             "schema": { "$ref": "#/components/schemas/Error" }
@@ -385,134 +381,29 @@
             "schema": { "$ref": "#/components/schemas/Error" }
           }
         }
+      },
+      "Conflict": {
+        "description": "State transition conflict (name reserved, stale restore proof, or concurrent transition lost)",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+        }
+      },
+      "Gone": {
+        "description": "Reservation window expired; the tag can no longer be restored",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+        }
       }
     },
     "schemas": {
-      "Error": {
+      "RestoreTagInput": {
         "type": "object",
-        "required": ["error"],
+        "required": ["deletedAt"],
         "properties": {
-          "error": { "type": "string" },
-          "message": { "type": "string" }
-        }
-      },
-      "Tag": {
-        "type": "object",
-        "required": ["id", "address", "name"],
-        "properties": {
-          "id": { "type": "string" },
-          "address": { "type": "string" },
-          "name": { "type": "string" },
-          "createdAt": { "type": "string", "format": "date-time" }
-        }
-      },
-      "TagInput": {
-        "type": "object",
-        "required": ["address", "name"],
-        "properties": {
-          "address": { "type": "string" },
-          "name": { "type": "string" }
-        }
-      },
-      "TagList": {
-        "type": "object",
-        "required": ["items"],
-        "properties": {
-          "items": {
-            "type": "array",
-            "items": { "$ref": "#/components/schemas/Tag" }
-          },
-          "page": { "type": "integer" },
-          "limit": { "type": "integer" },
-          "total": { "type": "integer" }
-        }
-      },
-      "ActivityList": {
-        "type": "object",
-        "required": ["items"],
-        "properties": {
-          "items": {
-            "type": "array",
-            "items": { "type": "object" }
-          },
-          "nextCursor": { "type": ["string", "null"] }
-        }
-      },
-      "Stats": {
-        "type": "object",
-        "properties": {
-          "totalTags": { "type": "integer" },
-          "totalAddresses": { "type": "integer" },
-          "updatedAt": { "type": "string", "format": "date-time" }
-        }
-      },
-      "TokenAllowlist": {
-        "type": "object",
-        "required": ["entries"],
-        "properties": {
-          "entries": {
-            "type": "array",
-            "items": { "$ref": "#/components/schemas/TokenAllowlistEntry" }
-          }
-        }
-      },
-      "TokenAllowlistEntry": {
-        "type": "object",
-        "required": ["token", "allowed"],
-        "properties": {
-          "token": { "type": "string" },
-          "allowed": { "type": "boolean" },
-          "pendingUpdate": { "type": ["object", "null"] },
-          "updatedAt": { "type": "string", "format": "date-time" }
-        }
-      },
-      "FeePolicy": {
-        "type": "object",
-        "required": ["token", "feeBps", "cap", "source", "version"],
-        "description": "Effective fee policy for an asset. feeBps is applied to the amount using exact integer arithmetic (floor(amount * feeBps / 10000)) and the result is clamped to cap. When no asset-specific policy exists, the global configuration is used and source is global.",
-        "properties": {
-          "token": { "type": "string" },
-          "feeBps": {
-            "type": "integer",
-            "minimum": 0,
-            "maximum": 10000,
-            "description": "Fee in basis points (1 bps = 0.01%)."
-          },
-          "cap": {
-            "type": "integer",
-            "minimum": 0,
-            "description": "Maximum fee in the asset's smallest unit. The computed fee is clamped to this value."
-          },
-          "source": {
+          "deletedAt": {
             "type": "string",
-            "enum": ["asset", "global"],
-            "description": "Whether the policy comes from an asset-specific override or the global fallback."
-          },
-          "version": {
-            "type": "integer",
-            "minimum": 1,
-            "description": "Monotonic version incremented on each governance-approved change."
-          },
-          "pendingChange": {
-            "type": ["object", "null"],
-            "description": "Queued governance change awaiting approval, if any.",
-            "properties": {
-              "feeBps": { "type": "integer", "minimum": 0, "maximum": 10000 },
-              "cap": { "type": "integer", "minimum": 0 },
-              "effectiveAt": { "type": "string", "format": "date-time" }
-            }
-          },
-          "updatedAt": { "type": "string", "format": "date-time" }
-        }
-      },
-      "FeePolicyList": {
-        "type": "object",
-        "required": ["global", "assets"],
-        "properties": {
-          "global": { "$ref": "#/components/schemas/FeePolicy" },
-          "assets": {
-            "type": "array",
-            "items": { "$ref": "#/components/schemas/FeePolicy" }
+            "format": "date-time",
+            "description": "The `deletedAt` value observed at deletion time; used as restoration proof. A mismatch is rejected with 409 Conflict."
           }
         }
       }

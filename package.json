@@ -9,10 +9,12 @@
     "prepare": "husky",
     "load:test": "artillery run artillery.yml",
     "generate:bindings": "bash scripts/generate-bindings.sh",
+    "generate:fixtures": "node scripts/generate-fixtures.js",
     "test:unit": "npm --prefix stellar-payment-platform test -- --testPathPattern=tests/unit --passWithNoTests",
     "test:integration": "bash tests/integration/run.sh",
     "test:property": "jest --config jest.property.config.js",
     "test:all": "npm test --workspace=payment-dashboard && npm test --workspace=stellar-payment-platform && cd payment_router && cargo test",
+    "repair:payments": "node scripts/repair-payments.js",
     "contract:build": "node scripts/deploy.js build",
     "contract:deploy": "node scripts/deploy.js deploy",
     "contract:upgrade": "node scripts/deploy.js upgrade",
@@ -33,6 +35,6 @@
     "testEnvironment": "node",
     "testMatch": ["**/tests/**/*.test.js"],
     "collectCoverageFrom": ["src/**/*.js", "!src/index.js"],
-    "setupFilesAfterEnv": ["<rootDir>/tests/setup.js"]
+    "setupFilesAfterEach": ["<rootDir>/tests/setup.js"]
   }
 }

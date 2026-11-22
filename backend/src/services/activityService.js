@@ -12,6 +12,135 @@ const prisma = new PrismaClient();
  */
 
 /**
+ * Current schema version for persisted activity event metadata. Bump this
+ * whenever the metadata shape changes in a backward-incompatible way and add
+ * a corresponding entry to METADATA_MIGRATIONS.
+ */
+const CURRENT_METADATA_VERSION = 1;
+
+/**
+ * Key under which the schema version is stored inside the persisted metadata
+ * JSON. Kept inside the JSON blob so no migration of the activity_log table is
+ * required and historical rows remain readable.
+ */
+const METADATA_VERSION_KEY = 'schemaVersion';
+
+/**
+ * Adapters that upgrade historical (unversioned or older) metadata to the
+ * current schema. Each entry receives metadata at version N and returns
+ * metadata at version N + 1. Unversioned rows are treated as version 0.
+ *
+ * @type {Record<number, (metadata: Object) => Object>}
+ */
+const METADATA_MIGRATIONS = {
+  // v0 -> v1: unversioned rows simply gain an explicit schemaVersion.
+  0: (metadata) => ({ ...metadata }),
+};
+
+/**
+ * Validate metadata against the current schema. Throws on invalid input so
+ * persistence boundaries fail fast rather than storing corrupt payloads.
+ *
+ * @param {Object} metadata
+ * @returns {Object} the validated metadata
+ */
+function validateMetadata(metadata) {
+  if (metadata === null || typeof metadata !== 'object' || Array.isArray(metadata)) {
+    throw new TypeError('activity metadata must be a plain object');
+  }
+
+  const version = metadata[METADATA_VERSION_KEY];
+  if (version !== CURRENT_METADATA_VERSION) {
+    throw new RangeError(
+      `activity metadata schemaVersion must be ${CURRENT_METADATA_VERSION}, got ${version}`
+    );
+  }
+
+  return metadata;
+}
+
+/**
+ * Upgrade historical metadata (unversioned or older versions) to the current
+ * schema version. Unknown future versions are rejected: we cannot safely
+ * downgrade data written by a newer writer, so callers must handle them.
+ *
+ * @param {Object|null|undefined} metadata
+ * @returns {Object} metadata at CURRENT_METADATA_VERSION
+ */
+function upgradeMetadata(metadata) {
+  if (metadata === null || metadata === undefined) {
+    metadata = {};
+  }
+  if (typeof metadata !== 'object' || Array.isArray(metadata)) {
+    throw new TypeError('activity metadata must be a plain object');
+  }
+
+  let current = { ...metadata };
+  let version = Number.isInteger(current[METADATA_VERSION_KEY])
+    ? current[METADATA_VERSION_KEY]
+    : 0;
+
+  if (version > CURRENT_METADATA_VERSION) {
+    throw new RangeError(
+      `activity metadata schemaVersion ${version} is newer than supported ${CURRENT_METADATA_VERSION}`
+    );
+  }
+
+  while (version < CURRENT_METADATA_VERSION) {
+    const migrate = METADATA_MIGRATIONS[version];
+    if (!migrate) {
+      throw new RangeError(`no migration registered for activity metadata version ${version}`);
+    }
+    current = migrate(current);
+    version += 1;
+    current[METADATA_VERSION_KEY] = version;
+  }
+
+  return current;
+}
+
+/**
+ * Prepare metadata for persistence: upgrade historical shapes and stamp the
+ * current schema version, then validate. Returns undefined when no metadata
+ * was supplied so the column stays null.
+ *
+ * @param {Object|null|undefined} metadata
+ * @returns {Object|undefined}
+ */
+function prepareMetadataForWrite(metadata) {
+  if (metadata === null || metadata === undefined) {
+    return undefined;
+  }
+  const upgraded = upgradeMetadata(metadata);
+  upgraded[METADATA_VERSION_KEY] = CURRENT_METADATA_VERSION;
+  return validateMetadata(upgraded);
+}
+
+/**
+ * Prepare metadata read from persistence: upgrade historical rows to the
+ * current schema. Unknown future versions are surfaced as-is (with a warning)
+ * so readers do not crash on data written by a newer deployment; retention
+ * logic treats them as opaque and never rewrites them.
+ *
+ * @param {Object|null|undefined} metadata
+ * @returns {Object|null|undefined}
+ */
+function prepareMetadataForRead(metadata) {
+  if (metadata === null || metadata === undefined) {
+    return metadata;
+  }
+  try {
+    return upgradeMetadata(metadata);
+  } catch (err) {
+    if (err instanceof RangeError) {
+      // Unknown future version: retain the row untouched for forward compat.
+      return metadata;
+    }
+    throw err;
+  }
+}
+
+/**
  * Persist a single activity log entry.
  * @param {ActivityEvent} event
  * @returns {Promise<Object>}
@@ -23,7 +152,7 @@ async function log(event) {
       action: event.action,
       entityType: event.entityType,
       entityId: event.entityId,
-      metadata: event.metadata,
+      metadata: prepareMetadataForWrite(event.metadata),
     },
   });
 }
@@ -44,7 +173,7 @@ async function logMany(events) {
       action: event.action,
       entityType: event.entityType,
       entityId: event.entityId,
-      metadata: event.metadata,
+      metadata: prepareMetadataForWrite(event.metadata),
     })),
     skipDuplicates: false,
   });
@@ -90,7 +219,7 @@ async function listByUser(userId, options = {}) {
     const total = await prisma.activityLog.count({ where });
 
     return {
-      data,
+      data: data.map((row) => ({ ...row, metadata: prepareMetadataForRead(row.metadata) })),
       total,
       page,
       limit,
@@ -113,7 +242,7 @@ async function listByUser(userId, options = {}) {
   const nextCursor = data.length === limit ? data[data.length - 1].id : null;
 
   return {
-    data,
+    data: data.map((row) => ({ ...row, metadata: prepareMetadataForRead(row.metadata) })),
     total,
     page,
     limit,
@@ -231,185 +360,39 @@ async function cleanupCompletedRecords(options = {}) {
 }
 
 /**
- * Actions that represent durable liability records reconciled by the report.
- * Each entry maps an action to the liability category it contributes to.
+ * Action recorded when an operator applies a payment data repair. Used to
+ * detect already-applied repairs so re-runs stay idempotent.
  */
-const RECONCILIATION_LIABILITY_ACTIONS = {
-  'payment.recorded': 'payment',
-  'payment.settled': 'payment',
-  'fee.charged': 'fee',
-  'fee.accrued': 'fee',
-  'refund.issued': 'refund',
-  'refund.completed': 'refund',
-};
+const PAYMENT_REPAIR_ACTION = 'payment.repair.applied';
 
 /**
- * Hard upper bound on the number of durable records scanned by a single
- * reconciliation run. Keeps the read-only report bounded.
+ * Default maximum number of payment records examined per repair run.
  */
-const MAX_RECONCILIATION_RECORDS = 10000;
+const DEFAULT_REPAIR_BATCH_SIZE = 200;
 
 /**
- * Build a read-only reconciliation report of payment, fee, and refund
- * liabilities from durable activity records.
- *
- * The report is grouped by `network` and `asset` (read from record metadata)
- * and bounded to the inclusive `[from, to]` date range. It surfaces:
- * - missing records: liability references (metadata.reference) that appear in
- *   one category but are absent from a category they should accompany.
- * - duplicated records: the same reference recorded more than once within a
- *   category.
- * - inconsistent records: records missing required metadata (network, asset,
- *   amount, reference) or with a non-positive amount.
- *
- * The operation is strictly read-only and deterministic for a given set of
- * durable records.
- *
- * @param {Object} options
- * @param {Date|string} options.from inclusive lower bound (required)
- * @param {Date|string} options.to inclusive upper bound (required)
- * @param {number} [options.limit=MAX_RECONCILIATION_RECORDS]
- * @returns {Promise<Object>} reconciliation report
+ * Hard upper bound on the repair batch size, regardless of caller input.
  */
-async function reconcileLiabilities(options = {}) {
-  const from = options.from instanceof Date ? options.from : new Date(options.from);
-  const to = options.to instanceof Date ? options.to : new Date(options.to);
+const MAX_REPAIR_BATCH_SIZE = 2000;
 
-  if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) {
-    throw new Error('reconcileLiabilities requires valid `from` and `to` dates');
-  }
-  if (from.getTime() > to.getTime()) {
-    throw new Error('reconcileLiabilities requires `from` <= `to`');
-  }
-
-  const requestedLimit = Number.parseInt(options.limit, 10);
-  const limit = Math.min(
-    MAX_RECONCILIATION_RECORDS,
-    Math.max(1, requestedLimit || MAX_RECONCILIATION_RECORDS)
-  );
-
-  const actions = Object.keys(RECONCILIATION_LIABILITY_ACTIONS);
-
-  const records = await prisma.activityLog.findMany({
-    where: {
-      action: { in: actions },
-      createdAt: { gte: from, lte: to },
-    },
-    orderBy: { createdAt: 'asc' },
-    take: limit,
-    select: { id: true, action: true, entityId: true, metadata: true, createdAt: true },
-  });
-
-  const groups = new Map();
-  const inconsistent = [];
-  const referencesByCategory = { payment: new Map(), fee: new Map(), refund: new Map() };
-
-  for (const record of records) {
-    const category = RECONCILIATION_LIABILITY_ACTIONS[record.action];
-    const meta = record.metadata || {};
-    const network = meta.network;
-    const asset = meta.asset;
-    const reference = meta.reference || record.entityId;
-    const amount = Number(meta.amount);
-
-    const problems = [];
-    if (!network) problems.push('missing network');
-    if (!asset) problems.push('missing asset');
-    if (!reference) problems.push('missing reference');
-    if (!Number.isFinite(amount) || amount <= 0) problems.push('invalid amount');
-
-    if (problems.length > 0) {
-      inconsistent.push({
-        id: record.id,
-        action: record.action,
-        category,
-        reference: reference || null,
-        problems,
-      });
-      continue;
-    }
-
-    const groupKey = `${network}::${asset}`;
-    if (!groups.has(groupKey)) {
-      groups.set(groupKey, {
-        network,
-        asset,
-        totals: { payment: 0, fee: 0, refund: 0 },
-        counts: { payment: 0, fee: 0, refund: 0 },
-      });
-    }
-    const group = groups.get(groupKey);
-    group.totals[category] += amount;
-    group.counts[category] += 1;
-
-    if (!referencesByCategory[category].has(reference)) {
-      referencesByCategory[category].set(reference, []);
-    }
-    referencesByCategory[category].get(reference).push(record.id);
-  }
-
-  // Duplicated records: same reference recorded more than once in a category.
-  const duplicated = [];
-  for (const category of Object.keys(referencesByCategory)) {
-    for (const [reference, ids] of referencesByCategory[category].entries()) {
-      if (ids.length > 1) {
-        duplicated.push({ category, reference, ids });
-      }
-    }
-  }
-
-  // Missing records: a reference present in one category but absent from a
-  // category it should accompany (payments should have matching fees/refunds
-  // when the reference is shared across categories).
-  const missing = [];
-  const allReferences = new Set();
-  for (const category of Object.keys(referencesByCategory)) {
-    for (const reference of referencesByCategory[category].keys()) {
-      allReferences.add(reference);
-    }
-  }
-  for (const reference of allReferences) {
-    const present = Object.keys(referencesByCategory).filter((category) =>
-      referencesByCategory[category].has(reference)
-    );
-    if (present.length > 1) {
-      for (const category of Object.keys(referencesByCategory)) {
-        if (!referencesByCategory[category].has(reference)) {
-          missing.push({ reference, expectedCategory: category, presentIn: present });
-        }
-      }
-    }
-  }
-
-  const byNetworkAsset = Array.from(groups.values()).sort((a, b) => {
-    if (a.network !== b.network) return a.network < b.network ? -1 : 1;
-    if (a.asset !== b.asset) return a.asset < b.asset ? -1 : 1;
-    return 0;
-  });
-
-  return {
-    from,
-    to,
-    recordCount: records.length,
-    truncated: records.length >= limit,
-    byNetworkAsset,
-    missing,
-    duplicated,
-    inconsistent,
-  };
+/**
+ * Build a stable, deterministic key for a repair proposal so the same
+ * underlying defect always maps to the same key across runs. This is what
+ * makes resumption idempotent: an applied repair is recorded under this key
+ * and skipped on subsequent runs.
+ *
+ * @param {Object} payment
+ * @returns {string}
+ */
+function repairKeyFor(payment) {
+  return `payment:${payment.id}:amount`;
 }
 
-module.exports = {
-  log,
-  logMany,
-  listByUser,
-  cleanupCompletedRecords,
-  reconcileLiabilities,
-  DEFAULT_RETENTION_DAYS,
-  DEFAULT_CLEANUP_BATCH_SIZE,
-  MAX_CLEANUP_BATCH_SIZE,
-  CLEANUP_ELIGIBLE_ACTIONS,
-  CLEANUP_PROTECTED_ACTIONS,
-  RECONCILIATION_LIABILITY_ACTIONS,
-  MAX_RECONCILIATION_RECORDS,
-};
+/**
+ * Determine whether a payment record needs an amount repair. A record is
+ * considered defective when its stored amount is missing, non-numeric, or
+ * negative. The proposed value is the absolute, rounded amount.
+ *
+ * @param {Object} payment
+
+/* … truncated 4010 chars — edit only what you need near the top … */
