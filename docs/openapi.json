@@ -219,10 +219,11 @@
       "get": {
         "tags": ["Stats"],
         "summary": "Get platform statistics",
+        "description": "Returns aggregate statistics served from the refreshable reporting read model. The response includes the source watermark and refresh status so clients can reason about staleness. Reporting refreshes run asynchronously and never block payment writes.",
         "operationId": "getStats",
         "responses": {
           "200": {
-            "description": "Aggregate platform statistics",
+            "description": "Aggregate platform statistics from the reporting read model",
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Stats" }
@@ -244,6 +245,52 @@
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Stats" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/api/admin/stats/refresh": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Trigger a reporting read model refresh",
+        "description": "Enqueues an asynchronous refresh of the reporting read model. The refresh runs decoupled from the payment write path and records the source watermark on completion. Returns the current refresh status.",
+        "operationId": "refreshStats",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "202": {
+            "description": "Refresh accepted and running asynchronously",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StatsRefreshStatus" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "409": {
+            "description": "A refresh is already in progress",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/StatsRefreshStatus" } }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Get reporting read model refresh status",
+        "description": "Returns the current refresh status and source watermark of the reporting read model.",
+        "operationId": "getStatsRefreshStatus",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Current refresh status",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StatsRefreshStatus" }
               }
             }
           },

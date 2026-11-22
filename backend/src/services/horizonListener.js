@@ -164,6 +164,20 @@ function handlePayment(payment, config) {
   if (typeof config.onPayment === 'function') {
     config.onPayment(event);
   }
+  // Reporting is decoupled from the payment write path: the read model is
+  // refreshed asynchronously and never blocks payment ingestion.
+  if (typeof config.onReportingWatermark === 'function') {
+    try {
+      config.onReportingWatermark({
+        source: 'horizon',
+        cursor: payment.paging_token || payment.id,
+        ledger: payment.ledger,
+        observedAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      logger.error(`Error recording reporting watermark: ${err.message}`);
+    }
+  }
 }
 
 module.exports = {

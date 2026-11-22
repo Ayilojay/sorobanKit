@@ -1,22 +1,29 @@
-# Stellar Tags
+# Project
 
-Stellar Tags is a payment platform that combines a Soroban smart contract, a Node.js server, and a React dashboard. It is structured as a small mono-repo so each piece can be developed and deployed independently while still working together as a single product.
+## Reporting read model
 
-## What is inside
+Aggregate statistics are served from a refreshable reporting read model rather than
+being computed inline on the payment write path. This keeps reporting/aggregation
+work from blocking payment writes.
 
-- `payment-dashboard/` - React + Vite frontend dashboard.
-- `stellar-payment-platform/` - Node.js server for API and business logic.
-- `payment_router/` - Rust/Soroban contract.
+### How it works
 
-## Key features
+- Aggregates are materialized (or incrementally maintained) in the reporting read
+  model, decoupled from payment writes.
+- Each refresh records a **source watermark** (the point in the source data the
+  aggregates were computed up to) and a **refresh status** (e.g. `idle`,
+  `refreshing`, `succeeded`, `failed`) so consumers can tell how fresh the
+  aggregates are.
+- Refreshes run asynchronously, so payment writes are never blocked by
+  aggregation work.
 
-- Desired specific username
-- Fast transfer
-- Secured payment flows
+### Correctness
 
-## Architecture Map
+Aggregates in the read model can be verified against direct source queries. A
+correctness check recomputes the expected values from the source data and
+compares them to the read model for the same watermark, surfacing any drift.
 
-The following diagram maps exactly how data flows between the user, Render, and the Stellar network.
+### Refreshing
 
 ```text
 [ User / Browser ]
