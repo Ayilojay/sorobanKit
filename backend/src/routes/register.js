@@ -23,7 +23,7 @@ function isReservationActive(deletedAt) {
 
 router.post('/register', rejectNestedObjects, async (req, res, next) => {
   try {
-    const { address, memo } = req.body || {};
+    const { address, memo, tenantId } = req.body || {};
 
     if (!address || typeof address !== 'string') {
       throw new ApiError('INVALID_INPUT', 'address is required');

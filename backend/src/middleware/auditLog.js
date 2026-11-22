@@ -8,12 +8,35 @@ const prisma = new PrismaClient();
  * The insert is fire-and-forget: it is scheduled with setImmediate so it
  * runs after the response lifecycle, and any failure is logged without
  * being propagated to the response.
+ *
+ * Tenant isolation: every audit entry is stamped with the acting user's
+ * tenant (merchant) id so merchant-owned records stay scoped. Cross-tenant
+ * admin access is only permitted for explicitly flagged admins, and the
+ * bypass is recorded on the entry itself (audited) rather than silently
+ * widening the query scope.
  */
 function auditLog(action) {
   return (req, res, next) => {
+    const user = req.user || null;
+    const tenantId = user ? user.tenantId || user.merchantId || null : null;
+    const isAdmin = Boolean(user && user.isAdmin);
+    const requestedTenantId = req.params && req.params.tenantId
+      ? req.params.tenantId
+      : null;
+
+    // An admin may act across tenants, but only when the target tenant is
+    // explicitly provided. The bypass is captured on the audit entry so it
+    // can be reviewed later.
+    const crossTenantBypass = Boolean(
+      isAdmin && requestedTenantId && requestedTenantId !== tenantId
+    );
+
     const entry = {
       action,
-      userId: req.user ? req.user.id : null,
+      userId: user ? user.id : null,
+      tenantId,
+      targetTenantId: requestedTenantId,
+      crossTenantBypass,
       method: req.method,
       path: req.originalUrl,
       ip: req.ip,

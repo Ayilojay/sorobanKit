@@ -71,3 +71,117 @@ describe('db-pool-monitor wait queue alerts', () => {
     jest.useRealTimers();
   });
 });
+
+describe('db-pool-monitor interactive statement timeouts', () => {
+  const originalEnv = {
+    DB_STATEMENT_TIMEOUT_MS: process.env.DB_STATEMENT_TIMEOUT_MS,
+    DB_MAINTENANCE_TIMEOUT_MS: process.env.DB_MAINTENANCE_TIMEOUT_MS,
+  };
+
+  afterEach(() => {
+    jest.clearAllMocks();
+    Object.entries(originalEnv).forEach(([key, value]) => {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    });
+  });
+
+  function mockClient() {
+    return {
+      query: jest.fn().mockResolvedValue({ rows: [] }),
+      release: jest.fn(),
+    };
+  }
+
+  function mockPoolWithClient(client) {
+    return {
+      connect: jest.fn().mockResolvedValue(client),
+      query: jest.fn().mockResolvedValue({ rows: [] }),
+    };
+  }
+
+  test('applies the interactive statement timeout to the session', async () => {
+    process.env.DB_STATEMENT_TIMEOUT_MS = '2500';
+    const client = mockClient();
+    const pool = mockPoolWithClient(client);
+
+    await runInteractiveQuery(pool, 'SELECT 1');
+
+    expect(client.query).toHaveBeenCalledWith('SET LOCAL statement_timeout = $1', [2500]);
+    expect(client.query).toHaveBeenCalledWith('SELECT 1');
+    expect(client.release).toHaveBeenCalled();
+  });
+
+  test('uses the default interactive budget when env is unset', async () => {
+    delete process.env.DB_STATEMENT_TIMEOUT_MS;
+    const client = mockClient();
+    const pool = mockPoolWithClient(client);
+
+    await runInteractiveQuery(pool, 'SELECT 1');
+
+    expect(client.query).toHaveBeenCalledWith('SET LOCAL statement_timeout = $1', [DEFAULT_INTERACTIVE_TIMEOUT_MS]);
+  });
+
+  test('maintenance budget is separate from the interactive budget', async () => {
+    process.env.DB_STATEMENT_TIMEOUT_MS = '1000';
+    process.env.DB_MAINTENANCE_TIMEOUT_MS = '60000';
+    const client = mockClient();
+    const pool = mockPoolWithClient(client);
+
+    await runMaintenanceQuery(pool, 'VACUUM');
+
+    expect(client.query).toHaveBeenCalledWith('SET LOCAL statement_timeout = $1', [60000]);
+    expect(client.query).toHaveBeenCalledWith('VACUUM');
+  });
+
+  test('maps statement timeout errors to a safe API error', async () => {
+    const timeoutError = Object.assign(new Error('canceling statement due to statement timeout'), {
+      code: '57014',
+    });
+    const client = mockClient();
+    client.query.mockImplementation((sql) => {
+      if (sql === 'SELECT pg_sleep(10)') {
+        return Promise.reject(timeoutError);
+      }
+      return Promise.resolve({ rows: [] });
+    });
+    const pool = mockPoolWithClient(client);
+
+    await expect(runInteractiveQuery(pool, 'SELECT pg_sleep(10)')).rejects.toMatchObject({
+      status: 504,
+      code: 'DB_STATEMENT_TIMEOUT',
+    });
+    expect(client.release).toHaveBeenCalled();
+  });
+
+  test('releases the pooled connection after cancellation so it can recover', async () => {
+    const timeoutError = Object.assign(new Error('canceling statement due to statement timeout'), {
+      code: '57014',
+    });
+    const client = mockClient();
+    client.query.mockImplementation((sql) => {
+      if (sql === 'SELECT pg_sleep(10)') {
+        return Promise.reject(timeoutError);
+      }
+      return Promise.resolve({ rows: [] });
+    });
+    const pool = mockPoolWithClient(client);
+
+    await expect(runInteractiveQuery(pool, 'SELECT pg_sleep(10)')).rejects.toBeDefined();
+
+    expect(client.release).toHaveBeenCalledTimes(1);
+    expect(client.release).toHaveBeenCalledWith();
+  });
+
+  test('releases the connection when the query succeeds', async () => {
+    const client = mockClient();
+    const pool = mockPoolWithClient(client);
+
+    await runInteractiveQuery(pool, 'SELECT 1');
+
+    expect(client.release).toHaveBeenCalledTimes(1);
+  });
+});
