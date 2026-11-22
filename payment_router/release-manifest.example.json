@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "network": "testnet",
+  "contracts": [
+    {
+      "name": "payment_router",
+      "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "wasm_path": "target/wasm32-unknown-unknown/release/payment_router.optimized.wasm",
+      "wasm_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "interface_version": 1,
+      "dependencies": []
+    }
+  ]
+}
