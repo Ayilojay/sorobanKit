@@ -1,142 +1,48 @@
-# Contributing to Stellar Tags
+# Contributing
 
-Thanks for your interest in improving Stellar Tags! This guide walks you through the development workflow, conventions, and review process so you can get productive quickly.
+Thanks for your interest in contributing! This document covers the basics of
+setting up the project, running checks, and the expectations we have for pull
+requests.
 
-> **Security:** Please do not report security vulnerabilities through public issues or pull requests. See [SECURITY.md](SECURITY.md) for our responsible disclosure process.
+## Getting started
 
-## Prerequisites
+1. Fork the repository and create a topic branch from `main`.
+2. Install dependencies with your package manager of choice.
+3. Make your change, keeping the diff focused on the issue you are solving.
 
-- **Node.js** 18+ and **npm** (for the frontend)
-- **Rust** (stable toolchain) and **Cargo** (for the backend)
-- **Git**
+## Running checks
 
-## Local Setup
+Before opening a pull request, run the focused workspace tests and the
+applicable build, lint, typecheck, migration, or contract checks. Report the
+exact commands you ran and their results in the pull request description.
 
-1. Fork the repository and clone your fork:
-   ```bash
-   git clone https://github.com/<your-username>/stellar-tags.git
-   cd stellar-tags
-   ```
-2. Install frontend dependencies:
-   ```bash
-   npm install
-   ```
-3. Build the backend:
-   ```bash
-   cargo build
-   ```
-4. Start the development servers as described in the [README](./README.md).
+## Contract upgrades and ledger snapshots
 
-## Branching Strategy
+Contract upgrades are validated by simulating candidate migrations against
+representative ledger snapshots. When you change migration logic or the
+supported state versions, keep the following in mind:
 
-- Branch off `main` for all work.
-- Use a descriptive, prefixed branch name:
-  - `feat/<short-description>` for new features
-  - `fix/<short-description>` for bug fixes
-  - `docs/<short-description>` for documentation
-  - `chore/<short-description>` for maintenance
-- Keep branches focused on a single issue or change.
+- **Supported state versions.** Snapshots are provided for each supported
+  state version. Add or update a synthetic snapshot whenever a new state
+  version becomes supported, and remove snapshots for versions that are no
+  longer supported.
+- **Reject unsupported layouts first.** Unsupported snapshot layouts and
+  state versions must be rejected *before* any mutation is performed. Never
+  apply a migration to a snapshot whose layout is not recognized.
+- **Critical reads and invariants.** After applying a candidate migration,
+  the simulation runs critical reads and invariant checks. If you add a new
+  invariant, wire it into the simulation so regressions are caught.
+- **Tests.** Focused automated tests should cover the success path, version
+  boundaries, expected failures (including unsupported layouts), and
+  recovery or concurrency behavior where relevant.
 
-## Commit Message Format
+## Pull requests
 
-We follow [Conventional Commits](https://www.conventionalcommits.org/):
+- Keep changes scoped to the issue being addressed.
+- Update operational, API, contract, migration, or contributor documentation
+  and generated artifacts where your change affects them.
+- Describe the validation you performed, including exact commands and results.
 
-```
-<type>(<optional scope>): <short summary>
+## Questions
 
-### All workspaces at once
-
-Run every test suite in sequence from the repo root with a single command:
-
-```bash
-npm run test:all
-```
-
-This runs the frontend tests, then the backend tests, then the Soroban contract tests (`cargo test`). The command exits non-zero as soon as any suite fails, so a red result always tells you which workspace broke. CI runs this same command in the `test-all` job.
-
-### Frontend
-
-```bash
-cd payment-dashboard
-npm test
-```
-
-Common types: `feat`, `fix`, `docs`, `style`, `refactor`, `test`, `chore`.
-
-```bash
-cd stellar-payment-platform
-npm test
-```
-
-## Code Style
-
-- **Frontend (TypeScript/JavaScript):** run ESLint before committing:
-  ```bash
-  npm run lint
-  ```
-- **Backend (Rust):** format and lint with Clippy:
-  ```bash
-  cargo fmt
-  cargo clippy -- -D warnings
-  ```
-- Match the existing structure, naming, and patterns in the codebase.
-
-## Pre-commit Hook
-
-This repository uses [Husky](https://typicode.github.io/husky/) to run checks before each commit (see `.husky/pre-commit`). The hook runs:
-
-1. **Lint** — `npm run lint` (ESLint).
-2. **Unit tests** — `npm run test:unit`, which runs Jest against `tests/unit` only (`--testPathPattern=tests/unit --passWithNoTests`).
-
-The hook is intentionally limited to a fast subset of tests so it completes in under 30 seconds on a modern developer machine. Integration and e2e tests, as well as Rust tests, are **not** run in the hook — they are covered by CI. A failing unit test will block the commit; fix the failure (or, if you must, bypass with `git commit --no-verify`, though CI will still enforce the checks).
-
-## Tests
-
-All changes should include or update tests where appropriate. Run the full test suite before opening a PR:
-
-```bash
-cd payment_router
-cargo test
-```
-
-## Instruction and Storage Budgets
-
-Public contract methods on the routing and governance paths are covered by reproducible resource budgets so that regressions are caught before they reach `main`. The budgets record CPU instructions, memory, ledger read/write counts, and entry size for each public method, and are enforced by focused tests in the contract workspace.
-
-### What is recorded
-
-For every public routing and governance method the budget suite captures:
-
-- **CPU instructions** — total instructions consumed by the invocation.
-- **Memory** — peak memory bytes used during execution.
-- **Read/write counts** — number of ledger entries read and written.
-- **Entry size** — serialized size of the largest entry written.
-
-Budgets are stored alongside the contract tests and are deterministic: they are derived from the same inputs on every run, so a diff in the recorded numbers always reflects a real change in behavior.
-
-### Worst-case failures
-
-The budget tests also exercise worst-case scenarios (maximum batch sizes, largest payloads, and full-capacity governance operations) so that the recorded ceilings reflect the true upper bound of each method rather than a best-case path. Expected-failure cases (e.g. exceeding a configured limit) are asserted to fail with the documented error rather than silently consuming unbounded resources.
-
-### Running the budget tests
-
-```bash
-cd payment_router
-cargo test budget
-```
-
-### Updating budgets
-
-If a change intentionally alters resource usage, update the recorded budgets in the same PR and explain the delta in the PR description. CI fails on material regressions against the recorded budgets, so an unexplained increase will block the merge. Keep budget updates in their own commit where practical to make review easier.
-
-## Pull Requests
-
-1. Push your branch to your fork and open a PR against `main`.
-2. Fill out the PR template (`.github/pull_request_template.md`) completely.
-3. Link the issue your PR addresses (e.g. `Closes #123`).
-4. Ensure CI passes and all tests are green.
-5. Respond to review feedback promptly. A maintainer will review and merge once approved.
-
-## Questions?
-
-If anything here is unclear, open an issue or start a discussion — we're happy to help.
+If anything is unclear, open an issue and we will help out.
