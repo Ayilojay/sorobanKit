@@ -231,3 +231,23 @@ app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
   res.sendStatus(200);
 });
 ```
+
+## How Stellar Tags stores your webhook secret
+
+Your webhook secret is stored using **envelope encryption** so that a compromise
+of the application database alone does not expose signing secrets:
+
+- Each secret is encrypted with its own randomly generated **data key**.
+- The data key is wrapped (encrypted) by a **KMS key** managed by Stellar Tags.
+- The wrapped data key and the **KMS key version** used to wrap it are stored
+  alongside the ciphertext, so the secret can be decrypted and re-wrapped during
+  key rotation.
+
+This is an internal storage detail. **The signing secret value you registered is
+unchanged** — signatures are still computed exactly as described above, and no
+merchant-side code changes are required. Existing secrets are migrated to the
+encrypted format in place; the migration is idempotent and safe to re-run.
+
+When the KMS key is rotated, Stellar Tags re-wraps each stored data key under the
+new key version without changing the underlying signing secret, so previously
+issued signatures continue to verify.

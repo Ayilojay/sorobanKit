@@ -1,22 +1,29 @@
-# Stellar Tags
+# Project
 
-Stellar Tags is a payment platform that combines a Soroban smart contract, a Node.js server, and a React dashboard. It is structured as a small mono-repo so each piece can be developed and deployed independently while still working together as a single product.
+## Reporting read model
 
-## What is inside
+Aggregate statistics are served from a refreshable reporting read model rather than
+being computed inline on the payment write path. This keeps reporting/aggregation
+work from blocking payment writes.
 
-- `payment-dashboard/` - React + Vite frontend dashboard.
-- `stellar-payment-platform/` - Node.js server for API and business logic.
-- `payment_router/` - Rust/Soroban contract.
+### How it works
 
-## Key features
+- Aggregates are materialized (or incrementally maintained) in the reporting read
+  model, decoupled from payment writes.
+- Each refresh records a **source watermark** (the point in the source data the
+  aggregates were computed up to) and a **refresh status** (e.g. `idle`,
+  `refreshing`, `succeeded`, `failed`) so consumers can tell how fresh the
+  aggregates are.
+- Refreshes run asynchronously, so payment writes are never blocked by
+  aggregation work.
 
-- Desired specific username
-- Fast transfer
-- Secured payment flows
+### Correctness
 
-## Architecture Map
+Aggregates in the read model can be verified against direct source queries. A
+correctness check recomputes the expected values from the source data and
+compares them to the read model for the same watermark, surfacing any drift.
 
-The following diagram maps exactly how data flows between the user, Render, and the Stellar network.
+### Refreshing
 
 ```text
 [ User / Browser ]
@@ -738,12 +745,45 @@ The repository includes a dedicated CLI tool (`scripts/deploy.js` and `./scripts
 # Deploy to mainnet
 ./scripts/deploy_contract.sh deploy --network mainnet --source S... --admin G...
 
-# Upgrade an existing contract to newly compiled WASM
+# Queue an existing contract's WASM upgrade
 ./scripts/deploy_contract.sh upgrade --contract-id C... --network testnet --source S...
+
+# Validate, install, and queue a dependency-ordered multi-contract release
+node scripts/deploy.js upgrade-manifest --manifest payment_router/release-manifest.json --network testnet --source S...
+
+# After the 24-hour timelock, execute queued upgrades and verify on-chain hashes/interfaces
+node scripts/deploy.js upgrade-manifest --manifest payment_router/release-manifest.json --network testnet --source S... --execute
 
 # Compile and optimize WASM only
 ./scripts/deploy_contract.sh build
 ```
+
+### Coordinated release manifest
+
+Start from [`payment_router/release-manifest.example.json`](payment_router/release-manifest.example.json)
+and replace the example contract ID and hash. Each contract entry specifies its
+network-wide contract ID, local WASM path, expected SHA-256, interface version,
+and dependency names. Paths are relative to the manifest. The CLI validates the
+entire manifest, dependency graph, and every local WASM hash before making any
+network call, then installs each artifact and queues the upgrade action in
+dependency order. The contract enforces a 24-hour timelock. Each returned action
+nonce is persisted in the manifest, so preparation can resume after a partial
+failure. After the delay, run the command with `--execute`; it executes recorded
+nonces in dependency order and verifies each deployed WASM hash and the
+contract's `interface_version` before removing that nonce from the manifest.
+If execution succeeded but the process stopped before updating the manifest,
+the next `--execute` run detects the deployed hash and finishes verification
+without replaying the action. The manifest network must match `--network`.
+
+The single-contract `upgrade` command also queues the timelocked action and
+prints its nonce. After 24 hours it can be executed with
+`node scripts/deploy.js execute-action --contract-id C... --nonce <nonce>
+--network testnet --source S...`; use a release manifest when post-upgrade hash
+and interface verification or resumable multi-contract coordination is needed.
+
+Contracts upgrade in separate Soroban transactions, so a failed multi-contract
+release is not globally atomic. Fix the reported problem and rerun the manifest;
+already-upgraded dependencies are safe to upgrade again to the same hash.
 
 ### Automation & Config Updates
 
@@ -751,6 +791,23 @@ Upon successful deployment, the tool automatically updates the contract address 
 - `stellar-payment-platform/.env` (`PAYMENT_ROUTER_CONTRACT_ID`, `CONTRACT_ID`)
 - `payment-dashboard/.env` (`VITE_CONTRACT_ID`, `CONTRACT_ID`)
 - `payment-dashboard/src/views/shared.js` (`CONTRACT_ID`)
+
+### Routing and governance semantics
+
+`route_payments` is all-or-nothing. The first failing item returns its stable
+contract error code and Soroban rolls back every earlier item's token transfers,
+fees, volume, spending-limit updates, refund credits, and events. Correct the
+failing item and retry the batch; do not treat a failed call as partially paid.
+
+Sensitive fee, treasury, governance, pause, blacklist, token-block, amount-limit,
+and admin-transfer settings are changed with `queue_action` and
+`execute_action`, after the 24-hour delay. Identical pending actions are rejected
+until the original is executed or cancelled. Direct legacy setters return
+`TimelockRequired`. An executed admin-transfer action only nominates an address:
+the nominee must call `accept_admin` within seven days, and the current admin
+remains active until acceptance. The current admin can cancel a nomination;
+anyone can clear it after expiry. `emergency_freeze` remains immediate, while
+unfreezing requires a matured `Unfreeze` action.
 
 ## Architecture notes
 
@@ -785,5 +842,5 @@ See [LICENSE](LICENSE).
 <!-- handsoff-issue-424 -->
 - #424: Define a renewal strategy for persistent Soroban ledger entries
 
-<!-- handsoff-issue-435 -->
-- #435: Introduce a wallet-provider adapter boundary
+<!-- handsoff-issue-414 -->
+- #414: Verify refund liabilities remain fully backed by token balances
