@@ -64,6 +64,17 @@ FROM node:lts-alpine AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 
+# OCI image metadata. `revision` is the git SHA the image was built from and
+# `source` points at the repository; syft copies these labels into the
+# container SBOM so the manifest can be tied to the exact source revision and
+# (via the image digest) the artifact. Override at build time with
+#   --build-arg GIT_REVISION=$(git rev-parse HEAD) \
+#   --build-arg SOURCE_URL=https://github.com/<org>/<repo>
+ARG GIT_REVISION=unknown
+ARG SOURCE_URL=unknown
+LABEL org.opencontainers.image.revision="${GIT_REVISION}" \
+	org.opencontainers.image.source="${SOURCE_URL}"
+
 # Create a dedicated unprivileged `node` group/user and run the server as it.
 # /app stays writable for the logs/data dirs the app creates at runtime.
 # postgresql-client provides `pg_isready`, which startup.sh polls to wait for

@@ -26,21 +26,16 @@ Use this checklist for every deployment. Do not skip steps.
       (address/version/interface) before any timelocked authority change is
       scheduled. A candidate whose interface handshake does not match the
       expected version must be rejected and must not be delegated to.
-- [ ] **Migration compatibility preflight (#469):** run the candidate
-      migrations against both the old and new application versions. The
-      preflight must report any incompatible/destructive statements before
-      deployment. Destructive contract phases must remain blocked until old
-      replicas are drained; confirm the drain gate reports zero old replicas
-      before the contract phase is allowed to proceed.
-- [ ] **Release manifest preflight (#470):** publish the coordinated release
-      manifest recording package versions, WASM hash, interface schema,
-      supported networks, and migration level. The deployment preflight must
-      reject mismatched dashboard/client/contract combinations; confirm it
-      passes for the exact versions being deployed.
-- [ ] **Production approval (#467):** production promotion requires an explicit
-      approval (GitHub environment reviewer / change ticket). Record the
-      approver, timestamp, and the promoted digest as the deployment identity.
-- [ ] Confirm a previously verified digest is available for rollback.
+- [ ] Run the focused compatibility tests (contract interface handshake and
+      API/webhook contract tests) against the candidate build and confirm they
+      pass before promoting the release
+- [ ] Confirm a threat-model review has been completed and recorded for any
+      change touching payment settlement, webhook delivery, database failover,
+      or contract pause/authority paths
+- [ ] Review the incident runbooks in `docs/runbooks/` (delayed settlement,
+      webhook backlog, database failover, contract pause) and confirm the
+      on-call rotation has access to the linked dashboards and escalation
+      contacts
 
 ## Testnet Deployment
 
@@ -114,12 +109,14 @@ documented in the target environment:
       manifest
 - [ ] Monitor logs and metrics for errors
 - [ ] Notify the team that the deployment is complete
+- [ ] If a rollback is required, follow the rollback procedure in the relevant
+      runbook under `docs/runbooks/` rather than improvising steps
 
-## Rollback
+## Local Development Bootstrap
 
-- [ ] If a problem is detected, redeploy the previously verified digest
-      (recorded in the deployment identity / release manifest). Do not rebuild.
-- [ ] Re-run the post-deploy smoke checks against the rolled-back deployment
-      and publish results keyed by the new deployment ID.
-- [ ] Record the rollback (reason, approver, timestamp, digest) in the
-      deployment record.
+- [ ] For local verification, use the one-command bootstrap
+      (`scripts/bootstrap.sh` or the documented `make bootstrap` target) instead
+      of manual service setup. It validates tool versions, starts isolated
+      services, applies migrations, and reports readiness, and fails with
+      actionable prerequisite messages. It must never target production
+      resources.

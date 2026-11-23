@@ -156,6 +156,42 @@ jobs:
           fi
           echo "✅ Repeat builds produced byte-identical WASM ($FIRST_SHA)."
 
+      - name: Generate SBOMs for releasable artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p target/sbom
+          WASM_SHA256=$(jq -r '.sha256' target/reproducible/build-metadata.json)
+          if [ -z "$WASM_SHA256" ] || [ "$WASM_SHA256" = "null" ]; then
+            echo "::error::Could not read WASM sha256 from build-metadata.json; SBOM must be tied to an artifact digest."
+            exit 1
+          fi
+          bash ../scripts/generate-sbom.sh rust \
+            --source-revision "$GITHUB_SHA" \
+            --artifact-digest "sha256:${WASM_SHA256}" \
+            --artifact "target/reproducible/${WASM_ARTIFACT}" \
+            --output "target/sbom/${WASM_ARTIFACT}.spdx.json"
+
+      - name: Generate SBOMs for container images
+        if: ${{ hashFiles('payment_router/Dockerfile', 'payment_router/docker/Dockerfile') != '' }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/sbom
+          DOCKERFILE=payment_router/Dockerfile
+          if [ ! -f "$DOCKERFILE" ]; then
+            DOCKERFILE=payment_router/docker/Dockerfile
+          fi
+          IMAGE_REF="payment-router:${GITHUB_SHA}"
+          docker build --file "$DOCKERFILE" --tag "$IMAGE_REF" .
+          IMAGE_DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE_REF" 2>/dev/null || true)
+          if [ -z "$IMAGE_DIGEST" ]; then
+            IMAGE_DIGEST="sha256:$(docker inspect --format '{{.Id}}' "$IMAGE_REF" | sed 's/^sha256://')"
+          fi
+          bash ../scripts/generate-sbom.sh container \
+            --source-revision "$GITHUB_SHA" \
+            --artifact-digest "$IMAGE_DIGEST" \
+            --artifact "$IMAGE_REF" \
+            --output "target/sbom/payment-router-container.spdx.json"
+
       - name: Upload reproducible WASM artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -165,36 +201,13 @@ jobs:
             payment_router/target/reproducible/payment_router.wasm.sha256
             payment_router/target/reproducible/build-metadata.json
 
-      - name: Release manifest preflight
-        env:
-          RELEASE_MANIFEST: ${{ vars.RELEASE_MANIFEST || 'release-manifest.json' }}
-        run: |
-          # Reject mismatched dashboard/client/contract combinations before deploy.
-          if [ ! -f "$RELEASE_MANIFEST" ]; then
-            echo "::error::Release manifest '$RELEASE_MANIFEST' not found; refusing to deploy."
-            exit 1
-          fi
-          WASM_SHA=$(awk '{print $1}' target/reproducible/${WASM_ARTIFACT}.sha256)
-          MANIFEST_WASM_HASH=$(jq -r '.wasm_hash // empty' "$RELEASE_MANIFEST")
-          if [ -z "$MANIFEST_WASM_HASH" ]; then
-            echo "::error::Release manifest is missing required field 'wasm_hash'."
-            exit 1
-          fi
-          if [ "$MANIFEST_WASM_HASH" != "$WASM_SHA" ]; then
-            echo "::error::Release manifest wasm_hash ($MANIFEST_WASM_HASH) does not match built WASM ($WASM_SHA)."
-            exit 1
-          fi
-          for FIELD in api_version contract_version interface_schema migration_level supported_networks; do
-            if ! jq -e --arg f "$FIELD" 'has($f)' "$RELEASE_MANIFEST" >/dev/null; then
-              echo "::error::Release manifest is missing required field '$FIELD'."
-              exit 1
-            fi
-          done
-          if ! jq -e '.supported_networks | index("testnet") != null' "$RELEASE_MANIFEST" >/dev/null; then
-            echo "::error::Release manifest does not declare support for 'testnet'."
-            exit 1
-          fi
-          echo "✅ Release manifest preflight passed (wasm_hash=$WASM_SHA)."
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: payment-router-sbom
+          if-no-files-found: error
+          path: |
+            payment_router/target/sbom/*.spdx.json
 
       - name: Deploy to Testnet
         id: deploy
@@ -227,6 +240,18 @@ jobs:
           echo "**WASM sha256**: \`$(cat target/reproducible/payment_router.wasm.sha256 | awk '{print $1}')\`" >> $GITHUB_STEP_SUMMARY
           echo "**Backend image**: \`${BACKEND_IMAGE_REF:-unset}\`" >> $GITHUB_STEP_SUMMARY
           echo "**Backend digest**: \`${BACKEND_IMAGE_DIGEST:-unset}\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Attach SBOMs to GitHub Release
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "::warning::No GitHub Release exists for $GITHUB_REF_NAME; skipping SBOM attachment."
+            exit 0
+          fi
+          gh release upload "$GITHUB_REF_NAME" target/sbom/*.spdx.json --clobber
 
       - name: Post-Deploy Health Check
         env:

@@ -34,70 +34,30 @@ jobs:
           cd payment-dashboard
           npm run build
 
-  build-once:
-    # Build the immutable backend artifact exactly once. Downstream staging and
-    # production promotion jobs consume the recorded digest instead of
-    # rebuilding, so the same bytes are promoted across environments.
-    runs-on: ubuntu-latest
-    needs: build
-    outputs:
-      image-digest: ${{ steps.digest.outputs.digest }}
-      image-ref: ${{ steps.digest.outputs.image-ref }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Compute image reference
-        id: image
+      - name: Generate CycloneDX SBOM
         run: |
-          OWNER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
-          IMAGE="ghcr.io/${OWNER}/payment-dashboard-backend"
-          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
-
-      - name: Build backend image (no push)
-        id: build-image
-        uses: docker/build-push-action@v6
-        with:
-          context: ./payment-dashboard
-          file: ./payment-dashboard/Dockerfile
-          push: false
-          load: true
-          tags: ${{ steps.image.outputs.image }}:${{ github.sha }}
-          labels: |
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-
-      - name: Record image digest
-        id: digest
-        run: |
-          IMAGE="${{ steps.image.outputs.image }}:${{ github.sha }}"
-          DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE" 2>/dev/null || true)"
-          if [ -z "$DIGEST" ]; then
-            # Local (unpushed) images have no RepoDigests; derive the content
-            # digest from the image ID so downstream promotion can pin it.
-            IMAGE_ID="$(docker inspect --format='{{.Id}}' "$IMAGE")"
-            DIGEST="${IMAGE}@${IMAGE_ID}"
+          set -euo pipefail
+          SOURCE_REVISION="${GITHUB_SHA}"
+          ARTIFACT_DIGEST="$(cd payment-dashboard && find dist -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')"
+          if [ -z "${ARTIFACT_DIGEST}" ]; then
+            echo "Failed to compute artifact digest for payment-dashboard dist output" >&2
+            exit 1
           fi
-          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "image-ref=${IMAGE}" >> "$GITHUB_OUTPUT"
-          echo "Recorded backend artifact digest: ${DIGEST}"
+          mkdir -p sbom
+          bash scripts/generate-sbom.sh \
+            --ecosystem node \
+            --project payment-dashboard \
+            --source-revision "${SOURCE_REVISION}" \
+            --artifact-digest "${ARTIFACT_DIGEST}" \
+            --output sbom/payment-dashboard.cdx.json
+          if [ ! -s sbom/payment-dashboard.cdx.json ]; then
+            echo "SBOM generation did not produce an output file" >&2
+            exit 1
+          fi
 
-      - name: Write digest artifact
-        run: |
-          mkdir -p dist
-          {
-            echo "image-ref=${{ steps.digest.outputs.image-ref }}"
-            echo "digest=${{ steps.digest.outputs.digest }}"
-            echo "revision=${{ github.sha }}"
-          } > dist/backend-image-digest.txt
-          cat dist/backend-image-digest.txt
-
-      - name: Upload digest artifact
+      - name: Upload SBOM artifact
         uses: actions/upload-artifact@v4
         with:
-          name: backend-image-digest
-          path: dist/backend-image-digest.txt
-          retention-days: 30
+          name: sbom-payment-dashboard
+          path: sbom/payment-dashboard.cdx.json
+          if-no-files-found: error

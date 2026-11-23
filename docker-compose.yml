@@ -34,7 +34,6 @@
 # can find and remove stacks older than the TTL even if the PR is never closed.
 # Nothing here holds production credentials: the preview profile only reads
 # PREVIEW_* variables, and the API is started with synthetic seed data.
-=======
 #
 # Database ports are published to 127.0.0.1 only. Binding to localhost keeps
 # the dev and test Postgres instances reachable from the host (for psql, the

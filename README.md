@@ -385,6 +385,62 @@ import { get_refund_balance } from '@stellar-tags/payment-router';
 Importing one method no longer pulls the rest of the binding module into the
 Vite bundle.
 
+## Software Bill of Materials (SBOM)
+
+Every releasable artifact ships with a CycloneDX JSON inventory so consumers can
+audit exactly what went into a release and tie it back to the source revision
+and the artifact digest.
+
+### What gets an SBOM
+
+| Artifact | Produced by | SBOM covers |
+| --- | --- | --- |
+| Node packages (`stellar-payment-platform`, `payment-dashboard`, `packages/types`) | `npm run sbom` in each package | `package-lock.json` dependency tree |
+| Rust contract WASM (`payment_router`) | `cargo build --release --target wasm32-unknown-unknown` | `Cargo.lock` crates plus the compiled `.wasm` |
+| Container images (backend, frontend) | `docker build` | OS packages and the bundled Node/Rust artifacts |
+
+### Format and naming
+
+SBOMs are emitted as **CycloneDX JSON** (`bomFormat: "CycloneDX"`, spec version
+1.5) and named:
+
+```text
+<artifact>-<version>-<sha>.cdx.json
+```
+
+`<artifact>` is the package or image name, `<version>` is the release version
+(or `0.0.0-dev` for unreleased builds), and `<sha>` is the first 12 characters
+of the artifact digest — the npm tarball SHA-512 for Node packages, the WASM
+SHA-256 for the contract, and the image digest for containers. Each document
+records the source revision in `metadata.component.properties` as
+`vcs.revision` (the full git commit SHA) alongside `vcs.url`.
+
+### Attaching SBOMs to releases
+
+The release workflow runs `scripts/generate-sbom.sh` for each artifact and
+uploads the resulting `*.cdx.json` files as assets on the GitHub Release, next
+to the artifact they describe. A release is not considered complete until every
+artifact has a matching SBOM.
+
+### Generating and verifying locally
+
+```bash
+# Generate SBOMs for all artifacts into ./sbom/
+./scripts/generate-sbom.sh --all --out ./sbom
+
+# Generate for a single artifact
+./scripts/generate-sbom.sh --artifact payment_router --out ./sbom
+
+# Verify an SBOM matches a source revision and artifact digest
+./scripts/generate-sbom.sh --verify ./sbom/payment_router-1.2.0-<sha>.cdx.json \
+  --revision "$(git rev-parse HEAD)" \
+  --digest "sha256:<artifact-sha256>"
+```
+
+`--verify` recomputes the artifact digest, compares it with the digest recorded
+in the SBOM, and checks that `vcs.revision` matches the supplied revision. It
+exits non-zero on any mismatch, so it can be used as a release gate or in CI.
+
 ## Webhook signature verification
 
 Every webhook delivery includes an HMAC-SHA256 signature in the
@@ -989,6 +1045,54 @@ the nominee must call `accept_admin` within seven days, and the current admin
 remains active until acceptance. The current admin can cancel a nomination;
 anyone can clear it after expiry. `emergency_freeze` remains immediate, while
 unfreezing requires a matured `Unfreeze` action.
+
+## Security and threat model
+
+Assets, trust boundaries, attacker capabilities, mitigations and owners across
+wallet signing, admin actions, webhooks, persistence, RPC and contract
+governance are documented in
+[docs/security/threat-model.md](docs/security/threat-model.md). Read it before
+changing anything that crosses one of those boundaries (signature
+verification, admin credentials, webhook delivery, database access, Horizon
+calls, or timelocked contract actions).
+
+Operational response procedures live alongside it:
+
+- [docs/runbooks/payment-failures.md](docs/runbooks/payment-failures.md) —
+  delayed settlement, webhook backlog, contract pause events.
+- [docs/runbooks/infrastructure-failures.md](docs/runbooks/infrastructure-failures.md) —
+  database failover and dependency outages.
+
+Each runbook lists diagnostics, escalation, rollback and dashboard links, and
+only uses commands that are safe to run against the affected environment.
+
+## Local bootstrap
+
+`npm run bootstrap` (from the repository root) is the supported one-command
+local setup. It validates the required tool versions, starts the isolated
+`dev` Compose stack, applies migrations, seeds the database and reports
+readiness. It refuses to run against non-local resources and exits with an
+actionable message when a prerequisite is missing.
+
+```bash
+npm run bootstrap          # full setup
+npm run bootstrap -- --check   # validate prerequisites only
+```
+
+## Compatibility tests
+
+Contract and API compatibility is covered by focused suites that must pass
+before merging changes to the contract ABI, the OpenAPI document, or the
+generated bindings:
+
+```bash
+# contract ABI / interface compatibility
+cd payment_router && cargo test
+
+# API contract and generated-binding drift
+cd stellar-payment-platform && npm run test:contract
+cd payment-dashboard && npm run api:check
+```
 
 ## Architecture notes
 
