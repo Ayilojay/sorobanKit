@@ -37,6 +37,8 @@ const { ApiError } = require("../../errors");
 const { requireJson } = require("../../middleware/requireJson");
 const {
   authenticateUsernameOwner,
+  assertUsernameOwnership,
+  resolvePrincipal,
 } = require("../../services/ownershipService");
 const {
   ACTIVITY_ACTIONS,
@@ -398,9 +400,34 @@ router.post("/users/:username/transfer", async (req, res, next) => {
   try {
     const normalizedUsername =
       typeof username === "string" ? username.toLowerCase().trim() : "";
+
+    // #383 — the caller-supplied oldAddress must not be trusted on its own.
+    // Resolve the authenticated principal from the presented signature and
+    // require it to own the username being transferred.
+    const principal = await resolvePrincipal(req, {
+      operationType: "transfer",
+      signature: oldSignature,
+      signerAddress: req.body?.signerAddress,
+    });
+
+    await assertUsernameOwnership(principal, normalizedUsername);
+
+    if (
+      principal.address &&
+      oldAddress &&
+      principal.address !== oldAddress
+    ) {
+      return next(
+        new ApiError(
+          "FORBIDDEN",
+          "Authenticated principal does not match the transfer source address.",
+        ),
+      );
+    }
+
     const updatedUser = await transferAccount(
       normalizedUsername,
-      oldAddress,
+      principal.address || oldAddress,
       newAddress,
       oldSignature,
       newSignature,
@@ -472,9 +499,14 @@ router.delete(
         return next(notFoundError);
       }
 
-      // #386 — soft-deleting a primary row clears is_primary in the same
-      // transaction (mirroring removeAlias) so the partial unique index no
-      // longer sees it and the address can claim a new primary later.
+      // #383 — only the authenticated owner may unregister a username.
+      const principal = await resolvePrincipal(req, {
+        operationType: "unregister",
+        signature: req.get("X-Stellar-Signature") || req.body?.signature,
+        signerAddress: req.get("X-Stellar-Signer") || req.body?.signerAddress,
+      });
+      await assertUsernameOwnership(principal, username);
+
       await withTransaction(async (tx) => {
         await tx.user.update({
           where: { username },
@@ -565,50 +597,15 @@ router.get(
       );
     }
 
-    let signers;
-    try {
-      signers = await fetchAccountSigners(owner.address);
-    } catch (error) {
-      logger.error("Failed to fetch account signers:", error.message);
-      return next(
-        new ApiError(
-          "UNAUTHENTICATED",
-          "Unable to verify ownership: account signers unavailable.",
-        ),
-      );
-    }
-
-    const signerKeys = (signers || [])
-      .map((signer) => signer.key || signer.publicKey || signer)
-      .filter((key) => typeof key === "string" && key.length > 0);
-
-    if (!signerKeys.includes(signerAddress)) {
-      return next(
-        new ApiError(
-          "UNAUTHENTICATED",
-          "Signer is not authorized for this account.",
-        ),
-      );
-    }
-
-    const verification = await verifyMultiSignerThreshold(
-      owner.address,
-      signerKeys,
-      {
-        operationType: "activity",
-        providedSignatures: [signature],
-        signerAddress,
-      },
-    );
-
-    if (!verification.success) {
-      return next(
-        new ApiError(
-          "UNAUTHENTICATED",
-          verification.errorMessage || "Signature verification failed.",
-        ),
-      );
-    }
+    // #383 — ownership is decided by the authenticated principal, not by the
+    // username in the path. The principal is derived from the presented
+    // signature and must own the requested username.
+    const principal = await resolvePrincipal(req, {
+      operationType: "activity",
+      signature,
+      signerAddress,
+    });
+    await assertUsernameOwnership(principal, owner.username);
 
     const { range, error: dateError } = parseDateRange(req.query);
     if (dateError) {
@@ -617,7 +614,7 @@ router.get(
 
     const { page, limit } = req.query;
     const { rows, total } = await listActivity(prisma, {
-      username: owner.username,
+      username: principal.username || owner.username,
       page,
       limit,
       range,

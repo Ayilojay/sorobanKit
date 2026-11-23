@@ -40,7 +40,19 @@
               }
             }
           },
-          "503": { "$ref": "#/components/responses/ApiErrorResponse" }
+          "503": {
+            "description": "A dependency is unhealthy, or the server is draining during graceful shutdown",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    { "$ref": "#/components/schemas/HealthStatus" },
+                    { "$ref": "#/components/schemas/Error" }
+                  ]
+                }
+              }
+            }
+          }
         }
       }
     },
@@ -127,6 +139,7 @@
         "tags": ["Addresses"],
         "summary": "Resolve a federation name or address",
         "operationId": "getFederation",
+        "description": "Public metadata response. The `ETag` is computed from the canonical resolved federation data and changes whenever a user mutation changes the resolved result. Clients may send `If-None-Match` to receive `304 Not Modified` when the representation is unchanged. Responses are public-cacheable (`Cache-Control: public`) because they do not depend on the caller's authorization.",
         "parameters": [
           {
             "name": "q",
@@ -138,17 +151,24 @@
             "name": "type",
             "in": "query",
             "schema": { "type": "string", "enum": ["id", "name"] }
-          }
+          },
+          { "$ref": "#/components/parameters/IfNoneMatchParam" }
         ],
         "responses": {
           "200": {
             "description": "Resolved federation identity",
+            "headers": {
+              "ETag": { "$ref": "#/components/headers/ETagHeader" },
+              "Cache-Control": { "$ref": "#/components/headers/PublicCacheControlHeader" },
+              "Vary": { "$ref": "#/components/headers/VaryHeader" }
+            },
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/FederationEntry" }
               }
             }
           },
+          "304": { "$ref": "#/components/responses/NotModified" },
           "400": { "$ref": "#/components/responses/ApiErrorResponse" },
           "404": { "$ref": "#/components/responses/ApiErrorResponse" },
           "500": { "$ref": "#/components/responses/ApiErrorResponse" },
@@ -200,20 +220,28 @@
         "tags": ["Tags"],
         "summary": "List tags",
         "operationId": "listTags",
+        "description": "Public metadata response. The `ETag` is computed from the canonical response data and is invalidated when user mutations change the resolved data. Supports `If-None-Match` conditional requests returning `304 Not Modified`.",
         "parameters": [
           { "$ref": "#/components/parameters/PageParam" },
           { "$ref": "#/components/parameters/LimitParam" },
-          { "name": "q", "in": "query", "description": "Search query", "schema": { "type": "string" } }
+          { "name": "q", "in": "query", "description": "Search query", "schema": { "type": "string" } },
+          { "$ref": "#/components/parameters/IfNoneMatchParam" }
         ],
         "responses": {
           "200": {
             "description": "A paginated list of tags",
+            "headers": {
+              "ETag": { "$ref": "#/components/headers/ETagHeader" },
+              "Cache-Control": { "$ref": "#/components/headers/PublicCacheControlHeader" },
+              "Vary": { "$ref": "#/components/headers/VaryHeader" }
+            },
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/TagList" }
               }
             }
           },
+          "304": { "$ref": "#/components/responses/NotModified" },
           "400": { "$ref": "#/components/responses/BadRequest" }
         }
       },
@@ -239,6 +267,50 @@
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Tag" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "409": { "$ref": "#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/api/tags/bulk": {
+      "post": {
+        "tags": ["Tags"],
+        "summary": "Create payment intents in bulk",
+        "operationId": "createTagsBulk",
+        "description": "Creates multiple payment intents atomically. Each request carries a client-supplied `batchId` (stable batch identifier) and each item carries a client-supplied `externalId` (stable item identifier). Persistence is all-or-nothing: if any item fails validation, no items are written and the response is `400` with per-item validation details. Item ordering in the response matches the request order. Retries are safe: repeating a request with the same `batchId` and `externalId` values returns the previously created batch (`200`) instead of creating duplicates; reusing an `externalId` with different content is rejected with `409 Conflict`.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/BulkTagCreateInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Idempotent replay of a previously created batch",
+            "headers": {
+              "ETag": { "$ref": "#/components/headers/ETagHeader" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/BulkTagCreateResult" }
+              }
+            }
+          },
+          "201": {
+            "description": "All items created atomically",
+            "headers": {
+              "ETag": { "$ref": "#/components/headers/ETagHeader" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/BulkTagCreateResult" }
               }
             }
           },
@@ -295,6 +367,7 @@
           },
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" }
         }
       },
@@ -309,6 +382,7 @@
         "responses": {
           "204": { "description": "Tag soft-deleted" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" },
           "409": { "$ref": "#/components/responses/Conflict" }
         }
@@ -372,6 +446,46 @@
           },
           "400": { "$ref": "#/components/responses/BadRequest" },
           "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/payments/events": {
+      "get": {
+        "tags": ["Payments"],
+        "summary": "Stream payment status updates",
+        "operationId": "streamPaymentEvents",
+        "description": "Server-sent event (SSE) feed of payment status updates for the authenticated client. Each event is versioned (`event: payment.status`, `data` includes `version` and monotonic `sequence`). Clients reconnect with `Last-Event-ID` (or the `cursor` query parameter) to resume after the last received event; the server replays events after the cursor. Heartbeat comments are sent periodically to keep idle connections alive. The feed is bounded: a per-client connection limit applies (`429` when exceeded) and slow clients are disconnected rather than buffered indefinitely. Disconnects release all server resources. Responses are never shared-cached because they depend on the caller's authorization.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque reconnect cursor; equivalent to sending the `Last-Event-ID` header",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "Last-Event-ID",
+            "in": "header",
+            "description": "Standard SSE reconnect header carrying the last received event id",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Event stream",
+            "headers": {
+              "Cache-Control": { "$ref": "#/components/headers/PrivateNoStoreCacheControlHeader" },
+              "Vary": { "$ref": "#/components/headers/VaryHeader" }
+            },
+            "content": {
+              "text/event-stream": {
+                "schema": { "$ref": "#/components/schemas/PaymentEventStream" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "$ref": "#/components/responses/TooManyRequests" }
         }
       }
     },
@@ -609,6 +723,24 @@
         "bearerFormat": "JWT"
       }
     },
+    "headers": {
+      "ETagHeader": {
+        "description": "Strong validator computed from the canonical response data",
+        "schema": { "type": "string" }
+      },
+      "PublicCacheControlHeader": {
+        "description": "Public caching directive for authorization-independent responses",
+        "schema": { "type": "string", "example": "public, max-age=60" }
+      },
+      "PrivateNoStoreCacheControlHeader": {
+        "description": "Prevents shared caching of authorization-dependent responses",
+        "schema": { "type": "string", "example": "private, no-store" }
+      },
+      "VaryHeader": {
+        "description": "Response varies on these request headers",
+        "schema": { "type": "string", "example": "Accept, Accept-Encoding" }
+      }
+    },
     "parameters": {
       "ApiVersionParam": {
         "name": "X-API-Version",
@@ -716,6 +848,19 @@
       },
       "Gone": {
         "description": "Reservation window expired; the tag can no longer be restored",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+        }
+      },
+      "NotModified": {
+        "description": "The `If-None-Match` validator matched the current ETag; the representation is unchanged",
+        "headers": {
+          "ETag": { "$ref": "#/components/headers/ETagHeader" },
+          "Cache-Control": { "$ref": "#/components/headers/PublicCacheControlHeader" }
+        }
+      },
+      "TooManyRequests": {
+        "description": "Connection limit exceeded for this client",
         "content": {
           "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
         }
@@ -943,11 +1088,11 @@
         "type": "object",
         "required": ["status", "timestamp", "database", "redis", "horizon"],
         "properties": {
-          "status": { "type": "string", "enum": ["UP"] },
+          "status": { "type": "string", "enum": ["UP", "DRAINING"] },
           "timestamp": { "type": "string", "format": "date-time" },
-          "database": { "type": "string", "enum": ["up"] },
-          "redis": { "type": "string", "enum": ["up", "not configured"] },
-          "horizon": { "type": "string", "enum": ["up"] }
+          "database": { "type": "string", "enum": ["up", "draining", "down"] },
+          "redis": { "type": "string", "enum": ["up", "draining", "down", "not configured"] },
+          "horizon": { "type": "string", "enum": ["up", "draining", "down"] }
         }
       },
       "StartupHealthStatus": {
@@ -1028,6 +1173,60 @@
           "totalPages": { "type": "integer" },
           "currentPage": { "type": "integer" }
         }
+      },
+      "BulkTagCreateInput": {
+        "type": "object",
+        "required": ["batchId", "items"],
+        "properties": {
+          "batchId": {
+            "type": "string",
+            "description": "Client-supplied stable batch identifier; retries with the same value are idempotent"
+          },
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 100,
+            "description": "Items are persisted atomically and returned in request order",
+            "items": { "$ref": "#/components/schemas/BulkTagCreateItemInput" }
+          }
+        }
+      },
+      "BulkTagCreateItemInput": {
+        "type": "object",
+        "required": ["externalId", "username", "address"],
+        "properties": {
+          "externalId": {
+            "type": "string",
+            "description": "Client-supplied stable item identifier; repeating it with identical content is idempotent, differing content is rejected with 409 Conflict"
+          },
+          "username": { "type": "string" },
+          "address": { "type": "string" }
+        }
+      },
+      "BulkTagCreateResult": {
+        "type": "object",
+        "required": ["batchId", "items"],
+        "properties": {
+          "batchId": { "type": "string" },
+          "items": {
+            "type": "array",
+            "description": "Created items in the same order as the request",
+            "items": { "$ref": "#/components/schemas/BulkTagCreateItemResult" }
+          }
+        }
+      },
+      "BulkTagCreateItemResult": {
+        "type": "object",
+        "required": ["externalId", "status"],
+        "properties": {
+          "externalId": { "type": "string" },
+          "status": { "type": "string", "enum": ["created", "existing"] },
+          "tag": { "$ref": "#/components/schemas/Tag" }
+        }
+      },
+      "PaymentEventStream": {
+        "type": "string",
+        "description": "SSE stream. Each `payment.status` event carries an `id` (reconnect cursor), `event` name, and JSON `data` with `version`, `sequence`, `paymentId`, and `status`. Heartbeats are sent as SSE comments (`: heartbeat`)."
       },
       "RestoreTagInput": {
         "type": "object",

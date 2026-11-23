@@ -110,43 +110,50 @@ describe('E2E: Federation Flow', () => {
     expect(res.status).toBe(404);
   });
 
-  it('resolves type=id to the active primary and never to a stale alias', async () => {
-    const address = 'GPRIMARYALIAS123456789FEDERATION';
-    const primary = {
-      username: `${TEST_USER}primary*localhost`,
-      address,
-      isPrimary: true,
-      deletedAt: null,
+  it('should serve federation reads publicly without authentication', async () => {
+    const validUser = {
+      username: `${TEST_USER}public*localhost`,
+      address: 'GPUBLIC123XYZ456789FEDERATION',
     };
-    const alias = {
-      username: `${TEST_USER}alias*localhost`,
-      address,
-      isPrimary: false,
-      deletedAt: null,
-    };
-    mockDb.set(primary.username, primary);
-    mockDb.set(alias.username, alias);
+    mockDb.set(validUser.address, validUser);
 
-    // Reverse lookup resolves to the primary username, not the alias.
-    let res = await request(app)
-      .get(`/api/v1/federation?q=${address}&type=id`);
+    // No Authorization header / session cookie is supplied: federation reads
+    // must remain public even after ownership enforcement is introduced.
+    const byName = await request(app)
+      .get(`/api/v1/federation?q=${encodeURIComponent(validUser.username)}&type=name`);
+
+    expect(byName.status).toBe(200);
+    expect(byName.body.account_id).toBe(validUser.address);
+
+    const byId = await request(app)
+      .get(`/api/v1/federation?q=${validUser.address}&type=id`);
+
+    expect(byId.status).toBe(200);
+    expect(byId.body.stellar_address).toBe(validUser.username);
+  });
+
+  it('should not grant access based on caller-supplied usernames or addresses', async () => {
+    const ownedUser = {
+      username: `${TEST_USER}owner*localhost`,
+      address: 'GOWNER123XYZ456789FEDERATION',
+    };
+    mockDb.set(ownedUser.address, ownedUser);
+
+    // A caller-supplied username/address in the query must not be treated as
+    // an authenticated principal. Federation lookups only resolve public
+    // records and never expose ownership-scoped data.
+    const res = await request(app)
+      .get(`/api/v1/federation?q=${encodeURIComponent(ownedUser.username)}&type=name`)
+      .set('X-User-Username', ownedUser.username)
+      .set('X-User-Address', ownedUser.address);
 
     expect(res.status).toBe(200);
-    expect(res.body.stellar_address).toBe(primary.username);
-    expect(res.body.stellar_address).not.toBe(alias.username);
-
-    // Soft-delete the primary; the alias must not be served as a stale primary.
-    primary.deletedAt = new Date();
-
-    res = await request(app)
-      .get(`/api/v1/federation?q=${address}&type=id`);
-
-    // Either no active primary remains (404) or a promoted primary is returned,
-    // but never the stale alias.
-    if (res.status === 200) {
-      expect(res.body.stellar_address).not.toBe(alias.username);
-    } else {
-      expect(res.status).toBe(404);
-    }
+    expect(res.body.account_id).toBe(ownedUser.address);
+    // Response must only contain public federation fields.
+    expect(Object.keys(res.body).sort()).toEqual(
+      expect.arrayContaining(['account_id', 'memo_type', 'memo'])
+    );
+    expect(res.body).not.toHaveProperty('owner');
+    expect(res.body).not.toHaveProperty('userId');
   });
 });

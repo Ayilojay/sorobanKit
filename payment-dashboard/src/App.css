@@ -16,7 +16,6 @@
   display: flex;
   flex-direction: column;
   gap: 24px;
-  animation: float-in 0.6s ease-out;
 }
 
 .registration .hero-panel::before {
@@ -131,7 +130,6 @@
   border-radius: 999px;
   font-weight: 600;
   cursor: pointer;
-  transition: transform 0.2s ease, background 0.2s ease;
   width: auto;
 }
 
@@ -172,7 +170,6 @@
   display: flex;
   flex-direction: column;
   gap: 24px;
-  animation: float-in 0.7s ease-out;
 }
 
 .registration .form-header h2 {
@@ -240,7 +237,6 @@
   background: linear-gradient(135deg, var(--nova), var(--accent));
   color: var(--on-accent);
   cursor: pointer;
-  transition: transform 0.2s ease, box-shadow 0.2s ease;
   width: 100%;
 }
 
@@ -379,7 +375,6 @@
   text-align: center;
   max-width: 820px;
   width: 100%;
-  animation: float-in 0.7s ease-out;
 }
 
 .help-eyebrow {
@@ -448,7 +443,6 @@
   color: var(--ink);
   font-weight: 600;
   cursor: pointer;
-  transition: transform 0.2s ease, box-shadow 0.2s ease;
 }
 
 .help-actions button:hover {
@@ -469,7 +463,6 @@
   min-height: 0;
   opacity: 0;
   transform: translateY(18px);
-  transition: opacity 0.35s ease, transform 0.35s ease;
   pointer-events: none;
 }
 
@@ -567,7 +560,6 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: background 0.2s, transform 0.2s;
 }
 
 .scroll-to-top:hover {
@@ -585,4 +577,92 @@
   margin-top: 4px;
   font-size: 0.75rem;
   color: var(--danger-ink);
+}
+
+/* Motion is opt-in: only animate when the user has not requested reduced motion. */
+@media (prefers-reduced-motion: no-preference) {
+  .registration .hero-panel {
+    animation: float-in 0.6s ease-out;
+  }
+
+  .registration .form-panel {
+    animation: float-in 0.7s ease-out;
+  }
+
+  .help-hero-content {
+    animation: float-in 0.7s ease-out;
+  }
+
+  .registration .ghost-button {
+    transition: transform 0.2s ease, background 0.2s ease;
+  }
+
+  .registration .ghost-button:hover {
+    transform: translateY(-1px);
+  }
+
+  .registration .form-field input {
+    transition: border 0.2s ease, box-shadow 0.2s ease;
+  }
+
+  .registration .primary-button {
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+  }
+
+  .registration .primary-button:hover {
+    transform: translateY(-1px);
+  }
+
+  .help-actions button {
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+  }
+
+  .help-actions button:hover {
+    transform: translateY(-1px);
+  }
+
+  .help-action-panel {
+    transition: opacity 0.35s ease, transform 0.35s ease;
+  }
+
+  .scroll-to-top {
+    transition: background 0.2s, transform 0.2s;
+  }
+
+  .scroll-to-top:hover {
+    transform: translateY(-2px);
+  }
+}
+
+/* Reduced-motion fallback: keep functional feedback (visibility, color, focus rings) but drop motion. */
+@media (prefers-reduced-motion: reduce) {
+  .registration .hero-panel,
+  .registration .form-panel,
+  .help-hero-content {
+    animation: none;
+  }
+
+  .registration .ghost-button,
+  .registration .form-field input,
+  .registration .primary-button,
+  .help-actions button,
+  .help-action-panel,
+  .scroll-to-top {
+    transition: none;
+  }
+
+  .registration .ghost-button:hover,
+  .registration .primary-button:hover,
+  .help-actions button:hover,
+  .scroll-to-top:hover {
+    transform: none;
+  }
+
+  .help-action-panel {
+    transform: none;
+  }
+
+  .help-action-panel.is-visible {
+    transform: none;
+  }
 }

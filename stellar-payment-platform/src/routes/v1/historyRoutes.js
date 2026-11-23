@@ -6,6 +6,7 @@ const { ApiError } = require('../../errors');
 const { accountPaymentsQuerySchema } = require('../../schemas');
 const { asyncHandler } = require('../../middleware/asyncHandler');
 const { fetchPaymentsForAccount } = require('../../services/stellarService');
+const { assertAccountOwnership } = require('../../services/ownershipService');
 
 const router = express.Router();
 
@@ -79,6 +80,8 @@ router.get('/accounts/:account/payments', validateSchema({ query: accountPayment
   const network = req.query.network || req.app?.locals?.stellarNetwork || process.env.STELLAR_NETWORK || 'public';
 
   try {
+    await assertAccountOwnership(req.principal, account);
+
     const page = await fetchPaymentsForAccount({ address: account, limit, cursor, order });
 
     const rawRecords = page._embedded?.records || [];

@@ -5,6 +5,13 @@ on:
     branches:
       - main
 
+# Cancel superseded pull-request runs for the same workflow and ref so new
+# commits don't queue behind obsolete validation. Releases/deployments live in
+# separate workflows and are unaffected by this group.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   backend-tests:
     runs-on: ubuntu-latest
@@ -30,10 +37,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
         with:
           node-version: ${{ matrix.node-version }}
 
@@ -44,7 +51,7 @@ jobs:
       # - restore-keys provides a fallback to the most recent cache for this OS
       #   when the exact key misses, so partial hits still save download time.
       - name: Cache backend dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: |
             stellar-payment-platform/node_modules
@@ -53,9 +60,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-node-backend-
 
+      # Lockfile-enforced install: `npm ci` fails if package.json and
+      # package-lock.json disagree, guaranteeing reproducible CI installs.
+      # `--legacy-peer-deps` is intentional (see CONTRIBUTING.md) because the
+      # backend has peer-dependency conflicts that npm 7+ strict resolution
+      # rejects; the lockfile still pins the exact resolved tree.
       - name: Install backend dependencies
         working-directory: stellar-payment-platform
-        run: npm install --legacy-peer-deps
+        run: npm ci --legacy-peer-deps
 
       # Apply migrations and seed the database so API key tests have data.
       # The seed is idempotent: re-running it yields the same active API key.

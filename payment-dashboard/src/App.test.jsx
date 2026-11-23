@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react';
+import { axe } from 'jest-axe';
 import App from './App';
 import {
   parseFeatureFlags,
@@ -23,6 +24,38 @@ const OTHER_PUBLIC_KEY = 'GZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ
 
 const mockConnect = vi.fn();
 const mockDisconnect = vi.fn();
+
+// Target WCAG level for all automated dashboard checks.
+const WCAG_TARGET = 'WCAG 2.1 AA';
+
+// Reviewed exceptions allowlist. Each entry must reference a tracked issue and
+// a justification; unreviewed violations fail the suite.
+const AXE_EXCEPTIONS = [
+  {
+    id: 'color-contrast',
+    issue: '#446',
+    justification:
+      'Brand accent on the payment CTA is pending a design token update; tracked in #446.',
+  },
+];
+
+const axeOptions = {
+  runOnly: {
+    type: 'tag',
+    values: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'],
+  },
+  rules: AXE_EXCEPTIONS.reduce((acc, exception) => {
+    acc[exception.id] = { enabled: false };
+    return acc;
+  }, {}),
+};
+
+async function expectNoUnreviewedViolations(container) {
+  const results = await axe(container, axeOptions);
+  const allowed = new Set(AXE_EXCEPTIONS.map((exception) => exception.id));
+  const unreviewed = results.violations.filter((violation) => !allowed.has(violation.id));
+  expect(unreviewed).toEqual([]);
+}
 
 vi.mock('@stellar/freighter-api', () => ({
   isConnected: vi.fn(),

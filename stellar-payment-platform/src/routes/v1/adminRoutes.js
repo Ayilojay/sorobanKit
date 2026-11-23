@@ -10,6 +10,8 @@
  *  POST /admin/block          – flag (soft-block) an address
  *  GET  /admin/export         – stream transaction records as CSV or JSON
  *  GET  /admin/stats/routing  – fetch historical payment routing statistics
+ *  GET  /admin/audit-logs     – list recent admin audit logs (with integrity fields)
+ *  GET  /admin/audit-logs/verify – walk the audit chain and report breaks
  */
 const express = require('express');
 const registerAdminExport = require('./adminExport');
@@ -30,6 +32,41 @@ const { ACTIVITY_ACTIONS, recordActivity } = require('../../services/activitySer
 const { PRIMARY_USERNAME_ORDER } = require('../../utils');
 const { ApiError } = require('../../errors');
 
+// Integrity fields that are safe to expose alongside audit records. These are
+// derived from the canonicalized event and do not reveal redacted payloads.
+const AUDIT_INTEGRITY_FIELDS = ['digest', 'prevDigest', 'keyId'];
+
+/**
+ * Projects an audit log row onto the public response shape, preserving the
+ * existing redaction behavior while surfacing the integrity-link fields.
+ */
+const projectAuditLog = (log) => {
+  const projected = { ...log };
+  for (const field of AUDIT_INTEGRITY_FIELDS) {
+    projected[field] = log[field] ?? null;
+  }
+  return projected;
+};
+
+/**
+ * Walks the audit chain in ascending order and verifies each link.
+ *
+ * Returns a report describing the total number of records checked, whether the
+ * chain is intact, and the first break (if any) with its reason.
+ *
+ * The actual digest recomputation is delegated to the audit integrity service
+ * so that key rotation and canonicalization rules live in one place.
+ */
+const verifyAuditChain = async (prisma, { limit } = {}) => {
+  const { verifyAuditLogChain } = require('../../services/auditIntegrityService');
+
+  const logs = await prisma.auditLog.findMany({
+    orderBy: { createdAt: 'asc' },
+    ...(limit ? { take: limit } : {}),
+  });
+
+  return verifyAuditLogChain(logs);
+};
 
 module.exports = (redisClient) => {
 
@@ -181,6 +218,10 @@ router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
    *
    * Query parameters:
    *  - limit (optional) integer between 1 and 100, default 50
+   *
+   * Each record includes its integrity-link fields (digest, prevDigest, keyId)
+   * so callers can independently verify the chain. Redaction of sensitive
+   * payload fields is unchanged.
    */
   
 /**
@@ -209,10 +250,59 @@ router.get(
       return res.status(200).json({
         success: true,
         count: logs.length,
-        data: logs,
+        data: logs.map(projectAuditLog),
+      });
+    }),
+  );
+
+  // ── GET /admin/audit-logs/verify ─────────────────────────────────────────
+
+  /**
+   * Walks the audit chain and reports any integrity breaks.
+   *
+   * Query parameters:
+   *  - limit (optional) integer between 1 and 100, default 50 — caps the number
+   *    of records walked (oldest-first) for bounded verification.
+   *
+   * Response:
+   *  - success: true when the chain is intact, false when a break is detected
+   *  - checked: number of records walked
+   *  - intact: boolean
+   *  - break: { index, id, reason } | null — first detected break
+   */
+  
+/**
+ * @openapi
+ * /admin/audit-logs/verify:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /admin/audit-logs/verify
+ *     responses:
+ *       200:
+ *         description: Success
+ */
+router.get(
+    '/admin/audit-logs/verify',
+    adminAuth,
+    validateSchema({ query: adminAuditLogsQuerySchema }),
+    asyncHandler(async (req, res) => {
+      const { prisma } = getPrisma();
+      const limit = req.query.limit;
+
+      const report = await verifyAuditChain(prisma, { limit });
+
+      return res.status(200).json({
+        success: report.intact,
+        checked: report.checked,
+        intact: report.intact,
+        break: report.break ?? null,
       });
     }),
   );
 
   return router;
 };
+</｜｜DSML｜｜ parameter>
+</｜｜DSML｜｜ invoke>
+</｜｜DSML｜｜ calls>
