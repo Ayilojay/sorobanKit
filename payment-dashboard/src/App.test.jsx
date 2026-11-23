@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react';
+import { axe } from 'jest-axe';
 import App from './App';
 
 const STORAGE_KEY = 'stellar_dashboard_wallet_pubkey';
@@ -9,6 +10,38 @@ const OTHER_PUBLIC_KEY = 'GZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ
 
 const mockConnect = vi.fn();
 const mockDisconnect = vi.fn();
+
+// Target WCAG level for all automated dashboard checks.
+const WCAG_TARGET = 'WCAG 2.1 AA';
+
+// Reviewed exceptions allowlist. Each entry must reference a tracked issue and
+// a justification; unreviewed violations fail the suite.
+const AXE_EXCEPTIONS = [
+  {
+    id: 'color-contrast',
+    issue: '#446',
+    justification:
+      'Brand accent on the payment CTA is pending a design token update; tracked in #446.',
+  },
+];
+
+const axeOptions = {
+  runOnly: {
+    type: 'tag',
+    values: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'],
+  },
+  rules: AXE_EXCEPTIONS.reduce((acc, exception) => {
+    acc[exception.id] = { enabled: false };
+    return acc;
+  }, {}),
+};
+
+async function expectNoUnreviewedViolations(container) {
+  const results = await axe(container, axeOptions);
+  const allowed = new Set(AXE_EXCEPTIONS.map((exception) => exception.id));
+  const unreviewed = results.violations.filter((violation) => !allowed.has(violation.id));
+  expect(unreviewed).toEqual([]);
+}
 
 vi.mock('@stellar/freighter-api', () => ({
   isConnected: vi.fn(),
@@ -341,5 +374,170 @@ describe('App pending payment resume after reload', () => {
     await waitFor(() => {
       expect(localStorage.getItem(PENDING_KEY)).toBeNull();
     });
+  });
+});
+
+describe(`App accessibility (${WCAG_TARGET})`, () => {
+  beforeEach(() => {
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  it('registration journey has no unreviewed WCAG violations', async () => {
+    freighterApi.isConnected.mockResolvedValue({ isConnected: false });
+
+    const { container } = render(<App />);
+
+    await screen.findByRole('button', { name: /connect/i });
+    await expectNoUnreviewedViolations(container);
+  });
+
+  it('registration error view has no unreviewed WCAG violations', async () => {
+    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
+    freighterApi.requestAccess.mockRejectedValue(new Error('User rejected access'));
+
+    const { container } = render(<App />);
+
+    const connectButton = await screen.findByRole('button', { name: /connect/i });
+    connectButton.click();
+
+    expect(await screen.findByText(/rejected|failed|error/i)).toBeTruthy();
+    await expectNoUnreviewedViolations(container);
+  });
+
+  it('payment journey has no unreviewed WCAG violations', async () => {
+    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
+    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
+    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
+    freighterApi.getNetwork.mockResolvedValue({ network: 'TESTNET' });
+
+    const { container } = render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+    await screen.findByRole('button', { name: /pay|send/i });
+    await expectNoUnreviewedViolations(container);
+  });
+
+  it('payment loading view has no unreviewed WCAG violations', async () => {
+    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
+    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
+    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
+    freighterApi.getNetwork.mockResolvedValue({ network: 'TESTNET' });
+
+    const { container } = render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+    const payButton = await screen.findByRole('button', { name: /pay|send/i });
+    payButton.click();
+
+    await screen.findByText(/pending|checking status|submitting/i);
+    await expectNoUnreviewedViolations(container);
+  });
+
+  it('payment error view has no unreviewed WCAG violations', async () => {
+    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
+    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
+    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
+    freighterApi.getNetwork.mockRejectedValue(new Error('Network unavailable'));
+
+    const { container } = render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+    const signButton = await screen.findByRole('button', { name: /sign/i });
+    signButton.click();
+
+    expect(await screen.findByText(/unknown network|network mismatch/i)).toBeTruthy();
+    await expectNoUnreviewedViolations(container);
+  });
+
+  it('history journey has no unreviewed WCAG violations', async () => {
+    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
+    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
+    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
+    freighterApi.getNetwork.mockResolvedValue({ network: 'TESTNET' });
+
+    const { container } = render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+    const historyTab = await screen.findByRole('tab', { name: /history/i });
+    historyTab.click();
+
+    await screen.findByText(/history|transactions/i);
+    await expectNoUnreviewedViolations(container);
+  });
+
+  it('history loading view has no unreviewed WCAG violations', async () => {
+    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
+    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
+    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
+    freighterApi.getNetwork.mockResolvedValue({ network: 'TESTNET' });
+
+    const { container } = render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+    const historyTab = await screen.findByRole('tab', { name: /history/i });
+    historyTab.click();
+
+    await screen.findByText(/loading|fetching/i);
+    await expectNoUnreviewedViolations(container);
+  });
+
+  it('analytics journey has no unreviewed WCAG violations', async () => {
+    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
+    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
+    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
+    freighterApi.getNetwork.mockResolvedValue({ network: 'TESTNET' });
+
+    const { container } = render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+    const analyticsTab = await screen.findByRole('tab', { name: /analytics/i });
+    analyticsTab.click();
+
+    await screen.findByText(/analytics|metrics/i);
+    await expectNoUnreviewedViolations(container);
+  });
+
+  it('analytics error view has no unreviewed WCAG violations', async () => {
+    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
+    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
+    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
+    freighterApi.getNetwork.mockResolvedValue({ network: 'TESTNET' });
+
+    const { container } = render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+    const analyticsTab = await screen.findByRole('tab', { name: /analytics/i });
+    analyticsTab.click();
+
+    expect(await screen.findByText(/failed|error|unavailable/i)).toBeTruthy();
+    await expectNoUnreviewedViolations(container);
+  });
+
+  it('every axe exception is reviewed with a tracked issue and justification', () => {
+    for (const exception of AXE_EXCEPTIONS) {
+      expect(exception.id).toBeTruthy();
+      expect(exception.issue).toMatch(/^#\d+$/);
+      expect(exception.justification.length).toBeGreaterThan(0);
+    }
   });
 });

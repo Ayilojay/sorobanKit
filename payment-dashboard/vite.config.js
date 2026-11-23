@@ -51,6 +51,15 @@ export default defineConfig(({ mode }) => {
     // Explicitly declare the public assets directory so it is obvious which
     // static files (robots.txt, sitemap.xml, …) will be copied to dist/.
     publicDir: 'public',
+    // Vitest configuration for the automated WCAG (axe-core) checks.
+    // The setup file registers the axe matchers and applies the WCAG 2.1 AA
+    // rule set plus the reviewed exceptions allowlist.
+    test: {
+      environment: 'jsdom',
+      globals: true,
+      setupFiles: ['./src/test/setup.js'],
+      include: ['src/**/*.{test,spec}.{js,jsx}'],
+    },
     server: {
       port: 3000,
       proxy: {

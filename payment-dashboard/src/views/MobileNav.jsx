@@ -1,3 +1,5 @@
+import { useReducedMotion } from "../hooks/useReducedMotion";
+
 /**
  * @typedef {Object} MobileNavProps
  * @property {string} active
@@ -21,8 +23,14 @@ function MobileNav({
   onRegisterClick,
   canRegister,
 }) {
+  const prefersReducedMotion = useReducedMotion();
+
   return (
-    <nav className="mobile-nav" aria-label="Primary">
+    <nav
+      className={`mobile-nav${prefersReducedMotion ? " mobile-nav--reduced-motion" : ""}`}
+      aria-label="Primary"
+      data-reduced-motion={prefersReducedMotion ? "true" : "false"}
+    >
       <button
         type="button"
         className={active === "dashboard" ? "is-active" : ""}

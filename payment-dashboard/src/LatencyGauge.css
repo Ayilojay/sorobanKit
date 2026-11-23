@@ -136,6 +136,21 @@
   }
 }
 
+/* Reduced motion: keep the dot visible, drop the pulsing glow */
+@media (prefers-reduced-motion: reduce) {
+  .latency-gauge {
+    transition: none;
+  }
+
+  .latency-gauge .gauge-dot,
+  .latency-gauge.checking .gauge-dot,
+  .latency-gauge.unhealthy .gauge-dot {
+    animation: none;
+    opacity: 1;
+    box-shadow: none;
+  }
+}
+
 /* Responsive adjustments */
 @media (max-width: 640px) {
   .latency-gauge {

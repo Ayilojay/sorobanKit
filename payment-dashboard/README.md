@@ -53,6 +53,71 @@ If the page is reloaded while a payment is in flight, the dashboard restores pro
 - **No resubmission**: resuming performs a read-only status lookup against the server using the stored reference. The payment is never re-sent on reload.
 - **Cleared on completion or mismatch**: the reference is removed once the operation reaches a terminal state (success or failure), or when it is invalid, unreadable, or does not match the current account/network.
 
+## Amount handling and token precision
+
+Canonical asset amounts are kept as **exact decimal strings** end to end. Amounts are never converted to JavaScript `number`/floating point for storage, transport, or arithmetic.
+
+- **Canonical form**: amounts are represented as decimal strings (e.g. `"12.345"`). Parsing and formatting helpers live in the amount utilities and operate on strings only.
+- **Precision at the UI boundary**: token precision (decimals) is applied only when rendering or parsing user input in the UI. The canonical string is preserved unchanged in state, drafts, and requests.
+- **Locale formatting**: display formatting uses `Intl.NumberFormat` with the token's precision, but the formatted output is derived from the exact string — no float round-trip. Parsing user input strips locale grouping separators and validates against the token precision before producing a canonical string.
+- **Validation**: amounts exceeding the token precision or containing invalid characters are rejected with an explicit error rather than silently rounded.
+
+Focused tests cover locale formatting, parsing, precision boundaries, and rejection of over-precision input without floating-point loss.
+
+## Accessible confirmation dialogs
+
+All confirmations (payment, deletion, admin actions) use the shared `Dialog` component, which implements a consistent accessibility contract:
+
+- **Semantics**: rendered with `role="dialog"` and `aria-modal="true"`, and labelled via `aria-labelledby` (title) and optionally `aria-describedby` (description).
+- **Focus entry**: on open, focus moves to the dialog (the first focusable control or the dialog container).
+- **Focus trap**: Tab/Shift+Tab cycle within the dialog while it is open; focus cannot escape to the background.
+- **Escape policy**: Escape closes the dialog by default. Destructive or irreversible confirmations may opt out of Escape-to-close; this is explicit per dialog and documented at the call site.
+- **Focus return**: on close, focus returns to the element that opened the dialog.
+- **Labelled controls**: every interactive control has an accessible name; icon-only buttons require an `aria-label`.
+
+## Accessibility testing (WCAG 2.1 AA)
+
+The dashboard targets **WCAG 2.1 Level AA**. Automated checks use [axe-core](https://github.com/dequelabs/axe-core) against critical journeys:
+
+- Registration
+- Payment (including pre-sign simulation review)
+- Transaction history
+- Analytics
+- Error and loading states for each of the above
+
+Run the focused accessibility tests with:
+
+```bash
+npm test -- --run a11y
+```
+
+Any violation fails the test. Known, reviewed exceptions are recorded in the accessibility exceptions allowlist (with a rule id, affected selector/journey, justification, and review date). Adding an exception requires review; unreviewed exceptions are not permitted.
+
+## Reduced motion
+
+The dashboard respects the `prefers-reduced-motion` media query:
+
+- Nonessential animations and transitions (entrance animations, decorative motion) are disabled or simplified when reduced motion is requested.
+- Functional feedback (loading indicators, state changes, focus indicators) remains visible — motion is reduced, not information removed.
+
+Test both modes by toggling the OS/browser setting, or in Chromium DevTools via **Rendering → Emulate CSS media feature `prefers-reduced-motion`**. Automated tests cover both preference modes.
+
+## Development commands
+
+```bash
+# Focused tests (amounts, dialogs, accessibility, reduced motion)
+npm test -- --run amounts dialog a11y reduced-motion
+
+# Lint
+npm run lint
+
+# Typecheck
+npm run typecheck
+
+# Production build
+npm run build
+```
+
 ## Expanding the ESLint configuration
 
 If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
