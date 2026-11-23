@@ -21,6 +21,117 @@ const httpRequestDuration = new client.Histogram({
   buckets: [0.01, 0.05, 0.1, 0.5, 1, 5],
 });
 
+// ---------------------------------------------------------------------------
+// Service-level indicator (SLI) metrics.
+//
+// These back the SLOs documented in docs/operations/slo.md. Label sets are
+// deliberately low-cardinality: only route templates, operation names, status
+// classes and network identifiers are allowed. User identifiers (Stellar
+// addresses, emails, usernames, intent/payment ids) must never be used as
+// label values.
+// ---------------------------------------------------------------------------
+
+// Status classes collapse concrete HTTP codes so cardinality stays bounded.
+const STATUS_CLASSES = ['2xx', '3xx', '4xx', '5xx'];
+
+/**
+ * Maps an HTTP status code to a coarse status class label value.
+ * Unknown codes fall back to 'unknown' rather than leaking the raw code.
+ */
+function statusClass(statusCode) {
+  const code = Number(statusCode);
+  if (!Number.isFinite(code)) return 'unknown';
+  if (code >= 200 && code < 300) return '2xx';
+  if (code >= 300 && code < 400) return '3xx';
+  if (code >= 400 && code < 500) return '4xx';
+  if (code >= 500 && code < 600) return '5xx';
+  return 'unknown';
+}
+
+// Counter: SLI events for the three user-facing flows. `operation` is a fixed
+// enum (e.g. "register", "federation_lookup", "payment_submit") and `status`
+// is a status class or outcome enum, never a user-supplied value.
+const sliEventsTotal = new client.Counter({
+  name: 'stellar_tags_sli_events_total',
+  help: 'Service-level indicator events by flow, operation and status class',
+  labelNames: ['flow', 'operation', 'status'],
+});
+
+// Histogram: end-to-end latency for SLI flows, bucketed for p50/p95/p99.
+const sliLatencySeconds = new client.Histogram({
+  name: 'stellar_tags_sli_latency_seconds',
+  help: 'Latency in seconds for user-facing SLI flows',
+  labelNames: ['flow', 'operation', 'status'],
+  buckets: [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+});
+
+// Histogram: time from payment submission to ledger finality, per network.
+// `outcome` is a fixed enum: success | failed | timeout | reverted.
+const ledgerFinalitySeconds = new client.Histogram({
+  name: 'stellar_tags_ledger_finality_seconds',
+  help: 'Time from payment submission to ledger finality, by network and outcome',
+  labelNames: ['network', 'outcome'],
+  buckets: [0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300],
+});
+
+// Gauge: age in seconds of the oldest unreconciled payment intent, per network.
+// Set from a periodic reconciliation sweep; never labelled by intent id.
+const oldestUnreconciledIntentAgeSeconds = new client.Gauge({
+  name: 'stellar_tags_oldest_unreconciled_intent_age_seconds',
+  help: 'Age in seconds of the oldest unreconciled payment intent, by network',
+  labelNames: ['network'],
+});
+
+/**
+ * Records one SLI observation for a flow.
+ * @param {object} params
+ * @param {string} params.flow - e.g. "registration" | "federation" | "payment"
+ * @param {string} params.operation - fixed operation enum
+ * @param {string|number} params.status - status class or outcome enum
+ * @param {number} [params.durationSeconds] - observed latency, if any
+ */
+function recordSli({ flow, operation, status, durationSeconds } = {}) {
+  const labels = {
+    flow: flow || 'unknown',
+    operation: operation || 'unknown',
+    status: typeof status === 'number' ? statusClass(status) : status || 'unknown',
+  };
+  sliEventsTotal.inc(labels);
+  if (typeof durationSeconds === 'number' && Number.isFinite(durationSeconds)) {
+    sliLatencySeconds.observe(labels, durationSeconds);
+  }
+}
+
+/**
+ * Records submission-to-finality latency for a payment on a network.
+ * @param {object} params
+ * @param {string} params.network - network identifier (e.g. "testnet")
+ * @param {string} params.outcome - success | failed | timeout | reverted
+ * @param {number} params.durationSeconds - submission-to-finality duration
+ */
+function recordLedgerFinality({ network, outcome, durationSeconds } = {}) {
+  if (typeof durationSeconds !== 'number' || !Number.isFinite(durationSeconds)) {
+    return;
+  }
+  ledgerFinalitySeconds.observe(
+    { network: network || 'unknown', outcome: outcome || 'unknown' },
+    durationSeconds,
+  );
+}
+
+/**
+ * Updates the oldest-unreconciled-intent-age gauge for a network.
+ * @param {object} params
+ * @param {string} params.network - network identifier
+ * @param {number} params.ageSeconds - age of the oldest unreconciled intent
+ */
+function setOldestUnreconciledIntentAge({ network, ageSeconds } = {}) {
+  if (typeof ageSeconds !== 'number' || !Number.isFinite(ageSeconds)) {
+    return;
+  }
+  oldestUnreconciledIntentAgeSeconds.set({ network: network || 'unknown' }, ageSeconds);
+}
+
 // The Prisma and Redis clients are created after this module is imported, so
 // they are registered later via setMetricsSources and read at scrape time.
 let prismaSource = null;
@@ -104,100 +215,80 @@ const redisConnectionsActive = new client.Gauge({
   },
 });
 
-// ---------------------------------------------------------------------------
-// Large administrative export jobs
-//
-// Exports run as durable background jobs with bounded worker concurrency. The
-// metrics below let operators watch job health (creation, terminal outcomes,
-// queue depth vs. running workers) and artifact sizes without scraping the
-// database.
-// ---------------------------------------------------------------------------
+// --- Webhook queue health -------------------------------------------------
+// These metrics back the operational dashboard for the webhook delivery queue.
+// They are updated by the webhook worker / admin DLQ route via the helpers
+// below rather than collected at scrape time, so a scrape never triggers a
+// database query. All label values are bounded (status/outcome enums only).
 
-// Counter: export jobs by lifecycle transition. `status` is one of
-// created | completed | failed | cancelled | expired.
-const exportJobsCounter = new client.Counter({
-  name: 'stellar_tags_export_jobs_total',
-  help: 'Total number of administrative export jobs by lifecycle status',
-  labelNames: ['status'],
+// Gauge: age in seconds of the oldest webhook event still pending delivery.
+// Reported as 0 when the queue is empty so the dashboard shows a flat line
+// instead of a gap.
+const webhookQueueOldestPendingAge = new client.Gauge({
+  name: 'stellar_tags_webhook_queue_oldest_pending_age_seconds',
+  help: 'Age in seconds of the oldest webhook event still pending delivery (0 when empty)',
 });
 
-// Gauge: export jobs currently executing on a worker (bounded by the worker
-// concurrency limit) and jobs waiting in the queue.
-const exportJobsRunning = new client.Gauge({
-  name: 'stellar_tags_export_jobs_running',
-  help: 'Administrative export jobs currently running on a worker',
+// Histogram: number of delivery attempts made for an event before it was
+// delivered or moved to the DLQ. Buckets are bounded to a small set of attempt
+// counts so the dashboard can render an attempt distribution without
+// unbounded cardinality.
+const webhookDeliveryAttempts = new client.Histogram({
+  name: 'stellar_tags_webhook_delivery_attempts',
+  help: 'Number of delivery attempts per webhook event',
+  buckets: [1, 2, 3, 5, 8, 13, 21],
 });
 
-const exportJobsQueued = new client.Gauge({
-  name: 'stellar_tags_export_jobs_queued',
-  help: 'Administrative export jobs waiting to be picked up by a worker',
+// Histogram: end-to-end delivery latency in seconds, from event enqueue to
+// successful delivery. Buckets mirror the HTTP latency SLOs plus a longer tail
+// for retried deliveries.
+const webhookDeliveryLatency = new client.Histogram({
+  name: 'stellar_tags_webhook_delivery_latency_seconds',
+  help: 'Webhook delivery latency in seconds from enqueue to successful delivery',
+  buckets: [0.1, 0.5, 1, 5, 30, 60, 300],
 });
 
-// Histogram: wall-clock duration of export jobs in seconds, from start of
-// processing to terminal state. Buckets span short exports through multi-minute
-// large exports.
-const exportJobDuration = new client.Histogram({
-  name: 'stellar_tags_export_job_duration_seconds',
-  help: 'Administrative export job duration in seconds',
-  labelNames: ['status'],
-  buckets: [0.1, 0.5, 1, 5, 15, 30, 60, 120, 300, 600],
+// Gauge: age in seconds of the oldest event sitting in the dead-letter queue.
+// Reported as 0 when the DLQ is empty.
+const webhookDlqOldestAge = new client.Gauge({
+  name: 'stellar_tags_webhook_dlq_oldest_age_seconds',
+  help: 'Age in seconds of the oldest webhook event in the dead-letter queue (0 when empty)',
 });
-
-// Histogram: size of the produced export artifact in bytes, so operators can
-// see how large exports grow and size artifact storage accordingly.
-const exportArtifactSize = new client.Histogram({
-  name: 'stellar_tags_export_artifact_size_bytes',
-  help: 'Size of produced administrative export artifacts in bytes',
-  buckets: [
-    1024,
-    10 * 1024,
-    100 * 1024,
-    1024 * 1024,
-    10 * 1024 * 1024,
-    100 * 1024 * 1024,
-    1024 * 1024 * 1024,
-  ],
-});
-
-const EXPORT_JOB_STATUSES = ['created', 'completed', 'failed', 'cancelled', 'expired'];
 
 /**
- * Records an export job lifecycle transition. Unknown statuses are ignored so a
- * stray value can never create unbounded label cardinality.
+ * Records the age of the oldest pending webhook event. Negative or non-finite
+ * inputs are clamped to 0 so a clock skew never produces a misleading spike.
  */
-function recordExportJobStatus(status) {
-  if (!EXPORT_JOB_STATUSES.includes(status)) return;
-  exportJobsCounter.inc({ status });
+function observeWebhookOldestPendingAge(seconds) {
+  const value = Number(seconds);
+  webhookQueueOldestPendingAge.set(Number.isFinite(value) && value > 0 ? value : 0);
 }
 
 /**
- * Records the terminal duration of an export job. `status` should be one of
- * completed | failed | cancelled.
+ * Records the age of the oldest dead-lettered webhook event, clamped like the
+ * pending-age gauge.
  */
-function observeExportJobDuration(status, seconds) {
-  if (!EXPORT_JOB_STATUSES.includes(status)) return;
-  if (!Number.isFinite(seconds) || seconds < 0) return;
-  exportJobDuration.observe({ status }, seconds);
+function observeWebhookDlqOldestAge(seconds) {
+  const value = Number(seconds);
+  webhookDlqOldestAge.set(Number.isFinite(value) && value > 0 ? value : 0);
 }
 
 /**
- * Records the size of a produced export artifact in bytes.
+ * Records the attempt count and (on success) the delivery latency for a single
+ * webhook event. Attempts below 1 are clamped to 1 so the histogram always
+ * observes a valid bucket. Latency is only observed when provided and finite.
  */
-function observeExportArtifactSize(bytes) {
-  if (!Number.isFinite(bytes) || bytes < 0) return;
-  exportArtifactSize.observe(bytes);
-}
+function observeWebhookDelivery({ attempts, latencySeconds } = {}) {
+  const attemptValue = Number(attempts);
+  webhookDeliveryAttempts.observe(
+    Number.isFinite(attemptValue) && attemptValue >= 1 ? attemptValue : 1
+  );
 
-/**
- * Updates the running/queued export job gauges. Values are clamped to
- * non-negative numbers so a transient bad read cannot poison the gauges.
- */
-function setExportJobQueueDepth({ running, queued } = {}) {
-  if (running !== undefined) {
-    exportJobsRunning.set(Number.isFinite(running) && running > 0 ? running : 0);
-  }
-  if (queued !== undefined) {
-    exportJobsQueued.set(Number.isFinite(queued) && queued > 0 ? queued : 0);
+  if (latencySeconds !== undefined && latencySeconds !== null) {
+    const latencyValue = Number(latencySeconds);
+    if (Number.isFinite(latencyValue) && latencyValue >= 0) {
+      webhookDeliveryLatency.observe(latencyValue);
+    }
   }
 }
 
@@ -255,13 +346,14 @@ module.exports = {
   dbPoolConnectionsIdle,
   dbPoolQueriesWaiting,
   redisConnectionsActive,
-  exportJobsCounter,
-  exportJobsRunning,
-  exportJobsQueued,
-  exportJobDuration,
-  exportArtifactSize,
-  recordExportJobStatus,
-  observeExportJobDuration,
-  observeExportArtifactSize,
-  setExportJobQueueDepth,
+  // SLI / SLO metrics
+  STATUS_CLASSES,
+  statusClass,
+  recordSli,
+  recordLedgerFinality,
+  setOldestUnreconciledIntentAge,
+  sliEventsTotal,
+  sliLatencySeconds,
+  ledgerFinalitySeconds,
+  oldestUnreconciledIntentAgeSeconds,
 };

@@ -20,6 +20,9 @@ const { Parser: CsvParser } = require('json2csv');
 const fs = require('fs');
 const { pipeline } = require('stream/promises');
 
+/** Default asset precision (Stellar classic assets use 7 decimal places). */
+const DEFAULT_ASSET_PRECISION = 7;
+
 /** Number of rows fetched from the database per round-trip. */
 const PAGE_SIZE = 500;
 
@@ -42,9 +45,73 @@ const EXPORT_FIELDS = [
 ];
 
 /**
- * Writes `chunk` to a writable sink, waiting for a drain event if the write
- * buffer is full (i.e. the sink is applying backpressure).  Works for both
- * HTTP responses and file streams.
+ * Converts an exact integer unit count (BigInt or numeric string) into a
+ * fixed-precision decimal string, e.g. formatUnits(12345678n, 7) => '1.2345678'.
+ *
+ * @param {bigint|string|number|null|undefined} units - Amount in base units.
+ * @param {number} [precision] - Number of decimal places for the asset.
+ * @returns {string} Decimal string representation ('' when units is nullish).
+ */
+const formatUnits = (units, precision = DEFAULT_ASSET_PRECISION) => {
+  if (units === null || units === undefined) return '';
+
+  const decimals = Number.isInteger(precision) && precision >= 0
+    ? precision
+    : DEFAULT_ASSET_PRECISION;
+
+  const value = typeof units === 'bigint' ? units : BigInt(units);
+  const negative = value < 0n;
+  const abs = negative ? -value : value;
+
+  if (decimals === 0) {
+    return `${negative ? '-' : ''}${abs.toString()}`;
+  }
+
+  const divisor = 10n ** BigInt(decimals);
+  const whole = abs / divisor;
+  const fraction = (abs % divisor).toString().padStart(decimals, '0');
+
+  return `${negative ? '-' : ''}${whole.toString()}.${fraction}`;
+};
+
+/**
+ * Maps a raw payment row (with exact unit columns) into the export shape,
+ * replacing the raw unit fields with a formatted decimal `amount` string.
+ *
+ * @param {object} record - Row selected from prisma.payment.
+ * @returns {object} Export record containing only EXPORT_FIELDS.
+ */
+const toExportRecord = (record) => {
+  const precision = record.assetPrecision ?? DEFAULT_ASSET_PRECISION;
+  return {
+    id: record.id,
+    createdAt: record.createdAt,
+    fromAddress: record.fromAddress,
+    toAddress: record.toAddress,
+    amount: formatUnits(record.amountUnits, precision),
+    assetCode: record.assetCode,
+    transactionHash: record.transactionHash,
+    status: record.status,
+  };
+};
+
+/** Prisma `select` clause used by both streamers. */
+const EXPORT_SELECT = {
+  id: true,
+  createdAt: true,
+  fromAddress: true,
+  toAddress: true,
+  amountUnits: true,
+  feeUnits: true,
+  assetPrecision: true,
+  assetCode: true,
+  transactionHash: true,
+  status: true,
+};
+
+/**
+ * Writes `chunk` to `res`, waiting for a drain event if the write buffer is
+ * full (i.e. the socket is applying backpressure).
  *
  * @param {import('stream').Writable} sink
  * @param {string|Buffer} chunk
@@ -110,16 +177,7 @@ const streamCsv = async (res, prisma, filter, logger, correlationId, options = {
 
     const records = await prisma.payment.findMany({
       where: filter,
-      select: {
-        id: true,
-        createdAt: true,
-        fromAddress: true,
-        toAddress: true,
-        amount: true,
-        assetCode: true,
-        transactionHash: true,
-        status: true,
-      },
+      select: EXPORT_SELECT,
       orderBy: { createdAt: 'desc' },
       skip: page * PAGE_SIZE,
       take: PAGE_SIZE,
@@ -135,7 +193,7 @@ const streamCsv = async (res, prisma, filter, logger, correlationId, options = {
         // Append a trailing newline so pages concatenate correctly.
         withBOM: false,
       });
-      const chunk = parser.parse(records) + '\n';
+      const chunk = parser.parse(records.map(toExportRecord)) + '\n';
       await writeChunk(res, chunk);
       headerWritten = true;
     } catch (parseErr) {
@@ -189,16 +247,7 @@ const streamJson = async (res, prisma, filter, logger, correlationId, options = 
 
     const records = await prisma.payment.findMany({
       where: filter,
-      select: {
-        id: true,
-        createdAt: true,
-        fromAddress: true,
-        toAddress: true,
-        amount: true,
-        assetCode: true,
-        transactionHash: true,
-        status: true,
-      },
+      select: EXPORT_SELECT,
       orderBy: { createdAt: 'desc' },
       skip: page * PAGE_SIZE,
       take: PAGE_SIZE,
@@ -207,8 +256,8 @@ const streamJson = async (res, prisma, filter, logger, correlationId, options = 
     if (records.length === 0) break;
 
     for (const record of records) {
-      if (isSinkClosed(res)) return totalRows;
-      await writeChunk(res, JSON.stringify(record) + '\n');
+      if (res.writableEnded) return totalRows;
+      await writeChunk(res, JSON.stringify(toExportRecord(record)) + '\n');
       totalRows += 1;
     }
 
@@ -370,6 +419,10 @@ module.exports = {
   streamAdminExport,
   streamExportToFile,
   buildDateFilter,
+  formatUnits,
+  toExportRecord,
   EXPORT_FIELDS,
+  EXPORT_SELECT,
+  DEFAULT_ASSET_PRECISION,
   PAGE_SIZE,
 };

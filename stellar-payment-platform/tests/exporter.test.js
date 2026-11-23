@@ -13,6 +13,12 @@ const os = require('os');
 const path = require('path');
 
 const exporter = require('../src/utils/exporter');
+const {
+  toUnits,
+  fromUnits,
+  formatUnits,
+  STROOP_SCALE,
+} = require('../src/utils/money');
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -430,5 +436,135 @@ describe('streamAdminExport JSON', () => {
 
     expect(writtenText(res).trim()).toBe('');
     expect(res.end).toHaveBeenCalled();
+  });
+});
+
+// ── exact money units (issue #384) ───────────────────────────────────────────
+
+describe('money units round-trip', () => {
+  it('round-trips representable values at 7-decimal precision', () => {
+    const samples = ['0', '0.0000001', '1', '1.2345678', '100', '99999999.9999999'];
+    for (const value of samples) {
+      const units = toUnits(value);
+      expect(typeof units).toBe('bigint');
+      expect(fromUnits(units)).toBe(value);
+    }
+  });
+
+  it('round-trips integer units back to decimal strings', () => {
+    expect(fromUnits(1n)).toBe('0.0000001');
+    expect(fromUnits(10_000_000n)).toBe('1');
+    expect(fromUnits(12_345_678n)).toBe('1.2345678');
+    expect(fromUnits(0n)).toBe('0');
+  });
+
+  it('exposes the stroop scale', () => {
+    expect(STROOP_SCALE).toBe(10_000_000n);
+  });
+
+  it('formats units as fixed-precision decimal strings', () => {
+    expect(formatUnits(12_345_678n)).toBe('1.2345678');
+    expect(formatUnits(10_000_000n)).toBe('1.0000000');
+    expect(formatUnits(0n)).toBe('0.0000000');
+  });
+
+  it('rejects values with more than 7 decimal places', () => {
+    expect(() => toUnits('0.00000001')).toThrow();
+    expect(() => toUnits('1.12345678')).toThrow();
+  });
+
+  it('rejects non-numeric input', () => {
+    expect(() => toUnits('abc')).toThrow();
+    expect(() => toUnits(null)).toThrow();
+    expect(() => toUnits(undefined)).toThrow();
+  });
+});
+
+describe('money units half-up rounding boundaries', () => {
+  it('rounds a half unit up', () => {
+    expect(toUnits('0.00000005')).toBe(1n);
+  });
+
+  it('rounds below a half unit down', () => {
+    expect(toUnits('0.00000004')).toBe(0n);
+  });
+
+  it('rounds negative halves away from zero (half-up)', () => {
+    expect(toUnits('-0.00000005')).toBe(-1n);
+    expect(toUnits('-0.00000004')).toBe(0n);
+  });
+
+  it('rounds larger fractional values correctly', () => {
+    expect(toUnits('1.00000005')).toBe(10_000_001n);
+    expect(toUnits('1.00000004')).toBe(10_000_000n);
+  });
+});
+
+describe('exporter emits decimal strings for exact money', () => {
+  const makeUnitRecord = (i) => ({
+    id: `txn-${i}`,
+    createdAt: new Date('2026-01-15T12:00:00Z'),
+    fromAddress: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+    toAddress: 'GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB',
+    amountUnits: 12_345_678n,
+    feeUnits: 100n,
+    assetCode: 'XLM',
+    transactionHash: `hash-${i}`,
+    status: 'completed',
+  });
+
+  it('CSV export renders amount and fee as decimal strings', async () => {
+    const res = makeRes();
+    const logger = makeLogger();
+    const prisma = makePrisma(async () => [makeUnitRecord(1)]);
+
+    await exporter.streamAdminExport({
+      res,
+      prisma,
+      format: 'csv',
+      logger,
+      correlationId: 'corr-money-1',
+    });
+
+    const text = writtenText(res);
+    expect(text).toMatch(/1\.2345678/);
+    expect(text).toMatch(/0\.0000100/);
+  });
+
+  it('JSON export renders amount and fee as decimal strings', async () => {
+    const res = makeRes();
+    const logger = makeLogger();
+    const prisma = makePrisma(async () => [makeUnitRecord(1)]);
+
+    await exporter.streamAdminExport({
+      res,
+      prisma,
+      format: 'json',
+      logger,
+      correlationId: 'corr-money-2',
+    });
+
+    const line = JSON.parse(writtenText(res).trim().split('\n')[0]);
+    expect(line.amount).toBe('1.2345678');
+    expect(line.fee).toBe('0.0000100');
+  });
+
+  it('matches the previous Float output for representable values', async () => {
+    const res = makeRes();
+    const logger = makeLogger();
+    const prisma = makePrisma(async () => [makeUnitRecord(1)]);
+
+    await exporter.streamAdminExport({
+      res,
+      prisma,
+      format: 'json',
+      logger,
+      correlationId: 'corr-money-3',
+    });
+
+    const line = JSON.parse(writtenText(res).trim().split('\n')[0]);
+    // Previous Float serialization of the same value.
+    expect(Number(line.amount)).toBe(1.2345678);
+    expect(Number(line.fee)).toBe(0.00001);
   });
 });

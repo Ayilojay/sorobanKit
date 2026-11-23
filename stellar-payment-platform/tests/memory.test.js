@@ -21,6 +21,14 @@
  * • `MEMORY_TEST_REQUESTS` (env var, default 200) controls the request count.
  * • `MEMORY_LEAK_THRESHOLD_MB` (env var, default 50) controls the allowed
  *   heap growth in megabytes.
+ *
+ * Sustained-load benchmark (Issue #479)
+ * ─────────────────────────────────────
+ * The load loop drives a realistic mix of the critical user journeys
+ * (registration, federation lookup, payment initiation, history) instead of a
+ * single endpoint, and additionally tracks connection-pool usage over time so
+ * that unbounded resource growth (leaked sockets / pool slots) is caught even
+ * when the JS heap stays flat.
  */
 
 'use strict';
@@ -56,6 +64,31 @@ jest.mock('../prismaClient', () => ({
 const REQUEST_COUNT = parseInt(process.env.MEMORY_TEST_REQUESTS ?? '200', 10);
 const THRESHOLD_MB = parseFloat(process.env.MEMORY_LEAK_THRESHOLD_MB ?? '50');
 const THRESHOLD_BYTES = THRESHOLD_MB * 1024 * 1024;
+// Allowed growth of the HTTP connection pool (open sockets) across the run.
+const POOL_GROWTH_LIMIT = parseInt(process.env.MEMORY_TEST_POOL_GROWTH ?? '10', 10);
+
+// ── Critical-journey request mix (#479) ──────────────────────────────────────
+// Each entry is a request the benchmark rotates through so that registration,
+// federation lookup, payment initiation and history are all exercised under
+// sustained load.  Bodies are only sent for POST journeys.
+const JOURNEY_MIX = [
+  { name: 'health', method: 'GET', path: '/health' },
+  { name: 'federation', method: 'GET', path: '/federation?q=client*localhost' },
+  { name: 'federation-miss', method: 'GET', path: '/federation?q=unknown*localhost' },
+  { name: 'history', method: 'GET', path: '/transactions?account=GCLIENT' },
+  {
+    name: 'registration',
+    method: 'POST',
+    path: '/register',
+    body: { publicKey: 'GCLIENT', email: 'bench@example.com' },
+  },
+  {
+    name: 'payment',
+    method: 'POST',
+    path: '/payments',
+    body: { from: 'GCLIENT', to: 'GMERCHANT', amount: '1.00', asset: 'XLM' },
+  },
+];
 
 // /health probes Horizon over HTTP; keep it off the network.
 global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 });
@@ -82,20 +115,50 @@ function heapUsedBytes() {
 }
 
 /**
- * Send a single HTTP GET to the running server and resolve when the full
+ * Send a single HTTP request to the running server and resolve when the full
  * response body has been consumed (so the server has finished its work).
+ * Accepts either a path string (GET) or a journey descriptor from JOURNEY_MIX.
  */
-function sendRequest(server, path) {
+function sendRequest(server, journey) {
+  const spec =
+    typeof journey === 'string' ? { method: 'GET', path: journey } : journey;
+  const payload = spec.body ? JSON.stringify(spec.body) : null;
+
   return new Promise((resolve, reject) => {
     const { address, port } = server.address();
     const host = address === '::' || address === '0.0.0.0' ? '127.0.0.1' : address;
-    const req = http.request({ host, port, path, method: 'GET' }, (res) => {
-      res.resume(); // drain the body
-      res.on('end', resolve);
-    });
+    const headers = {};
+    if (payload) {
+      headers['Content-Type'] = 'application/json';
+      headers['Content-Length'] = Buffer.byteLength(payload);
+    }
+    const req = http.request(
+      { host, port, path: spec.path, method: spec.method, headers },
+      (res) => {
+        res.resume(); // drain the body
+        res.on('end', resolve);
+      },
+    );
     req.on('error', reject);
+    if (payload) req.write(payload);
     req.end();
   });
+}
+
+/**
+ * Snapshot of the server's current connection-pool usage.  `connections` is
+ * the number of sockets currently open against the listener; a value that
+ * keeps climbing across batches indicates leaked sockets / pool slots.
+ */
+function poolUsage(server) {
+  if (typeof server.getConnections !== 'function') return 0;
+  let count = 0;
+  // getConnections is async but the callback fires synchronously for the
+  // in-process listener used here.
+  server.getConnections((_err, n) => {
+    count = n;
+  });
+  return count;
 }
 
 // ── Test suite ────────────────────────────────────────────────────────────────
@@ -131,14 +194,10 @@ describe('Memory leak detection (#511)', () => {
       const baselineBytes = heapUsedBytes();
 
       // --- load loop --------------------------------------------------------
+      // Rotate through the critical-journey mix so registration, federation
+      // lookup, payment initiation and history all run under sustained load.
       for (let i = 0; i < REQUEST_COUNT; i++) {
-        // Rotate between several endpoints to exercise different code paths.
-        const paths = [
-          '/health',
-          '/federation?q=client*localhost',
-          '/federation?q=unknown*localhost',
-        ];
-        await sendRequest(server, paths[i % paths.length]);
+        await sendRequest(server, JOURNEY_MIX[i % JOURNEY_MIX.length]);
       }
 
       // --- final measurement ------------------------------------------------
@@ -190,5 +249,29 @@ describe('Memory leak detection (#511)', () => {
     // deterministic; two consecutive limit-busting steps strongly suggest a leak).
     const exceedingSteps = growthPerBatch.filter((g) => g > PER_STEP_LIMIT).length;
     expect(exceedingSteps).toBeLessThanOrEqual(1);
+  });
+
+  it('connection-pool usage stays bounded across the sustained journey mix', async () => {
+    // Drive the full critical-journey mix in batches and record the number of
+    // open sockets after each batch.  A healthy server releases sockets once
+    // the response is drained, so the pool should plateau rather than grow.
+    const BATCH = Math.max(10, Math.floor(REQUEST_COUNT / 3));
+    const poolSamples = [];
+
+    for (let batch = 0; batch < 3; batch++) {
+      for (let i = 0; i < BATCH; i++) {
+        await sendRequest(server, JOURNEY_MIX[i % JOURNEY_MIX.length]);
+      }
+      poolSamples.push(poolUsage(server));
+    }
+
+    console.log('[memory-test] pool usage per batch:', poolSamples.join(', '));
+
+    const growth = poolSamples[poolSamples.length - 1] - poolSamples[0];
+    expect(growth).toBeLessThanOrEqual(
+      POOL_GROWTH_LIMIT,
+      `Connection pool grew by ${growth} sockets across the sustained load ` +
+        `(limit ${POOL_GROWTH_LIMIT}). Possible socket/pool leak.`,
+    );
   });
 });

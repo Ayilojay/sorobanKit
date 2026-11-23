@@ -10,6 +10,52 @@ requests.
 2. Install dependencies with your package manager of choice.
 3. Make your change, keeping the diff focused on the issue you are solving.
 
+### One-command local bootstrap
+
+For a reproducible local environment, use the supported bootstrap command
+instead of wiring services up by hand:
+
+```sh
+./scripts/bootstrap.sh
+```
+
+The bootstrap path:
+
+- **Validates tool versions.** It checks that the required toolchain
+  (package manager, runtime, and database client) is installed and meets the
+  minimum versions. If a prerequisite is missing or too old, it exits with an
+  actionable message naming the tool, the version found, and the version
+  required.
+- **Starts isolated services.** It brings up local-only services (database and
+  supporting dependencies) in an isolated namespace so they do not collide
+  with other local projects.
+- **Applies migrations.** It runs the pending database migrations against the
+  local database.
+- **Reports readiness.** On success it prints a readiness summary listing each
+  service and its status, so you can confirm the environment is usable before
+  running tests.
+
+The bootstrap refuses to run against production resources. It only targets the
+local, isolated configuration; if it detects a production endpoint it stops
+without making changes. Re-running the command is safe and idempotent.
+
+If bootstrap fails, read the reported prerequisite or service error, fix the
+underlying cause, and re-run. Do not work around a failed prerequisite check by
+pointing the bootstrap at shared or production resources.
+
+## Security and operations references
+
+Before changing wallet signing, admin actions, webhooks, persistence, RPC, or
+contract governance, review the published threat model. It documents the
+assets, trust boundaries, attacker capabilities, mitigations, and owners for
+each of those areas.
+
+If you are changing payment or infrastructure behavior, also review the
+incident runbooks. They describe safe procedures for delayed settlement,
+webhook backlog, database failover, and contract pause events, including
+diagnostics, escalation, rollback, dashboard links, and tested commands. Keep
+the runbooks up to date when your change affects those procedures.
+
 ## Running checks
 
 Before opening a pull request, run the focused workspace tests and the
@@ -36,30 +82,34 @@ supported state versions, keep the following in mind:
   boundaries, expected failures (including unsupported layouts), and
   recovery or concurrency behavior where relevant.
 
-## Background jobs and long-running exports
+## Preview environments for pull requests
 
-Features that run work in the background (for example, large administrative
-exports) must meet the following expectations:
+Pull requests can be provisioned with an isolated, ephemeral preview
+environment containing the API and dashboard. Previews are meant for manual
+verification and review; they are never connected to production.
 
-- **Durable job model.** Persist job records (status, progress, ownership,
-  timestamps) so jobs survive process restarts and can be inspected later.
-- **Ownership checks.** Enforce that only the job's owner (or an authorized
-  administrator) can read progress, cancel, or download artifacts.
-- **Bounded concurrency.** Limit how many jobs run at once and stream output
-  to artifact storage rather than buffering entire results in memory.
-- **Cancellation.** Support cooperative cancellation and reflect the cancelled
-  state in the job record and any in-flight progress reporting.
-- **Expiring artifacts.** Downloads must expire; record and enforce artifact
-  expiration and clean up stale artifacts.
-- **Tests.** Focused automated tests should cover the success path, boundary
-  conditions (size limits, expiration edges), expected failures (unauthorized
-  access, cancellation), and concurrency or recovery behavior where relevant.
-- **Documentation and contracts.** Update OpenAPI/Postman collections and
-  operational or API documentation whenever job endpoints or payloads change.
+- **Isolation.** Each preview gets its own database and synthetic seed data.
+  Production credentials are never injected into a preview. Only the
+  preview-only secrets described below are available to the workload.
+- **Preview-only secrets.** Configure preview secrets under the preview
+  environment scope (for example `PREVIEW_DATABASE_URL`,
+  `PREVIEW_API_TOKEN`, and `PREVIEW_DASHBOARD_SESSION_SECRET`). These values
+  must be distinct from production and must not grant access to production
+  systems. Never reuse production credentials for a preview.
+- **TTL policy.** Every preview is created with a time-to-live. When the TTL
+  elapses the environment is torn down automatically, even if the pull
+  request is still open. Re-run the preview workflow to provision a fresh
+  environment.
+- **Auditable cleanup.** Closing or merging a pull request triggers cleanup of
+  the associated preview resources. Cleanup is recorded in an audit log that
+  captures what was removed, when, and by which trigger (TTL expiry or PR
+  closure). If you notice orphaned preview resources, report them in the
+  issue so the audit trail can be reconciled.
 
 ## Pull requests
 
 - Keep changes scoped to the issue being addressed.
+=======
 - Update operational, API, contract, migration, or contributor documentation
   and generated artifacts where your change affects them.
 - Describe the validation you performed, including exact commands and results.

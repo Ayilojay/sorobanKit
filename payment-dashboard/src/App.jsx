@@ -3,7 +3,11 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react
 import { toast, Toaster } from "react-hot-toast";
 import logger from "./logger";
 import LoadingSpinner from './components/LoadingSpinner';
+import ThemeToggle from './components/ThemeToggle';
+import { useTheme } from './hooks/useTheme';
+import { useOnlineStatus } from './hooks/useOnlineStatus';
 import { HORIZON_BASE, API_BASE, walletKit } from './views/shared';
+import { loadFeatureFlags } from './featureFlags';
 
 const Dashboard = lazy(() => import('./views/Dashboard.jsx'));
 const HelpPage = lazy(() => import('./views/HelpPage.jsx'));
@@ -35,6 +39,16 @@ const CATALOGS = {
     'payment.date': 'Payment date',
     'payment.amount': 'Amount',
     'locale.label': 'Language',
+    'theme.label': 'Theme',
+    'theme.light': 'Light',
+    'theme.dark': 'Dark',
+    'theme.system': 'System',
+    'offline.banner': 'You are offline. The dashboard is read-only until your connection returns.',
+    'offline.readOnly': 'Read-only while offline',
+    'offline.lastUpdated': 'Last updated {time}',
+    'offline.neverUpdated': 'Not yet updated',
+    'offline.staleData': 'Showing cached data',
+    'offline.mutationBlocked': 'This action is unavailable while offline.',
   },
   es: {
     'app.loadingView': 'Cargando vista...',
@@ -51,6 +65,16 @@ const CATALOGS = {
     'payment.date': 'Fecha de pago',
     'payment.amount': 'Importe',
     'locale.label': 'Idioma',
+    'theme.label': 'Tema',
+    'theme.light': 'Claro',
+    'theme.dark': 'Oscuro',
+    'theme.system': 'Sistema',
+    'offline.banner': 'Estás sin conexión. El panel es de solo lectura hasta que vuelva la conexión.',
+    'offline.readOnly': 'Solo lectura sin conexión',
+    'offline.lastUpdated': 'Última actualización {time}',
+    'offline.neverUpdated': 'Aún sin actualizar',
+    'offline.staleData': 'Mostrando datos en caché',
+    'offline.mutationBlocked': 'Esta acción no está disponible sin conexión.',
   },
 };
 
@@ -183,6 +207,40 @@ function ViewFallback({ label = 'Loading view...' }) {
   );
 }
 
+/**
+ * Persistent offline banner announcing read-only mode and data freshness.
+ * @param {{ message: string, freshness: string, readOnlyLabel: string }} props
+ */
+function OfflineBanner({ message, freshness, readOnlyLabel }) {
+  return (
+    <div
+      className="offline-banner"
+      role="status"
+      aria-live="polite"
+      aria-atomic="true"
+      style={{
+        position: 'sticky',
+        top: 0,
+        zIndex: 1500,
+        display: 'flex',
+        flexWrap: 'wrap',
+        alignItems: 'center',
+        gap: '12px',
+        padding: '10px 16px',
+        backgroundColor: 'var(--color-warning-surface, #FEF3C7)',
+        color: 'var(--color-warning-text, #92400E)',
+        borderBottom: '1px solid var(--color-warning-border, #F59E0B)',
+        fontSize: '0.875rem',
+      }}
+    >
+      <strong>{readOnlyLabel}</strong>
+      <span>{message}</span>
+      <span aria-hidden="true">·</span>
+      <span>{freshness}</span>
+    </div>
+  );
+}
+
 function isTypingTarget(target) {
   if (!target || typeof target.tagName !== 'string') {
     return false;
@@ -206,7 +264,7 @@ function ShortcutsModal({ onClose, t }) {
       style={{
         position: 'fixed',
         inset: 0,
-        backgroundColor: 'rgba(0, 0, 0, 0.5)',
+        backgroundColor: 'var(--color-overlay, rgba(0, 0, 0, 0.5))',
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
@@ -220,7 +278,8 @@ function ShortcutsModal({ onClose, t }) {
         aria-labelledby="shortcuts-modal-title"
         onClick={(event) => event.stopPropagation()}
         style={{
-          backgroundColor: '#FFFFFF',
+          backgroundColor: 'var(--color-surface, #FFFFFF)',
+          color: 'var(--color-text, #111827)',
           borderRadius: '8px',
           padding: '24px',
           minWidth: '320px',
@@ -245,7 +304,8 @@ function ShortcutsModal({ onClose, t }) {
               <kbd
                 style={{
                   fontFamily: 'monospace',
-                  backgroundColor: '#F3F4F6',
+                  backgroundColor: 'var(--color-surface-muted, #F3F4F6)',
+                  color: 'var(--color-text, #111827)',
                   borderRadius: '4px',
                   padding: '2px 6px',
                 }}
@@ -335,9 +395,11 @@ const [activeView, setActiveView] = useState('dashboard')
     return readStoredWalletKey()
   })
   const [registrationState, setRegistrationState] = useState("unknown");
-  const [isOffline, setIsOffline] = useState(!navigator.onLine);
+  const isOffline = useOnlineStatus();
   const [isShortcutsOpen, setIsShortcutsOpen] = useState(false);
   const [locale, setLocale] = useState(() => resolveInitialLocale());
+  const { theme, resolvedTheme, setTheme } = useTheme();
+  const [lastUpdatedAt, setLastUpdatedAt] = useState(() => Date.now());
 
   const t = useCallback(
     (key, values) => {
@@ -371,17 +433,40 @@ const [activeView, setActiveView] = useState('dashboard')
   }, [locale]);
 
   useEffect(() => {
-    const handleOnline = () => setIsOffline(false);
-    const handleOffline = () => setIsOffline(true);
+    document.documentElement.dataset.theme = resolvedTheme;
+    document.documentElement.style.colorScheme = resolvedTheme;
+  }, [resolvedTheme]);
 
-    window.addEventListener("online", handleOnline);
-    window.addEventListener("offline", handleOffline);
+  // Track the most recent successful data load so the offline banner can
+  // surface a freshness indicator for cached, read-only data.
+  useEffect(() => {
+    if (!isOffline) {
+      setLastUpdatedAt(Date.now());
+    }
+  }, [isOffline]);
 
-    return () => {
-      window.removeEventListener("online", handleOnline);
-      window.removeEventListener("offline", handleOffline);
-    };
-  }, []);
+  const lastUpdatedLabel = useMemo(() => {
+    if (!lastUpdatedAt) {
+      return t('offline.neverUpdated');
+    }
+    return t('offline.lastUpdated', {
+      time: formatPaymentDate(lastUpdatedAt, locale),
+    });
+  }, [lastUpdatedAt, locale, t]);
+
+  const guardOfflineMutation = useCallback(
+    (action) => {
+      if (isOffline) {
+        toast.error(t('offline.mutationBlocked'));
+        return false;
+      }
+      if (typeof action === 'function') {
+        action();
+      }
+      return true;
+    },
+    [isOffline, t]
+  );
 
   const WALLET_TIMEOUT_MS = 15_000;
 
@@ -500,6 +585,9 @@ const [activeView, setActiveView] = useState('dashboard')
   }, [userPublicKey]);
 
   const handleConnectWallet = async () => {
+    if (!guardOfflineMutation()) {
+      return { ok: false, error: t('offline.mutationBlocked') };
+    }
     try {
       await walletKit.openModal({
         onWalletSelected: async (option) => {
@@ -551,10 +639,58 @@ const [activeView, setActiveView] = useState('dashboard')
     setBalance(null);
   };
 
+  const handleThemeChange = useCallback(
+    (nextTheme) => {
+      setTheme(nextTheme);
+    },
+    [setTheme]
+  );
+
+  const handleNavigate = useCallback(
+    (view) => {
+      if (view === 'register' && isOffline) {
+        toast.error(t('offline.mutationBlocked'));
+        return;
+      }
+      setActiveView(view);
+    },
+    [isOffline, t]
+  );
+
   /** @type {[number | null, (value: number | null) => void]} */
   const [balance, setBalance] = useState(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [balanceError, setBalanceError] = useState("");
+
+  const handleRefresh = useCallback(() => {
+    if (isOffline) {
+      toast.error(t('offline.mutationBlocked'));
+      return;
+    }
+    setIsRefreshing(true);
+  }, [isOffline, t]);
+
+  const themeToggle = (
+    <ThemeToggle
+      theme={theme}
+      resolvedTheme={resolvedTheme}
+      onChange={handleThemeChange}
+      label={t('theme.label')}
+      options={{
+        light: t('theme.light'),
+        dark: t('theme.dark'),
+        system: t('theme.system'),
+      }}
+    />
+  );
+
+  const offlineBanner = isOffline ? (
+    <OfflineBanner
+      message={t('offline.banner')}
+      freshness={lastUpdatedLabel}
+      readOnlyLabel={t('offline.readOnly')}
+    />
+  ) : null;
 
   const load
 
