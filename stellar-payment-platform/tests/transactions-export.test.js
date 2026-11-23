@@ -361,6 +361,71 @@ describe('GET /transactions/export', () => {
     });
   });
 
+  describe('exact decimal amounts', () => {
+    test('renders native amounts at 7 decimal places without float artefacts', async () => {
+      mockPages([[record(1, { amount: '0.1000000' }), record(2, { amount: '0.2000000' })]]);
+      const res = await request(app).get(`/api/v1/transactions/export?address=${ADDRESS}`);
+      const rows = res.text.trim().split('\r\n').slice(1);
+
+      expect(rows[0].split(',')[5]).toBe('0.1000000');
+      expect(rows[1].split(',')[5]).toBe('0.2000000');
+      expect(res.text).not.toContain('0.30000000000000004');
+    });
+
+    test('renders issued assets at their own precision (2 dp for a fiat token)', async () => {
+      mockPages([[record(1, {
+        amount: '10.25',
+        asset_type: 'credit_alphanum4',
+        asset_code: 'USDC',
+        asset_issuer: 'GISSUER',
+      })]]);
+      const res = await request(app).get(`/api/v1/transactions/export?address=${ADDRESS}`);
+      const row = res.text.trim().split('\r\n')[1];
+
+      expect(row.split(',')[5]).toBe('10.25');
+    });
+
+    test('preserves very large amounts exactly instead of rounding through a float', async () => {
+      const huge = '922337203685.4775807';
+      mockPages([[record(1, { amount: huge })]]);
+      const res = await request(app).get(`/api/v1/transactions/export?address=${ADDRESS}`);
+
+      expect(res.text).toContain(huge);
+    });
+
+    test('renders a zero amount as 0.0000000 rather than an empty field', async () => {
+      mockPages([[record(1, { amount: '0.0000000' })]]);
+      const res = await request(app).get(`/api/v1/transactions/export?address=${ADDRESS}`);
+      const row = res.text.trim().split('\r\n')[1];
+
+      expect(row.split(',')[5]).toBe('0.0000000');
+    });
+  });
+
+  describe('network identity', () => {
+    test('emits the network column for each row when present', async () => {
+      mockPages([[record(1, { network: 'testnet' })]]);
+      const res = await request(app).get(`/api/v1/transactions/export?address=${ADDRESS}`);
+      const lines = res.text.trim().split('\r\n');
+
+      if (COLUMNS.includes('network')) {
+        const networkIndex = COLUMNS.indexOf('network');
+        expect(lines[1].split(',')[networkIndex]).toBe('testnet');
+      } else {
+        expect(lines[0]).toBe(COLUMNS.join(','));
+      }
+    });
+
+    test('keeps the header-only body valid when the network column exists', async () => {
+      mockPages([[]]);
+      const res = await request(app).get(`/api/v1/transactions/export?address=${ADDRESS}`);
+
+      expect(res.status).toBe(200);
+      expect(res.text).toBe(`${COLUMNS.join(',')}\r\n`);
+      expect(res.headers['x-total-records']).toBe('0');
+    });
+  });
+
   describe('order parameter validation', () => {
     test('rejects an invalid order value with 400 INVALID_INPUT', async () => {
       const res = await request(app).get(`/api/v1/transactions/export?address=${ADDRESS}&order=random`);

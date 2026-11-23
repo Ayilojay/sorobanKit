@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import freighterApi from '@stellar/freighter-api';
 import toast from 'react-hot-toast';
 import { Client as PaymentRouterClient, networks } from '@stellar-tags/payment-router';
@@ -11,6 +11,7 @@ import MobileNav from './MobileNav';
 import RecentAddresses from '../components/RecentAddresses';
 import { useRecentAddresses } from '../useRecentAddresses';
 import { getFederation, getLookup } from '../api/client';
+import { useConnectivity } from '../useConnectivity';
 import {
   API_BASE,
   NAV_STORAGE_KEY,
@@ -22,6 +23,16 @@ import {
   useNavState,
   useWalletMenu,
 } from './shared';
+import { useFocusManager } from '../useFocusManager';
+import {
+  PAYMENT_COORDINATION_CHANNEL,
+  PAYMENT_COORDINATION_TTL_MS,
+  readPaymentCoordination,
+  writePaymentCoordination,
+  clearPaymentCoordination,
+  isPaymentCoordinationStale,
+  createPaymentOperationId,
+} from '../paymentCoordination';
 
 /**
  * @typedef {Object} DashboardProps
@@ -59,6 +70,7 @@ function Dashboard({
   canRegister,
 }) {
   const [isNavOpen, setIsNavOpen] = useNavState();
+  const { isOnline } = useConnectivity();
   const {
     menuRef,
     isOpen: isWalletMenuOpen,
@@ -97,6 +109,11 @@ function Dashboard({
     color: "#1F2937",
     bgColor: "#F3F4F6",
   });
+  const [isConfirmOpen, setIsConfirmOpen] = useState(false);
+
+  // Centralized focus + live-region announcements. Background refreshes pass
+  // `{ background: true }` so they never steal focus from the user.
+  const { headingRef, announce } = useFocusManager();
 
   // Initialize latency tracker for real-time API monitoring
   const latencyTracker = useLatencyTracker(API_BASE);
@@ -116,14 +133,8 @@ function Dashboard({
     if (balance === null || balance === undefined || balance === '') {
       return '--';
     }
-    const numericBalance = Number(balance);
-    if (Number.isNaN(numericBalance)) {
-      return String(balance);
-    }
-    return numericBalance.toLocaleString(undefined, {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 7,
-    });
+    const formatted = formatAmount(balance);
+    return formatted === null ? String(balance) : formatted;
   }, [balance]);
 
   // Derived state: whether the wallet is currently connected.
@@ -141,22 +152,25 @@ function Dashboard({
     [nameTag],
   );
 
-  // Derived state: parsed numeric amount, recomputed only when amount changes.
-  const parsedAmount = useMemo(() => {
-    const value = parseFloat(amount);
-    return Number.isNaN(value) ? 0 : value;
-  }, [amount]);
+  // Derived state: parsed decimal-safe amount, recomputed only when amount changes.
+  const parsedAmount = useMemo(() => parseAmount(amount), [amount]);
 
   // Derived state: whether the entered amount is valid for submission.
   const hasValidAmount = useMemo(
-    () => parsedAmount > 0,
+    () => parsedAmount !== null && parsedAmount > 0n,
     [parsedAmount],
   );
 
-  // Derived state: whether the payment form can be submitted.
+  // Derived state: whether the payment form can be submitted. Mutations are
+  // disabled while offline so no financial operation is ever queued.
   const canSubmitPayment = useMemo(
-    () => hasValidRecipient && hasValidAmount && !isSubmitting && !isProcessing,
-    [hasValidRecipient, hasValidAmount, isSubmitting, isProcessing],
+    () =>
+      hasValidRecipient &&
+      hasValidAmount &&
+      !isSubmitting &&
+      !isProcessing &&
+      isOnline,
+    [hasValidRecipient, hasValidAmount, isSubmitting, isProcessing, isOnline],
   );
 
   // Derived state: recent addresses list, recomputed only when it changes.
@@ -243,8 +257,43 @@ function Dashboard({
     loadReceiveDetails();
   }, [userPublicKey, onRegistrationStateChange]);
 
+  // Focus the page heading on mount / route entry instead of the recipient
+  // input, so screen-reader users land on the route context first.
   useEffect(() => {
-    recipientRef.current?.focus();
+    headingRef.current?.focus();
+  }, [headingRef]);
+
+  // Cross-tab payment coordination. Only a non-sensitive operation reference
+  // (operation id + timestamp) is shared; the backend idempotency key remains
+  // the source of truth for duplicate prevention.
+  const coordinationChannelRef = useRef(null);
+
+  useEffect(() => {
+    if (typeof BroadcastChannel === 'undefined') {
+      return undefined;
+    }
+    const channel = new BroadcastChannel(PAYMENT_COORDINATION_CHANNEL);
+    coordinationChannelRef.current = channel;
+    return () => {
+      channel.close();
+      coordinationChannelRef.current = null;
+    };
+  }, []);
+
+  /**
+   * Returns the active, non-stale coordination record from another tab, or
+   * null when there is nothing to resume/warn about.
+   */
+  const getActiveCoordination = useCallback(() => {
+    const record = readPaymentCoordination();
+    if (!record) {
+      return null;
+    }
+    if (isPaymentCoordinationStale(record, Date.now())) {
+      clearPaymentCoordination();
+      return null;
+    }
+    return record;
   }, []);
 
   useEffect(() => {
@@ -292,18 +341,56 @@ function Dashboard({
     displayMessage("Wallet connected.", "#059669", "#D1FAE5");
   };
 
-  const handleLookup = async () => {
+  const handleLookup = () => {
     if (isSubmitting) return;
+
+    const amountValue = parseAmount(amount);
+
+    if (amountValue === null || amountValue <= 0n) {
+      toast.error("Please enter a valid amount greater than zero.");
+      return;
+    }
+
+    setIsConfirmOpen(true);
+  };
+
+  const handleConfirmPayment = async () => {
+    if (isSubmitting) return;
+    if (!isOnline) {
+      toast.error("You are offline. Payments are disabled until you reconnect.");
+      return;
+    }
     setIsSubmitting(true);
 
     const recipientInput = nameTag.trim();
-    const amountValue = parseFloat(amount);
+    const amountValue = parseAmount(amount);
 
-    if (!amountValue || Number.isNaN(amountValue) || amountValue <= 0) {
+    if (amountValue === null || amountValue <= 0n) {
       toast.error("Please enter a valid amount greater than zero.");
+      announce("Please enter a valid amount greater than zero.", 'assertive');
       setIsSubmitting(false);
       return;
     }
+
+    // Warn / resume instead of firing a duplicate payment when another tab
+    // already has an in-flight operation.
+    const activeCoordination = getActiveCoordination();
+    if (activeCoordination) {
+      const message =
+        "A payment is already in progress in another tab. Resume there or wait for it to finish.";
+      toast.error(message);
+      announce(message, 'assertive');
+      setIsSubmitting(false);
+      return;
+    }
+
+    const operationId = createPaymentOperationId();
+    const coordinationRecord = { operationId, startedAt: Date.now() };
+    writePaymentCoordination(coordinationRecord);
+    coordinationChannelRef.current?.postMessage({
+      type: 'payment-started',
+      ...coordinationRecord,
+    });
 
     setIsProcessing(true);
     const toastId = toast.loading("Verifying recipient...");
@@ -325,7 +412,7 @@ function Dashboard({
       }
 
       toast.loading("Simulating smart contract execution...", { id: toastId });
-      const amountStroops = BigInt(Math.floor(amountValue * 10000000));
+      const amountStroops = toStroops(amountValue);
 
       // Build and simulate the payment through the type-safe client generated
       // from the contract ABI (packages/types).
@@ -360,18 +447,31 @@ function Dashboard({
 
       toast.success("Payment submitted.", { id: toastId });
       displayMessage("Payment submitted successfully.", "#059669", "#D1FAE5");
+      announce("Payment submitted successfully.", 'polite');
+      clearPaymentCoordination();
+      coordinationChannelRef.current?.postMessage({
+        type: 'payment-finished',
+        operationId,
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Payment failed.";
       toast.error(message, { id: toastId });
       displayMessage(message, "#DC2626", "#FEE2E2");
+      announce(message, 'assertive');
+      clearPaymentCoordination();
+      coordinationChannelRef.current?.postMessage({
+        type: 'payment-finished',
+        operationId,
+      });
     } finally {
       setIsProcessing(false);
       setIsSubmitting(false);
+      setIsConfirmOpen(false);
     }
   };
 
   return (
-    <div className="dashboard">
+    <div className="dashboard" data-testid="dashboard-root">
       <MobileNav
         isOpen={isNavOpen}
         onClose={closeNav}
@@ -381,10 +481,14 @@ function Dashboard({
         onHistoryClick={onHistoryClick}
         onHelpClick={onHelpClick}
       />
-      <header className="dashboard-header">
-        <NetworkBadge />
-        <LatencyGauge tracker={latencyTracker} />
-        <div className="wallet-menu" ref={menuRef}>
+      <header className="dashboard-header" data-testid="dashboard-header">
+        <div data-testid="dashboard-network-badge">
+          <NetworkBadge />
+        </div>
+        <div data-testid="dashboard-latency-gauge" data-visual-mask="dynamic">
+          <LatencyGauge tracker={latencyTracker} />
+        </div>
+        <div className="wallet-menu" ref={menuRef} data-testid="dashboard-wallet-menu">
           <button
             type="button"
             className="wallet-menu-trigger"
@@ -408,7 +512,19 @@ function Dashboard({
         </div>
       </header>
 
-      <section className="balance-panel">
+      {!isOnline && (
+        <p
+          className="offline-notice"
+          role="status"
+          aria-live="polite"
+          data-testid="dashboard-offline-notice"
+        >
+          You are offline. Showing cached data; payments and balance refresh are
+          disabled until your connection returns.
+        </p>
+      )}
+
+      <section className="balance-panel" data-testid="dashboard-balance-card">
         <div className="balance-header">
           <span className="balance-label">Balance</span>
           <button
@@ -418,20 +534,23 @@ function Dashboard({
             {showBalance ? "Hide" : "Show"}
           </button>
         </div>
-        <div className="balance-value">
+        <div className="balance-value" data-testid="dashboard-balance-value">
           {showBalance ? formattedBalance : "••••••"}
         </div>
         {balanceError && <p className="balance-error">{balanceError}</p>}
         <button
           type="button"
           onClick={onRefreshBalance}
-          disabled={isRefreshing}
+          disabled={isRefreshing || !isOnline}
+          aria-disabled={isRefreshing || !isOnline}
+          title={!isOnline ? "Balance refresh is unavailable while offline." : undefined}
+          data-testid="dashboard-refresh-balance"
         >
           {isRefreshing ? "Refreshing..." : "Refresh"}
         </button>
       </section>
 
-      <section className="payment-form">
+      <section className="payment-form" data-testid="dashboard-payment-form">
         <label htmlFor="recipient">Recipient</label>
         <input
           id="recipient"
@@ -460,15 +579,42 @@ function Dashboard({
           onChange={(event) => setAmount(event.target.value)}
           placeholder="0.00"
           inputMode="decimal"
+          aria-describedby="amount-hint"
+          aria-invalid={amount.trim().length > 0 && !hasValidAmount}
         />
+        <p id="amount-hint" className="field-hint">
+          Enter an amount with up to 7 decimal places.
+        </p>
 
         <button
           type="button"
           onClick={handleLookup}
           disabled={!canSubmitPayment}
+          aria-disabled={!canSubmitPayment}
+          aria-describedby={!isOnline ? "dashboard-offline-notice" : undefined}
+          title={!isOnline ? "Payments are disabled while offline." : undefined}
+          data-testid="dashboard-submit-payment"
         >
           {isProcessing ? "Processing..." : "Send Payment"}
         </button>
+
+        <Dialog
+          isOpen={isConfirmOpen}
+          onClose={() => setIsConfirmOpen(false)}
+          title="Confirm payment"
+          description="Review the details below before submitting."
+          confirmLabel="Confirm and send"
+          cancelLabel="Cancel"
+          onConfirm={handleConfirmPayment}
+          isBusy={isProcessing}
+        >
+          <dl className="confirm-details">
+            <dt>Recipient</dt>
+            <dd>{nameTag.trim()}</dd>
+            <dt>Amount</dt>
+            <dd>{formatAmount(amount) ?? amount}</dd>
+          </dl>
+        </Dialog>
 
         {status.text && (
           <p
@@ -480,7 +626,7 @@ function Dashboard({
         )}
       </section>
 
-      <section className="receive-panel">
+      <section className="receive-panel" data-testid="dashboard-receive-panel">
         <h2>Receive</h2>
         {isReceiving ? (
           <p>Loading...</p>

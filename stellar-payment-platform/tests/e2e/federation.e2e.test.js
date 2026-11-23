@@ -109,4 +109,51 @@ describe('E2E: Federation Flow', () => {
 
     expect(res.status).toBe(404);
   });
+
+  it('should serve federation reads publicly without authentication', async () => {
+    const validUser = {
+      username: `${TEST_USER}public*localhost`,
+      address: 'GPUBLIC123XYZ456789FEDERATION',
+    };
+    mockDb.set(validUser.address, validUser);
+
+    // No Authorization header / session cookie is supplied: federation reads
+    // must remain public even after ownership enforcement is introduced.
+    const byName = await request(app)
+      .get(`/api/v1/federation?q=${encodeURIComponent(validUser.username)}&type=name`);
+
+    expect(byName.status).toBe(200);
+    expect(byName.body.account_id).toBe(validUser.address);
+
+    const byId = await request(app)
+      .get(`/api/v1/federation?q=${validUser.address}&type=id`);
+
+    expect(byId.status).toBe(200);
+    expect(byId.body.stellar_address).toBe(validUser.username);
+  });
+
+  it('should not grant access based on caller-supplied usernames or addresses', async () => {
+    const ownedUser = {
+      username: `${TEST_USER}owner*localhost`,
+      address: 'GOWNER123XYZ456789FEDERATION',
+    };
+    mockDb.set(ownedUser.address, ownedUser);
+
+    // A caller-supplied username/address in the query must not be treated as
+    // an authenticated principal. Federation lookups only resolve public
+    // records and never expose ownership-scoped data.
+    const res = await request(app)
+      .get(`/api/v1/federation?q=${encodeURIComponent(ownedUser.username)}&type=name`)
+      .set('X-User-Username', ownedUser.username)
+      .set('X-User-Address', ownedUser.address);
+
+    expect(res.status).toBe(200);
+    expect(res.body.account_id).toBe(ownedUser.address);
+    // Response must only contain public federation fields.
+    expect(Object.keys(res.body).sort()).toEqual(
+      expect.arrayContaining(['account_id', 'memo_type', 'memo'])
+    );
+    expect(res.body).not.toHaveProperty('owner');
+    expect(res.body).not.toHaveProperty('userId');
+  });
 });

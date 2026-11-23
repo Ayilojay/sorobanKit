@@ -297,6 +297,88 @@ describe('GET /federation — SEP-0002 compliance', () => {
     );
   });
 
+  describe('public access under ownership enforcement (#383)', () => {
+    test('a name lookup succeeds without any authentication headers', async () => {
+      prisma.user.findFirst.mockResolvedValue({
+        address: ACCOUNT_ID,
+        memoType: null,
+        memo: null,
+        flaggedAt: null,
+      });
+
+      const res = await request(app)
+        .get('/federation')
+        .query({ q: 'public*localhost', type: 'name' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.account_id).toBe(ACCOUNT_ID);
+    });
+
+    test('an id lookup succeeds without any authentication headers', async () => {
+      prisma.user.findFirst.mockResolvedValue({
+        username: 'public',
+        address: ACCOUNT_ID,
+        memoType: null,
+        memo: null,
+        flaggedAt: null,
+      });
+
+      const res = await request(app).get('/federation').query({ q: ACCOUNT_ID, type: 'id' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.account_id).toBe(ACCOUNT_ID);
+    });
+
+    test('caller-supplied identity headers do not change the lookup result', async () => {
+      prisma.user.findFirst.mockResolvedValue({
+        address: ACCOUNT_ID,
+        memoType: null,
+        memo: null,
+        flaggedAt: null,
+      });
+
+      const res = await request(app)
+        .get('/federation')
+        .query({ q: 'spoofed*localhost', type: 'name' })
+        .set('X-User-Address', 'GSPOOFEDADDRESS0000000000000000000000000000000000000000')
+        .set('X-Username', 'someone-else')
+        .set('Authorization', 'Bearer not-a-real-token');
+
+      expect(res.status).toBe(200);
+      expect(res.body.account_id).toBe(ACCOUNT_ID);
+      // The lookup is driven solely by `q`, never by caller-supplied identity.
+      expect(prisma.user.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ username: 'spoofed*localhost' }),
+        }),
+      );
+    });
+
+    test('a forged Authorization header cannot unlock a missing record', async () => {
+      prisma.user.findFirst.mockResolvedValue(null);
+
+      const res = await request(app)
+        .get('/federation')
+        .query({ q: 'ghost*localhost', type: 'name' })
+        .set('Authorization', 'Bearer forged-token');
+
+      expect(res.status).toBe(404);
+      expect(res.body.success).toBe(false);
+    });
+
+    test('the built-in registry fallback stays publicly readable', async () => {
+      prisma.user.findFirst.mockResolvedValue(null);
+
+      const res = await request(app)
+        .get('/federation')
+        .query({ q: 'client*localhost', type: 'name' })
+        .set('Authorization', 'Bearer forged-token');
+
+      expect(res.status).toBe(200);
+      expect(res.body.account_id).toBe('GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ');
+    });
+  });
+
   describe('response headers', () => {
     test('serves successful lookups as application/json', async () => {
       prisma.user.findFirst.mockResolvedValue({

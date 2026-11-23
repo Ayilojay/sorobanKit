@@ -250,4 +250,78 @@ describe('#613 username aliases', () => {
       expect(arg.orderBy).toEqual([{ isPrimary: 'desc' }, { createdAt: 'asc' }]);
     });
   });
+
+  describe('#386 active-primary invariant', () => {
+    test('reverse federation lookup filters on isPrimary: true', async () => {
+      prisma.user.findFirst.mockResolvedValue({
+        username: 'payments',
+        address: ADDRESS,
+        memoType: null,
+        memo: null,
+        flaggedAt: null,
+      });
+
+      await request(app).get('/federation').query({ q: ADDRESS, type: 'id' });
+
+      const arg = prisma.user.findFirst.mock.calls[0][0];
+      expect(arg.where).toMatchObject({ address: ADDRESS, isPrimary: true, deletedAt: null });
+    });
+
+    test('a soft-deleted primary is excluded from the reverse lookup', async () => {
+      // The primary row is soft-deleted, so the reverse lookup must not see it.
+      prisma.user.findFirst.mockResolvedValue(null);
+
+      const res = await request(app).get('/federation').query({ q: ADDRESS, type: 'id' });
+
+      expect(res.status).toBe(404);
+
+      const arg = prisma.user.findFirst.mock.calls[0][0];
+      expect(arg.where).toMatchObject({ address: ADDRESS, isPrimary: true, deletedAt: null });
+    });
+
+    test('the alias cap still applies after a primary is soft-deleted', async () => {
+      // Four live aliases remain after the primary was soft-deleted; the
+      // soft-deleted primary must not count toward the cap.
+      prisma.user.count.mockResolvedValue(4);
+
+      const res = await request(app)
+        .post('/register')
+        .send({ username: 'billing', address: ADDRESS });
+
+      expect(res.status).toBe(201);
+      expect(res.body).toMatchObject({ ok: true, is_primary: false });
+      expect(prisma.user.count).toHaveBeenCalledWith({
+        where: { address: ADDRESS, deletedAt: null },
+      });
+    });
+
+    test('the cap is still enforced when the live alias count reaches five', async () => {
+      prisma.user.count.mockResolvedValue(5);
+
+      const res = await request(app)
+        .post('/register')
+        .send({ username: 'overflow', address: ADDRESS });
+
+      expect(res.status).toBe(409);
+      expect(res.body.error.code).toBe('CONFLICT');
+      expect(prisma.user.create).not.toHaveBeenCalled();
+    });
+
+    test('a new primary is assigned when no live primary exists for the address', async () => {
+      // No live rows at all (primary was soft-deleted and no aliases remain).
+      prisma.user.count.mockResolvedValue(0);
+
+      const res = await request(app)
+        .post('/register')
+        .send({ username: 'payments', address: ADDRESS });
+
+      expect(res.status).toBe(201);
+      expect(res.body).toMatchObject({ ok: true, is_primary: true });
+      expect(prisma.user.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ username: 'payments*localhost', isPrimary: true }),
+        }),
+      );
+    });
+  });
 });

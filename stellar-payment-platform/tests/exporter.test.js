@@ -8,8 +8,17 @@
  */
 
 const { EventEmitter } = require('events');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 const exporter = require('../src/utils/exporter');
+const {
+  toUnits,
+  fromUnits,
+  formatUnits,
+  STROOP_SCALE,
+} = require('../src/utils/money');
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -64,6 +73,27 @@ const makeLogger = () => ({
 const makePrisma = (findManyImpl) => ({
   payment: { findMany: jest.fn(findManyImpl) },
 });
+
+/**
+ * A minimal writable sink that records every chunk and applies the same
+ * backpressure contract as a real stream (write() -> boolean, 'drain' event).
+ */
+const makeSink = ({ backpressure = false } = {}) => {
+  const sink = new EventEmitter();
+  sink.chunks = [];
+  sink.write = jest.fn((chunk) => {
+    sink.chunks.push(String(chunk));
+    if (backpressure) {
+      backpressure = false;
+      setImmediate(() => sink.emit('drain'));
+      return false;
+    }
+    return true;
+  });
+  sink.end = jest.fn();
+  sink.text = () => sink.chunks.join('');
+  return sink;
+};
 
 const writtenText = (res) =>
   res.write.mock.calls.map(([chunk]) => String(chunk)).join('');
@@ -209,6 +239,161 @@ describe('streamAdminExport CSV', () => {
   });
 });
 
+// ── streamExportToSink (generic sink) ────────────────────────────────────────
+
+describe('streamExportToSink', () => {
+  it('streams CSV rows into an arbitrary writable sink', async () => {
+    const sink = makeSink();
+    const logger = makeLogger();
+    const prisma = makePrisma(async () => [makeRecord(1), makeRecord(2)]);
+
+    const result = await exporter.streamExportToSink({
+      sink,
+      prisma,
+      format: 'csv',
+      logger,
+      correlationId: 'sink-1',
+    });
+
+    expect(sink.text()).toMatch(/txn-1/);
+    expect(sink.text()).toMatch(/txn-2/);
+    expect(result.rows).toBe(2);
+    expect(result.truncated).toBe(false);
+  });
+
+  it('streams NDJSON rows into an arbitrary writable sink', async () => {
+    const sink = makeSink();
+    const logger = makeLogger();
+    const prisma = makePrisma(async () => [makeRecord(1), makeRecord(2)]);
+
+    const result = await exporter.streamExportToSink({
+      sink,
+      prisma,
+      format: 'json',
+      logger,
+      correlationId: 'sink-2',
+    });
+
+    const lines = sink.text().trim().split('\n').filter(Boolean);
+    expect(lines.length).toBe(2);
+    expect(JSON.parse(lines[0]).id).toBe('txn-1');
+    expect(result.rows).toBe(2);
+  });
+
+  it('writes to a real file stream on disk', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'exporter-test-'));
+    const filePath = path.join(dir, 'export.csv');
+    const fileStream = fs.createWriteStream(filePath);
+    const logger = makeLogger();
+    const prisma = makePrisma(async () => [makeRecord(1), makeRecord(2), makeRecord(3)]);
+
+    try {
+      const result = await exporter.streamExportToSink({
+        sink: fileStream,
+        prisma,
+        format: 'csv',
+        logger,
+        correlationId: 'sink-file',
+      });
+      await new Promise((resolve, reject) => {
+        fileStream.on('finish', resolve);
+        fileStream.on('error', reject);
+      });
+
+      const contents = fs.readFileSync(filePath, 'utf8');
+      expect(contents).toMatch(/txn-1/);
+      expect(contents).toMatch(/txn-3/);
+      expect(result.rows).toBe(3);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('invokes the progress callback after each page', async () => {
+    const sink = makeSink();
+    const logger = makeLogger();
+    const onProgress = jest.fn();
+    const prisma = makePrisma(async () => [makeRecord(1), makeRecord(2)]);
+
+    await exporter.streamExportToSink({
+      sink,
+      prisma,
+      format: 'csv',
+      logger,
+      correlationId: 'sink-progress',
+      onProgress,
+    });
+
+    expect(onProgress).toHaveBeenCalled();
+    const lastCall = onProgress.mock.calls[onProgress.mock.calls.length - 1][0];
+    expect(lastCall).toEqual(expect.objectContaining({ rows: 2 }));
+  });
+
+  it('stops mid-export when the cancellation predicate returns true', async () => {
+    const sink = makeSink();
+    const logger = makeLogger();
+    const fullPage = Array.from({ length: exporter.PAGE_SIZE }, (_, i) => makeRecord(i));
+    const prisma = makePrisma(async () => fullPage);
+    let calls = 0;
+    const isCancelled = jest.fn(() => {
+      calls += 1;
+      return calls > 1;
+    });
+
+    const result = await exporter.streamExportToSink({
+      sink,
+      prisma,
+      format: 'csv',
+      logger,
+      correlationId: 'sink-cancel',
+      isCancelled,
+    });
+
+    expect(result.cancelled).toBe(true);
+    // Only the first page was fetched before cancellation was observed.
+    expect(prisma.payment.findMany).toHaveBeenCalledTimes(1);
+  });
+
+  it('flushes each page incrementally instead of buffering the whole export', async () => {
+    const sink = makeSink();
+    const logger = makeLogger();
+    const fullPage = Array.from({ length: exporter.PAGE_SIZE }, (_, i) => makeRecord(i));
+    const prisma = makePrisma(async () => fullPage);
+    process.env.EXPORT_MAX_PAGES = '3';
+    try {
+      await exporter.streamExportToSink({
+        sink,
+        prisma,
+        format: 'csv',
+        logger,
+        correlationId: 'sink-bounded',
+      });
+
+      // One write per page (plus header) — never a single giant buffered write.
+      expect(sink.write.mock.calls.length).toBeGreaterThan(1);
+      expect(sink.write.mock.calls.length).toBeLessThanOrEqual(4);
+    } finally {
+      delete process.env.EXPORT_MAX_PAGES;
+    }
+  });
+
+  it('waits for drain when the sink applies backpressure', async () => {
+    const sink = makeSink({ backpressure: true });
+    const logger = makeLogger();
+    const prisma = makePrisma(async () => [makeRecord(1), makeRecord(2)]);
+
+    await exporter.streamExportToSink({
+      sink,
+      prisma,
+      format: 'csv',
+      logger,
+      correlationId: 'sink-backpressure',
+    });
+
+    expect(sink.text()).toMatch(/txn-2/);
+  });
+});
+
 // ── streamAdminExport (JSON) ─────────────────────────────────────────────────
 
 describe('streamAdminExport JSON', () => {
@@ -251,5 +436,135 @@ describe('streamAdminExport JSON', () => {
 
     expect(writtenText(res).trim()).toBe('');
     expect(res.end).toHaveBeenCalled();
+  });
+});
+
+// ── exact money units (issue #384) ───────────────────────────────────────────
+
+describe('money units round-trip', () => {
+  it('round-trips representable values at 7-decimal precision', () => {
+    const samples = ['0', '0.0000001', '1', '1.2345678', '100', '99999999.9999999'];
+    for (const value of samples) {
+      const units = toUnits(value);
+      expect(typeof units).toBe('bigint');
+      expect(fromUnits(units)).toBe(value);
+    }
+  });
+
+  it('round-trips integer units back to decimal strings', () => {
+    expect(fromUnits(1n)).toBe('0.0000001');
+    expect(fromUnits(10_000_000n)).toBe('1');
+    expect(fromUnits(12_345_678n)).toBe('1.2345678');
+    expect(fromUnits(0n)).toBe('0');
+  });
+
+  it('exposes the stroop scale', () => {
+    expect(STROOP_SCALE).toBe(10_000_000n);
+  });
+
+  it('formats units as fixed-precision decimal strings', () => {
+    expect(formatUnits(12_345_678n)).toBe('1.2345678');
+    expect(formatUnits(10_000_000n)).toBe('1.0000000');
+    expect(formatUnits(0n)).toBe('0.0000000');
+  });
+
+  it('rejects values with more than 7 decimal places', () => {
+    expect(() => toUnits('0.00000001')).toThrow();
+    expect(() => toUnits('1.12345678')).toThrow();
+  });
+
+  it('rejects non-numeric input', () => {
+    expect(() => toUnits('abc')).toThrow();
+    expect(() => toUnits(null)).toThrow();
+    expect(() => toUnits(undefined)).toThrow();
+  });
+});
+
+describe('money units half-up rounding boundaries', () => {
+  it('rounds a half unit up', () => {
+    expect(toUnits('0.00000005')).toBe(1n);
+  });
+
+  it('rounds below a half unit down', () => {
+    expect(toUnits('0.00000004')).toBe(0n);
+  });
+
+  it('rounds negative halves away from zero (half-up)', () => {
+    expect(toUnits('-0.00000005')).toBe(-1n);
+    expect(toUnits('-0.00000004')).toBe(0n);
+  });
+
+  it('rounds larger fractional values correctly', () => {
+    expect(toUnits('1.00000005')).toBe(10_000_001n);
+    expect(toUnits('1.00000004')).toBe(10_000_000n);
+  });
+});
+
+describe('exporter emits decimal strings for exact money', () => {
+  const makeUnitRecord = (i) => ({
+    id: `txn-${i}`,
+    createdAt: new Date('2026-01-15T12:00:00Z'),
+    fromAddress: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+    toAddress: 'GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB',
+    amountUnits: 12_345_678n,
+    feeUnits: 100n,
+    assetCode: 'XLM',
+    transactionHash: `hash-${i}`,
+    status: 'completed',
+  });
+
+  it('CSV export renders amount and fee as decimal strings', async () => {
+    const res = makeRes();
+    const logger = makeLogger();
+    const prisma = makePrisma(async () => [makeUnitRecord(1)]);
+
+    await exporter.streamAdminExport({
+      res,
+      prisma,
+      format: 'csv',
+      logger,
+      correlationId: 'corr-money-1',
+    });
+
+    const text = writtenText(res);
+    expect(text).toMatch(/1\.2345678/);
+    expect(text).toMatch(/0\.0000100/);
+  });
+
+  it('JSON export renders amount and fee as decimal strings', async () => {
+    const res = makeRes();
+    const logger = makeLogger();
+    const prisma = makePrisma(async () => [makeUnitRecord(1)]);
+
+    await exporter.streamAdminExport({
+      res,
+      prisma,
+      format: 'json',
+      logger,
+      correlationId: 'corr-money-2',
+    });
+
+    const line = JSON.parse(writtenText(res).trim().split('\n')[0]);
+    expect(line.amount).toBe('1.2345678');
+    expect(line.fee).toBe('0.0000100');
+  });
+
+  it('matches the previous Float output for representable values', async () => {
+    const res = makeRes();
+    const logger = makeLogger();
+    const prisma = makePrisma(async () => [makeUnitRecord(1)]);
+
+    await exporter.streamAdminExport({
+      res,
+      prisma,
+      format: 'json',
+      logger,
+      correlationId: 'corr-money-3',
+    });
+
+    const line = JSON.parse(writtenText(res).trim().split('\n')[0]);
+    // Previous Float serialization of the same value.
+    expect(Number(line.amount)).toBe(1.2345678);
+    expect(Number(line.fee)).toBe(0.00001);
   });
 });

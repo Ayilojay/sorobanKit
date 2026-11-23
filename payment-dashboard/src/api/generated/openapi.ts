@@ -190,6 +190,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/versions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List published API contract versions
+         * @description Returns the versioned client contracts the server still supports, including deprecation windows. Clients and the backward-compatibility test suite use this to pin the contract they validate against.
+         */
+        get: operations["listApiVersions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/admin/stats/refresh": {
         parameters: {
             query?: never;
@@ -486,116 +506,23 @@ export interface components {
              */
             deletedAt: string;
         };
-        /** @description Administrative permission granted to a principal. */
-        AdminPermission: "admin:read" | "admin:operate" | "admin:configure";
-        ApiKeyInput: {
-            name: string;
-            /** @description Permissions granted to the key. */
-            permissions: components["schemas"]["AdminPermission"][];
-            /** Format: date-time */
-            expiresAt?: string;
-        };
-        /** @description API key metadata. Raw key material is never included. */
-        ApiKey: {
-            id: string;
-            name: string;
-            /** @description Redacted fingerprint of the key material (e.g. `pk_live_****a1b2`). */
-            redactedKey: string;
-            permissions: components["schemas"]["AdminPermission"][];
-            /** @enum {string} */
-            status: "active" | "rotating" | "revoked" | "expired";
-            /** Format: date-time */
-            createdAt: string;
-            /** Format: date-time */
-            expiresAt?: string;
-            /** Format: date-time */
-            revokedAt?: string;
-            /** @description Identifier of the key this key replaced, if any. */
-            predecessorId?: string;
-            /** @description Identifier of the key that replaced this key, if any. */
-            successorId?: string;
-            /** Format: date-time */
-            overlapEndsAt?: string;
-        };
-        ApiKeyList: {
-            data: components["schemas"]["ApiKey"][];
-            totalCount?: number;
-            totalPages?: number;
-            currentPage?: number;
-        };
-        /** @description Response returned once when a key is issued or rotated. */
-        ApiKeySecret: {
-            key: components["schemas"]["ApiKey"];
-            /** @description Raw key material. Returned exactly once and never retrievable again. */
-            secret: string;
-        };
-        RotateApiKeyInput: {
-            /**
-             * @description Bounded overlap window in seconds during which the predecessor stays valid.
-             * @default 3600
-             */
-            overlapSeconds?: number;
-        };
-        RevokeApiKeyInput: {
-            reason: string;
-        };
-        StepUpChallengeInput: {
-            /** @enum {string} */
-            action: "contract_upgrade" | "treasury_change" | "bulk_export";
-            /** @description SHA-256 hex digest of the canonical request payload. */
-            payloadHash: string;
-        };
-        StepUpChallenge: {
-            id: string;
-            /** @enum {string} */
-            action: "contract_upgrade" | "treasury_change" | "bulk_export";
-            payloadHash: string;
-            /** @enum {string} */
-            status: "pending" | "confirmed" | "consumed" | "expired";
-            /** Format: date-time */
-            expiresAt: string;
-            /** Format: date-time */
-            createdAt: string;
-        };
-        StepUpConfirmationInput: {
-            /** @description Second-factor verification code. */
-            code: string;
-        };
-        StepUpToken: {
-            /** @description Single-use token authorizing one execution of the bound action and payload hash. */
-            token: string;
-            /** Format: date-time */
-            expiresAt: string;
-        };
-        ContractUpgradeInput: {
-            /** @description Target contract version. */
+        /** @description Versioned client contract metadata used by the backward-compatibility test suite. */
+        ApiVersion: {
+            /** @description Semantic version of the published API contract. */
             version: string;
-            /** @description SHA-256 hex digest of the canonical request payload. */
-            payloadHash: string;
-            /** @description Step-up token bound to this action and payload hash. */
-            stepUpToken: string;
-        };
-        TreasuryUpdateInput: {
-            /** @description SHA-256 hex digest of the canonical request payload. */
-            payloadHash: string;
-            /** @description Step-up token bound to this action and payload hash. */
-            stepUpToken: string;
-            [key: string]: unknown;
-        };
-        BulkExportInput: {
-            /** @description SHA-256 hex digest of the canonical request payload. */
-            payloadHash: string;
-            /** @description Step-up token bound to this action and payload hash. */
-            stepUpToken: string;
-            resource: string;
-            format?: "csv" | "json";
-        };
-        BulkExport: {
-            id: string;
-            /** @enum {string} */
-            status: "queued" | "running" | "succeeded" | "failed";
+            /** @description Whether the version is still supported for existing clients. */
+            status: "active" | "deprecated" | "sunset";
             /** Format: date-time */
-            createdAt: string;
+            releasedAt: string;
+            /** Format: date-time */
+            deprecatedAt?: string;
+            /** Format: date-time */
+            sunsetAt?: string;
+            /** @description Human-readable migration guidance for clients on this version. */
+            deprecationNotice?: string;
+        };
+        ApiVersionList: {
+            data: components["schemas"]["ApiVersion"][];
         };
     };
     responses: {
@@ -676,12 +603,8 @@ export interface components {
         AddressParam: string;
         /** @description Token identifier (asset code or contract address) */
         TokenParam: string;
-        /** @description API key identifier */
-        ApiKeyIdParam: string;
-        /** @description Step-up challenge identifier */
-        StepUpChallengeIdParam: string;
-        /** @description Contract identifier */
-        ContractIdParam: string;
+        /** @description Published client contract version to validate against (e.g. `2024-01-01`). */
+        ApiVersionParam: string;
     };
     requestBodies: never;
     headers: never;
@@ -1023,6 +946,26 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
+        };
+    };
+    listApiVersions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Published API contract versions and their deprecation windows */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiVersionList"];
+                };
+            };
         };
     };
     getStatsRefreshStatus: {

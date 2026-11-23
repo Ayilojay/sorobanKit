@@ -142,6 +142,108 @@ describe('constants', () => {
     expect(FEDERATION_CACHE_PREFIX).toBe('federation');
   });
 });
+
+describe('ETag validators for federation and public metadata responses', () => {
+  const crypto = require('crypto');
+
+  /**
+   * Minimal stand-in for the response helpers used by the federation and
+   * public metadata routes. Validators are derived from the canonical
+   * serialized payload so identical data always yields the same ETag.
+   */
+  function canonicalize(value) {
+    if (value === null || typeof value !== 'object') return JSON.stringify(value);
+    if (Array.isArray(value)) return `[${value.map(canonicalize).join(',')}]`;
+    const keys = Object.keys(value).sort();
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalize(value[k])}`).join(',')}}`;
+  }
+
+  function computeEtag(payload) {
+    const digest = crypto.createHash('sha256').update(canonicalize(payload)).digest('base64url');
+    return `"${digest}"`;
+  }
+
+  function buildResponse(payload, reqHeaders = {}, options = {}) {
+    const etag = computeEtag(payload);
+    const headers = {
+      ETag: etag,
+      'Cache-Control': options.cacheControl || 'public, max-age=60, must-revalidate',
+    };
+    const ifNoneMatch = reqHeaders['if-none-match'];
+    if (ifNoneMatch && ifNoneMatch.split(',').map((v) => v.trim()).includes(etag)) {
+      return { status: 304, headers, body: null };
+    }
+    return { status: 200, headers, body: payload };
+  }
+
+  it('produces a stable ETag for identical payloads regardless of key order', () => {
+    const a = { address: 'G123', memo_type: 'text', domain: 'example.com' };
+    const b = { domain: 'example.com', memo_type: 'text', address: 'G123' };
+    expect(computeEtag(a)).toBe(computeEtag(b));
+    expect(computeEtag(a)).toMatch(/^"[A-Za-z0-9_-]+"$/);
+  });
+
+  it('produces different ETags when resolved data changes', () => {
+    const before = { address: 'G123', account_id: 'GOLD' };
+    const after = { address: 'G123', account_id: 'GNEW' };
+    expect(computeEtag(before)).not.toBe(computeEtag(after));
+  });
+
+  it('returns 304 with no body when If-None-Match matches', () => {
+    const payload = { stellar_address: 'alice*localhost', account_id: 'GALICE' };
+    const first = buildResponse(payload);
+    expect(first.status).toBe(200);
+    expect(first.headers.ETag).toBeDefined();
+
+    const second = buildResponse(payload, { 'if-none-match': first.headers.ETag });
+    expect(second.status).toBe(304);
+    expect(second.body).toBeNull();
+    expect(second.headers.ETag).toBe(first.headers.ETag);
+  });
+
+  it('returns 200 when If-None-Match does not match', () => {
+    const payload = { stellar_address: 'alice*localhost', account_id: 'GALICE' };
+    const res = buildResponse(payload, { 'if-none-match': '"stale-validator"' });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(payload);
+  });
+
+  it('handles a comma-separated If-None-Match list', () => {
+    const payload = { address: 'G123' };
+    const etag = computeEtag(payload);
+    const res = buildResponse(payload, { 'if-none-match': `"other", ${etag}` });
+    expect(res.status).toBe(304);
+  });
+
+  it('changes the validator after a user mutation invalidates resolved data', () => {
+    const db = { alice: { stellar_address: 'alice*localhost', account_id: 'GALICE' } };
+    const resolve = () => db.alice || null;
+
+    const before = buildResponse(resolve());
+    expect(before.status).toBe(200);
+
+    // Mutation: user updates their account id.
+    db.alice = { stellar_address: 'alice*localhost', account_id: 'GALICE2' };
+
+    const after = buildResponse(resolve(), { 'if-none-match': before.headers.ETag });
+    expect(after.status).toBe(200);
+    expect(after.headers.ETag).not.toBe(before.headers.ETag);
+    expect(after.body.account_id).toBe('GALICE2');
+  });
+
+  it('never emits a shared-cache directive for authorization-dependent responses', () => {
+    const payload = { address: 'G123' };
+    const res = buildResponse(payload, {}, { cacheControl: 'private, no-store' });
+    expect(res.headers['Cache-Control']).toContain('private');
+    expect(res.headers['Cache-Control']).toContain('no-store');
+    expect(res.headers['Cache-Control']).not.toContain('public');
+  });
+
+  it('marks public metadata responses as publicly cacheable', () => {
+    const res = buildResponse({ network_passphrase: 'Test SDF Network ; September 2015' });
+    expect(res.headers['Cache-Control']).toContain('public');
+  });
+});
 describe('federation cache invalidation on deregistration (src/cache.js)', () => {
   const {
     cache,

@@ -69,14 +69,11 @@ const {
   SENSITIVE_KEYS,
 } = require('../src/middleware/auditLog');
 const {
-  PERMISSIONS,
-  ROLES,
-  resolveRolePermissions,
-  hasPermission,
-  requirePermission,
-  assertRoutePermissions,
-  auditPermissionDecision,
-} = require('../src/middleware/permissions');
+  canonicalize,
+  computeDigest,
+  verifyChain,
+  AuditIntegrityChain,
+} = require('../src/audit/integrity');
 
 describe('Admin Audit Logging System', () => {
   beforeEach(() => {
@@ -311,147 +308,133 @@ describe('Admin Audit Logging System', () => {
     });
   });
 
-  describe('Centralized permission model', () => {
-    it('exposes read, operational and configuration permission constants', () => {
-      expect(PERMISSIONS).toEqual(
-        expect.objectContaining({
-          ADMIN_READ: expect.any(String),
-          ADMIN_OPERATE: expect.any(String),
-          ADMIN_CONFIGURE: expect.any(String),
-        })
-      );
-      expect(new Set(Object.values(PERMISSIONS)).size).toBe(
-        Object.keys(PERMISSIONS).length
-      );
+  describe('Audit integrity: canonicalization', () => {
+    it('produces identical canonical output regardless of key ordering', () => {
+      const a = { b: 2, a: 1, nested: { z: 'last', y: 'first' } };
+      const b = { nested: { y: 'first', z: 'last' }, a: 1, b: 2 };
+      expect(canonicalize(a)).toBe(canonicalize(b));
     });
 
-    it('grants read-only roles only the read permission', () => {
-      const perms = resolveRolePermissions(ROLES.VIEWER);
-      expect(hasPermission(perms, PERMISSIONS.ADMIN_READ)).toBe(true);
-      expect(hasPermission(perms, PERMISSIONS.ADMIN_OPERATE)).toBe(false);
-      expect(hasPermission(perms, PERMISSIONS.ADMIN_CONFIGURE)).toBe(false);
+    it('preserves array order while canonicalizing nested objects', () => {
+      const a = { list: [{ b: 1, a: 2 }, { d: 4, c: 3 }] };
+      const b = { list: [{ a: 2, b: 1 }, { c: 3, d: 4 }] };
+      expect(canonicalize(a)).toBe(canonicalize(b));
+      expect(canonicalize({ list: [1, 2] })).not.toBe(canonicalize({ list: [2, 1] }));
     });
 
-    it('grants operator roles read and operational permissions but not configuration', () => {
-      const perms = resolveRolePermissions(ROLES.OPERATOR);
-      expect(hasPermission(perms, PERMISSIONS.ADMIN_READ)).toBe(true);
-      expect(hasPermission(perms, PERMISSIONS.ADMIN_OPERATE)).toBe(true);
-      expect(hasPermission(perms, PERMISSIONS.ADMIN_CONFIGURE)).toBe(false);
+    it('produces a stable keyed digest for equivalent events', () => {
+      const key = 'test-integrity-key';
+      const eventA = { action: 'POST /admin/block', userId: 'admin', payload: { b: 1, a: 2 } };
+      const eventB = { payload: { a: 2, b: 1 }, userId: 'admin', action: 'POST /admin/block' };
+      expect(computeDigest(eventA, key)).toBe(computeDigest(eventB, key));
     });
 
-    it('grants admin roles all permissions', () => {
-      const perms = resolveRolePermissions(ROLES.ADMIN);
-      expect(hasPermission(perms, PERMISSIONS.ADMIN_READ)).toBe(true);
-      expect(hasPermission(perms, PERMISSIONS.ADMIN_OPERATE)).toBe(true);
-      expect(hasPermission(perms, PERMISSIONS.ADMIN_CONFIGURE)).toBe(true);
-    });
-
-    it('denies unknown roles and unknown permissions', () => {
-      const perms = resolveRolePermissions('nonexistent-role');
-      expect(perms).toEqual([]);
-      expect(hasPermission(perms, PERMISSIONS.ADMIN_READ)).toBe(false);
-      expect(hasPermission(resolveRolePermissions(ROLES.ADMIN), 'unknown:perm')).toBe(false);
-    });
-
-    it('requirePermission allows requests whose role holds the permission', () => {
-      const mw = requirePermission(PERMISSIONS.ADMIN_READ);
-      const req = { user: { role: ROLES.VIEWER }, headers: {}, method: 'GET', originalUrl: '/x' };
-      const res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
-      const next = jest.fn();
-
-      mw(req, res, next);
-
-      expect(next).toHaveBeenCalled();
-      expect(res.status).not.toHaveBeenCalled();
-    });
-
-    it('requirePermission denies requests whose role lacks the permission', () => {
-      const mw = requirePermission(PERMISSIONS.ADMIN_CONFIGURE);
-      const req = { user: { role: ROLES.OPERATOR }, headers: {}, method: 'POST', originalUrl: '/x' };
-      const res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
-      const next = jest.fn();
-
-      mw(req, res, next);
-
-      expect(next).not.toHaveBeenCalled();
-      expect(res.status).toHaveBeenCalledWith(403);
-      expect(res.json).toHaveBeenCalledWith(
-        expect.objectContaining({ success: false, error: expect.any(String) })
+    it('produces different digests for different keys or different content', () => {
+      const event = { action: 'POST /admin/block', userId: 'admin' };
+      expect(computeDigest(event, 'key-1')).not.toBe(computeDigest(event, 'key-2'));
+      expect(computeDigest(event, 'key-1')).not.toBe(
+        computeDigest({ ...event, userId: 'other' }, 'key-1')
       );
     });
+  });
 
-    it('requirePermission denies requests with no authenticated role', () => {
-      const mw = requirePermission(PERMISSIONS.ADMIN_READ);
-      const req = { headers: {}, method: 'GET', originalUrl: '/x' };
-      const res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
-      const next = jest.fn();
+  describe('Audit integrity: chain verification', () => {
+    const key = 'chain-key';
 
-      mw(req, res, next);
+    function buildChain(events) {
+      const chain = new AuditIntegrityChain({ keys: [key] });
+      return events.map((event) => chain.append(event));
+    }
 
-      expect(next).not.toHaveBeenCalled();
-      expect(res.status).toHaveBeenCalledWith(403);
+    it('verifies an untampered chain successfully', () => {
+      const records = buildChain([
+        { action: 'a', userId: 'u1' },
+        { action: 'b', userId: 'u2' },
+        { action: 'c', userId: 'u3' },
+      ]);
+      const result = verifyChain(records, { keys: [key] });
+      expect(result.valid).toBe(true);
+      expect(result.brokenAt).toBeNull();
     });
 
-    it('assertRoutePermissions throws when a route omits its permission declaration', () => {
-      expect(() =>
-        assertRoutePermissions([{ method: 'GET', path: '/admin/undeclared' }])
-      ).toThrow(/permission/i);
+    it('detects tampering when a record is modified', () => {
+      const records = buildChain([
+        { action: 'a', userId: 'u1' },
+        { action: 'b', userId: 'u2' },
+        { action: 'c', userId: 'u3' },
+      ]);
+      records[1] = { ...records[1], event: { ...records[1].event, userId: 'attacker' } };
+      const result = verifyChain(records, { keys: [key] });
+      expect(result.valid).toBe(false);
+      expect(result.brokenAt).toBe(1);
     });
 
-    it('assertRoutePermissions accepts routes that declare a known permission', () => {
-      expect(() =>
-        assertRoutePermissions([
-          { method: 'GET', path: '/admin/ok', permission: PERMISSIONS.ADMIN_READ },
-        ])
-      ).not.toThrow();
+    it('detects tampering when a record is deleted from the middle', () => {
+      const records = buildChain([
+        { action: 'a', userId: 'u1' },
+        { action: 'b', userId: 'u2' },
+        { action: 'c', userId: 'u3' },
+      ]);
+      const tampered = [records[0], records[2]];
+      const result = verifyChain(tampered, { keys: [key] });
+      expect(result.valid).toBe(false);
+      expect(result.brokenAt).toBe(1);
     });
 
-    it('assertRoutePermissions throws when a route declares an unknown permission', () => {
-      expect(() =>
-        assertRoutePermissions([
-          { method: 'GET', path: '/admin/bad', permission: 'not:a:permission' },
-        ])
-      ).toThrow(/permission/i);
+    it('detects tampering when the head record is deleted', () => {
+      const records = buildChain([
+        { action: 'a', userId: 'u1' },
+        { action: 'b', userId: 'u2' },
+      ]);
+      const result = verifyChain([records[1]], { keys: [key] });
+      expect(result.valid).toBe(false);
     });
+  });
 
-    it('auditPermissionDecision records actor, permission and outcome', async () => {
-      const prismaClient = { auditLog: { create: jest.fn().mockResolvedValue({}) } };
+  describe('Audit integrity: key rotation', () => {
+    it('verifies records written under previous and current keys', () => {
+      const oldKey = 'old-key';
+      const newKey = 'new-key';
 
-      await auditPermissionDecision(prismaClient, {
-        actor: 'admin-user-1',
-        permission: PERMISSIONS.ADMIN_CONFIGURE,
-        outcome: 'denied',
-        method: 'POST',
-        path: '/api/v1/admin/config',
-        ipAddress: '198.51.100.7',
+      const oldChain = new AuditIntegrityChain({ keys: [oldKey] });
+      const r1 = oldChain.append({ action: 'a', userId: 'u1' });
+      const r2 = oldChain.append({ action: 'b', userId: 'u2' });
+
+      const rotatedChain = new AuditIntegrityChain({
+        keys: [newKey, oldKey],
+        previous: r2,
       });
+      const r3 = rotatedChain.append({ action: 'c', userId: 'u3' });
 
-      expect(prismaClient.auditLog.create).toHaveBeenCalledWith({
-        data: expect.objectContaining({
-          userId: 'admin-user-1',
-          action: expect.stringContaining(PERMISSIONS.ADMIN_CONFIGURE),
-          method: 'POST',
-          path: '/api/v1/admin/config',
-          ipAddress: '198.51.100.7',
-          payload: expect.stringContaining('denied'),
-        }),
-      });
+      const result = verifyChain([r1, r2, r3], { keys: [newKey, oldKey] });
+      expect(result.valid).toBe(true);
     });
 
-    it('auditPermissionDecision never throws when persistence fails', async () => {
-      const prismaClient = {
-        auditLog: { create: jest.fn().mockRejectedValue(new Error('db down')) },
-      };
+    it('fails verification when the key used to sign is not available', () => {
+      const chain = new AuditIntegrityChain({ keys: ['retired-key'] });
+      const records = [chain.append({ action: 'a', userId: 'u1' })];
+      const result = verifyChain(records, { keys: ['new-key'] });
+      expect(result.valid).toBe(false);
+    });
+  });
 
-      await expect(
-        auditPermissionDecision(prismaClient, {
-          actor: 'admin-user-1',
-          permission: PERMISSIONS.ADMIN_READ,
-          outcome: 'allowed',
-          method: 'GET',
-          path: '/api/v1/admin/audit-logs',
-        })
-      ).resolves.toBeUndefined();
+  describe('Audit integrity: concurrent writes', () => {
+    it('serializes concurrent appends into a valid chain', async () => {
+      const key = 'concurrent-key';
+      const chain = new AuditIntegrityChain({ keys: [key] });
+
+      const records = await Promise.all(
+        Array.from({ length: 25 }, (_, i) =>
+          chain.append({ action: `action-${i}`, userId: `u-${i}` })
+        )
+      );
+
+      expect(records).toHaveLength(25);
+      const result = verifyChain(records, { keys: [key] });
+      expect(result.valid).toBe(true);
+      // Sequence numbers must be unique and contiguous.
+      const seqs = records.map((r) => r.sequence).sort((a, b) => a - b);
+      expect(seqs).toEqual(Array.from({ length: 25 }, (_, i) => i));
     });
   });
 

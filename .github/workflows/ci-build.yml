@@ -6,15 +6,19 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         with:
           node-version: '20'
           cache: 'npm'
@@ -22,7 +26,7 @@ jobs:
       - name: Install dependencies
         run: |
           cd payment-dashboard
-          npm install --legacy-peer-deps
+          npm ci --legacy-peer-deps
 
       - name: Typecheck
         run: |
@@ -33,3 +37,31 @@ jobs:
         run: |
           cd payment-dashboard
           npm run build
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          set -euo pipefail
+          SOURCE_REVISION="${GITHUB_SHA}"
+          ARTIFACT_DIGEST="$(cd payment-dashboard && find dist -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')"
+          if [ -z "${ARTIFACT_DIGEST}" ]; then
+            echo "Failed to compute artifact digest for payment-dashboard dist output" >&2
+            exit 1
+          fi
+          mkdir -p sbom
+          bash scripts/generate-sbom.sh \
+            --ecosystem node \
+            --project payment-dashboard \
+            --source-revision "${SOURCE_REVISION}" \
+            --artifact-digest "${ARTIFACT_DIGEST}" \
+            --output sbom/payment-dashboard.cdx.json
+          if [ ! -s sbom/payment-dashboard.cdx.json ]; then
+            echo "SBOM generation did not produce an output file" >&2
+            exit 1
+          fi
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-payment-dashboard
+          path: sbom/payment-dashboard.cdx.json
+          if-no-files-found: error

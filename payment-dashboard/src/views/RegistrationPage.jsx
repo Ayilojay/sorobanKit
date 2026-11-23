@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { API_BASE, apiErrorMessage, walletKit } from './shared'; // <-- 1. Import walletKit instead of Freighter
 import { getLookup } from '../api/client';
+import { useConnectivity } from '../hooks/useConnectivity';
 
 const USERNAME_REGEX = /^[a-zA-Z0-9]/;
 
@@ -40,6 +41,7 @@ function RegistrationPage({
   });
   const [isConnecting, setIsConnecting] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const { isOffline } = useConnectivity();
 
   const walletLabel = userPublicKey
     ? `Connected: ${userPublicKey.substring(0, 5)}...${userPublicKey.substring(51)}`
@@ -51,6 +53,35 @@ function RegistrationPage({
    */
   const setStatusMessage = (text, tone = "neutral") => {
     setStatus({ text, tone });
+  };
+
+  /**
+   * Announce async success/failure through the shared live region.
+   * @param {string} text
+   * @param {"success" | "error"} tone
+   */
+  const announceStatus = (text, tone) => {
+    setStatusMessage(text, tone);
+    announce(text, { politeness: tone === "error" ? "assertive" : "polite" });
+  };
+
+  /**
+   * Resolve a server error payload into actionable, accessible guidance.
+   * @param {unknown} data
+   * @param {string} [fallback]
+   */
+  const resolveApiError = (data, fallback = "Registration failed.") => {
+    const code =
+      data && typeof data === "object" && "code" in data
+        ? /** @type {{ code?: unknown }} */ (data).code
+        : undefined;
+    const guidance = getApiErrorGuidance(
+      typeof code === "string" ? code : undefined,
+    );
+    if (guidance) {
+      return guidance;
+    }
+    return { message: apiErrorMessage(data, fallback), retryable: false };
   };
 
   useEffect(() => {
@@ -91,33 +122,34 @@ function RegistrationPage({
         }
       });
     } catch {
-      setStatusMessage("Wallet connection cancelled or failed.", "error");
+      announceStatus("Wallet connection cancelled or failed.", "error");
     } finally {
       setIsConnecting(false);
     }
   };
 
   /**
+   * Validates the form and, when valid, opens the confirmation dialog.
    * @param {import('react').FormEvent<HTMLFormElement>} event
    */
-  const handleSubmit = async (event) => {
+  const handleSubmit = (event) => {
     if (isSubmitting) return;
 
     event.preventDefault();
     const cleaned = username.trim();
 
     if (!userPublicKey) {
-      setStatusMessage("Connect a wallet before registering.", "error");
+      announceStatus("Connect a wallet before registering.", "error");
       return;
     }
 
     if (cleaned.length < 3) {
-      setStatusMessage("Username must be at least 3 characters.", "error");
+      announceStatus("Username must be at least 3 characters.", "error");
       return;
     }
 
     if (!USERNAME_REGEX.test(cleaned)) {
-      setStatusMessage(
+      announceStatus(
         "Username may only contain letters, numbers, hyphens, and underscores.",
         "error",
       );
@@ -139,6 +171,17 @@ function RegistrationPage({
     }
     setMemoError("");
 
+    setIsConfirmOpen(true);
+  };
+
+  /**
+   * Performs the actual registration after the user confirms in the dialog.
+   */
+  const handleConfirmRegistration = async () => {
+    if (isSubmitting) return;
+
+    const cleaned = username.trim();
+    setIsConfirmOpen(false);
     setIsSubmitting(true);
     // 3. Removed the hardcoded Freighter text
     setStatusMessage(
@@ -202,13 +245,13 @@ function RegistrationPage({
       const message = err instanceof Error ? err.message : String(err);
       // Check if it's the specific LOBSTR unsupported error
       if (message.includes("signMessage")) {
-        setStatusMessage(
+        announceStatus(
           "LOBSTR does not support registration signatures. Please click 'Back to dashboard' to skip this step, or connect with Freighter.",
           "error"
         );
       } else {
         // Handle all other normal errors
-        setStatusMessage(message || "Signature request cancelled.", "error");
+        announceStatus(message || "Signature request cancelled.", "error");
       }
       setIsSubmitting(false);
       return;
@@ -259,9 +302,8 @@ function RegistrationPage({
               return null;
             }
 
-            throw new Error(
-              apiErrorMessage(data, "Registration failed."),
-            );
+            const guidance = resolveApiError(data, "Registration failed.");
+            throw new Error(guidance.message);
           }
           return data;
         })
@@ -269,7 +311,7 @@ function RegistrationPage({
           if (data === null) {
             return;
           }
-          setStatusMessage("Username reserved and saved.", "success");
+          announceStatus("Username reserved and saved.", "success");
 
           setTimeout(() => {
             if (typeof onRegistered === 'function') {
@@ -279,27 +321,29 @@ function RegistrationPage({
         })
         .catch((error) => {
           const message = error instanceof Error ? error.message : String(error);
-          setStatusMessage(message || "Registration failed.", "error");
+          announceStatus(message || "Registration failed.", "error");
         })
         .finally(() => {
           setIsSubmitting(false);
         });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      setStatusMessage(message || "Registration failed.", "error");
+      announceStatus(message || "Registration failed.", "error");
     } finally {
       setIsSubmitting(false);
     }
   };
 
   return (
-    <div className="registration">
-      <section className="hero-panel">
+    <div className="registration" data-testid="registration-page">
+      <section className="hero-panel" data-testid="registration-hero">
         <div className="brand">
           <div className="brand-mark">S</div>
           <div>
             <p className="brand-eyebrow">Stellar Pay</p>
-            <h1>Claim your on-chain identity.</h1>
+            <h1 ref={headingRef} tabIndex={-1}>
+              Claim your on-chain identity.
+            </h1>
           </div>
         </div>
         <p className="hero-copy">
@@ -316,17 +360,24 @@ function RegistrationPage({
             className="ghost-button"
             onClick={handleConnect}
             disabled={isConnecting}
+            aria-label={
+              userPublicKey
+                ? "Reconnect wallet"
+                : "Connect a Stellar wallet to begin registration"
+            }
+            aria-busy={isConnecting ? "true" : "false"}
           >
             {isConnecting ? "Connecting..." : userPublicKey ? "Reconnect" : "Connect Wallet"}
           </button>
         </div>
       </section>
 
-      <section className="form-panel">
-        <form onSubmit={handleSubmit}>
+      <section className="form-panel" data-testid="registration-form-panel">
+        <form onSubmit={handleSubmit} data-testid="registration-form">
           <label className="field">
             <span>Username</span>
             <input
+              id="registration-username"
               type="text"
               value={username}
               onChange={(event) => {
@@ -335,24 +386,39 @@ function RegistrationPage({
               }}
               placeholder="stellar-fan"
               autoComplete="off"
+              aria-required="true"
+              aria-invalid={usernameError ? "true" : "false"}
+              aria-describedby={usernameError ? "registration-username-error" : undefined}
             />
-            {usernameError && <small className="field-error">{usernameError}</small>}
+            {usernameError && (
+              <small id="registration-username-error" className="field-error" role="alert">
+                {usernameError}
+              </small>
+            )}
           </label>
 
-          <label className="field">
+          <label className="field" htmlFor="registration-address">
             <span>Address</span>
             <input
+              id="registration-address"
               type="text"
               value={userPublicKey || ""}
               readOnly
               placeholder="Connect a wallet"
+              aria-invalid={addressError ? "true" : "false"}
+              aria-describedby={addressError ? "registration-address-error" : undefined}
             />
-            {addressError && <small className="field-error">{addressError}</small>}
+            {addressError && (
+              <small id="registration-address-error" className="field-error" role="alert">
+                {addressError}
+              </small>
+            )}
           </label>
 
-          <label className="field">
+          <label className="field" htmlFor="registration-memo-type">
             <span>Memo type (optional)</span>
             <select
+              id="registration-memo-type"
               value={memoType}
               onChange={(event) => {
                 setMemoType(event.target.value);
@@ -366,9 +432,10 @@ function RegistrationPage({
           </label>
 
           {memoType && (
-            <label className="field">
+            <label className="field" htmlFor="registration-memo-value">
               <span>Memo value</span>
               <input
+                id="registration-memo-value"
                 type="text"
                 value={memo}
                 onChange={(event) => {
@@ -376,29 +443,74 @@ function RegistrationPage({
                   if (memoError) setMemoError("");
                 }}
                 placeholder={memoType === "text" ? "Up to 28 characters" : "Numeric ID"}
+                aria-invalid={memoError ? "true" : "false"}
+                aria-describedby={memoError ? "registration-memo-error" : undefined}
               />
-              {memoError && <small className="field-error">{memoError}</small>}
+              {memoError && (
+                <small id="registration-memo-error" className="field-error" role="alert">
+                  {memoError}
+                </small>
+              )}
             </label>
           )}
 
           <button
+            ref={confirmTriggerRef}
             type="submit"
             className="primary-button"
-            disabled={isSubmitting}
+            disabled={isSubmitting || isOffline}
             aria-busy={isSubmitting ? "true" : "false"}
+            aria-describedby={isOffline ? "registration-offline-note" : undefined}
+            data-testid="registration-submit"
           >
             {isSubmitting ? "Registering..." : "Register username"}
           </button>
 
-          {status.text && (
-            <p className={`status status-${status.tone}`}>{status.text}</p>
+          {isOffline && (
+            <p
+              id="registration-offline-note"
+              className="status status-neutral"
+              role="note"
+              data-testid="registration-offline-note"
+            >
+              You are offline. Registration is read-only until your connection
+              is restored.
+            </p>
           )}
 
-          <button type="button" className="link-button" onClick={onBack}>
+          {status.text && (
+            <p
+              className={`status status-${status.tone}`}
+              role="status"
+              aria-live="polite"
+              data-testid="registration-status"
+            >
+              {status.text}
+            </p>
+          )}
+
+          <button
+            type="button"
+            className="link-button"
+            onClick={onBack}
+            data-testid="registration-back"
+          >
             Back to dashboard
           </button>
         </form>
       </section>
+
+      <Dialog
+        open={isConfirmOpen}
+        title="Confirm registration"
+        description={`Register the username "${username.trim().toLowerCase()}" for this wallet? You will be asked to sign a message in your wallet.`}
+        onClose={() => setIsConfirmOpen(false)}
+        returnFocusRef={confirmTriggerRef}
+        confirmLabel="Confirm and sign"
+        cancelLabel="Cancel"
+        onConfirm={handleConfirmRegistration}
+        isBusy={isSubmitting}
+      />
     </div>
   );
 }

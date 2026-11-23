@@ -6,6 +6,7 @@ import NetworkBadge from '../NetworkBadge';
 // in App.jsx. This file currently renders metrics with plain HTML/CSS only.
 import ScrollToTop from '../ScrollToTop';
 import MobileNav from './MobileNav';
+import Dialog from '../Dialog';
 import {
   ANALYTICS_MAX_PAGES,
   ANALYTICS_PAGE_LIMIT,
@@ -17,13 +18,23 @@ import {
   useNavState,
   useWalletMenu,
 } from './shared';
+import {
+  addDecimalStrings,
+  formatAmount,
+  normalizeDecimalString,
+} from '../utils/amount';
 
 /**
  * @typedef {Object} AnalyticsMetrics
- * @property {number | null} routingVolume
+ * @property {string | null} routingVolume Canonical decimal string (XLM).
  * @property {number | null} avgConfirmation
  * @property {number | null} successRate
  */
+
+/**
+ * Token precision applied only at the UI boundary when rendering XLM amounts.
+ */
+const XLM_DISPLAY_PRECISION = 7;
 
 /**
  * @typedef {Object} AnalyticsPageProps
@@ -61,6 +72,12 @@ function AnalyticsPage({
   /** @type {[string | null, (value: string | null) => void]} */
   const [loadError, setLoadError] = useState(null);
   const [retryCount, setRetryCount] = useState(0);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isOffline, setIsOffline] = useState(
+    typeof navigator !== "undefined" && navigator.onLine === false,
+  );
+  /** @type {[number | null, (value: number | null) => void]} */
+  const [cachedAt, setCachedAt] = useState(null);
   const {
     menuRef,
     isOpen: isWalletMenuOpen,
@@ -86,6 +103,23 @@ function AnalyticsPage({
   };
 
   useEffect(() => {
+    if (typeof window === "undefined") {
+      return undefined;
+    }
+
+    const handleOnline = () => setIsOffline(false);
+    const handleOffline = () => setIsOffline(true);
+
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, []);
+
+  useEffect(() => {
     let isActive = true;
     /** @type {AbortController | null} */
     let currentController = null;
@@ -107,13 +141,14 @@ function AnalyticsPage({
     /**
      * @param {number} sinceMs
      * @param {AbortSignal} signal
-     * @returns {Promise<number | null>}
+     * @returns {Promise<string | null>}
      */
     const loadRoutingVolume = async (sinceMs, signal) => {
       /** @type {string | undefined} */
       let url = `${HORIZON_BASE}/payments?order=desc&limit=${ANALYTICS_PAGE_LIMIT}`;
       let pages = 0;
-      let total = 0;
+      /** @type {string} */
+      let total = "0";
 
       while (url && pages < ANALYTICS_MAX_PAGES) {
         const data = await fetchHorizon(url, signal);
@@ -131,7 +166,10 @@ function AnalyticsPage({
           }
 
           if (record.asset_type === "native" && record.amount) {
-            total += Number(record.amount);
+            const amount = normalizeDecimalString(record.amount);
+            if (amount !== null) {
+              total = addDecimalStrings(total, amount);
+            }
           }
         }
 
@@ -143,7 +181,7 @@ function AnalyticsPage({
         pages += 1;
       }
 
-      return Number.isFinite(total) ? total : null;
+      return total;
     };
 
     /**
@@ -258,6 +296,8 @@ function AnalyticsPage({
       currentController = controller;
       const sinceMs = Date.now() - ANALYTICS_WINDOW_MS;
 
+      setIsLoading(true);
+
       try {
         const [routingVolume, avgConfirmation, successRate] = await Promise.all(
           [
@@ -277,6 +317,7 @@ function AnalyticsPage({
           successRate,
         });
         setLoadError(null);
+        setCachedAt(null);
       } catch (error) {
         if (
           !isActive ||
@@ -290,12 +331,16 @@ function AnalyticsPage({
           avgConfirmation: null,
           successRate: null,
         });
+        setCachedAt(null);
         setLoadError(
           error instanceof Error && error.message
             ? error.message
             : "Failed to load analytics.",
         );
       } finally {
+        if (isActive) {
+          setIsLoading(false);
+        }
         if (currentController === controller) {
           currentController = null;
         }
@@ -326,7 +371,8 @@ function AnalyticsPage({
   const routingVolumeValue =
     analyticsMetrics.routingVolume === null
       ? fallbackValue
-      : formatNumber(analyticsMetrics.routingVolume, {
+      : formatAmount(analyticsMetrics.routingVolume, {
+          precision: XLM_DISPLAY_PRECISION,
           maximumFractionDigits: 2,
         });
   const avgConfirmationValue =
@@ -337,6 +383,14 @@ function AnalyticsPage({
     analyticsMetrics.successRate === null
       ? fallbackValue
       : analyticsMetrics.successRate.toFixed(1);
+
+  const freshnessLabel =
+    cachedAt === null
+      ? null
+      : `Cached ${new Date(cachedAt).toLocaleTimeString("en-US", {
+          hour: "2-digit",
+          minute: "2-digit",
+        })}`;
 
   return (
     <div className={`dashboard ${isNavOpen ? "nav-open" : ""}`}>
@@ -382,7 +436,7 @@ function AnalyticsPage({
           <button
             type="button"
             className="disconnect-button"
-            onClick={onDisconnectWallet}
+            onClick={() => setIsDisconnectDialogOpen(true)}
           >
             Disconnect wallet
           </button>
@@ -433,7 +487,13 @@ function AnalyticsPage({
               </button>
               {userPublicKey && isWalletMenuOpen && (
                 <div className="wallet-dropdown">
-                  <button type="button" onClick={onDisconnectWallet}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsWalletMenuOpen(false);
+                      setIsDisconnectDialogOpen(true);
+                    }}
+                  >
                     Disconnect wallet
                   </button>
                 </div>
@@ -442,15 +502,43 @@ function AnalyticsPage({
           </div>
         </section>
 
+        {freshnessLabel && (
+          <section
+            className="card reveal"
+            data-testid="analytics-freshness"
+            aria-live="polite"
+          >
+            <p className="subtle">{freshnessLabel}</p>
+          </section>
+        )}
+
+        {isLoading && !loadError && (
+          <section
+            className="card reveal"
+            data-testid="analytics-loading"
+            role="status"
+            aria-live="polite"
+          >
+            <p className="subtle">Loading analytics…</p>
+          </section>
+        )}
+
         {loadError && (
-          <section className="card reveal" role="alert">
+          <section
+            className="card reveal"
+            role="alert"
+            data-testid="analytics-error"
+          >
             <p className="field-error">
               Unable to load analytics: {loadError}
             </p>
             <button
               type="button"
               className="connect-pill"
+              data-testid="analytics-retry"
               onClick={() => setRetryCount((count) => count + 1)}
+              disabled={isOffline}
+              title={isOffline ? "Reconnect to retry" : undefined}
             >
               Retry
             </button>
@@ -459,7 +547,7 @@ function AnalyticsPage({
 
         {!loadError && (
           <section className="grid columns-3">
-            <div className="card reveal">
+            <div className="card reveal" data-testid="analytics-metric-volume">
               <div className="card-header">
                 <h2>Flow volume</h2>
                 <span className="badge">Last 1h</span>
@@ -468,7 +556,10 @@ function AnalyticsPage({
                 {routingVolumeValue} <span>XLM</span>
               </div>
             </div>
-            <div className="card reveal">
+            <div
+              className="card reveal"
+              data-testid="analytics-metric-confirmation"
+            >
               <div className="card-header">
                 <h2>Avg confirmation</h2>
                 <span className="badge">Network</span>
@@ -477,7 +568,10 @@ function AnalyticsPage({
                 {avgConfirmationValue} <span>sec</span>
               </div>
             </div>
-            <div className="card reveal">
+            <div
+              className="card reveal"
+              data-testid="analytics-metric-success-rate"
+            >
               <div className="card-header">
                 <h2>Routing reliability</h2>
                 <span className="badge">Last 1h</span>
@@ -497,6 +591,18 @@ function AnalyticsPage({
         onHelpClick={() => handleNav(onHelpClick)}
         onRegisterClick={() => handleNav(onRegisterClick)}
         canRegister={canRegister}
+      />
+      <Dialog
+        open={isDisconnectDialogOpen}
+        title="Disconnect wallet"
+        description="You will need to reconnect your wallet to continue using Stellar Pay."
+        confirmLabel="Disconnect"
+        cancelLabel="Cancel"
+        onConfirm={() => {
+          setIsDisconnectDialogOpen(false);
+          onDisconnectWallet();
+        }}
+        onCancel={() => setIsDisconnectDialogOpen(false)}
       />
       <ScrollToTop />
     </div>

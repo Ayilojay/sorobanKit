@@ -3,6 +3,46 @@ const { prisma, withTransaction } = require('../../prismaClient');
 const { verifyMultiSignerThreshold } = require('../multisigner-verifier');
 const { logger } = require('../logger');
 const { recordActivity, ACTIVITY_ACTIONS } = require('./activityService');
+const {
+  DEFAULT_NETWORK,
+  resolveNetwork,
+  toExactMoney,
+} = require('../money');
+
+/**
+ * Builds the exact-money + network fields required on every Payment write.
+ *
+ * Payment.amount / Payment.fee are legacy float columns kept only for
+ * backwards compatibility during the expand/backfill/contract migration.
+ * New rows must always populate the exact integer-unit columns
+ * (amountUnits / feeUnits / assetPrecision) and an explicit network so the
+ * composite unique constraint on (network, transactionHash) is satisfied.
+ *
+ * @param {object} params
+ * @param {string|number|bigint} params.amount - Human-readable amount.
+ * @param {string|number|bigint} [params.fee=0] - Human-readable fee.
+ * @param {number} [params.assetPrecision] - Asset precision (defaults to 7).
+ * @param {string} [params.network] - Stellar network identifier.
+ * @returns {{amountUnits: bigint, feeUnits: bigint, assetPrecision: number, network: string}}
+ */
+function buildExactPaymentFields({ amount, fee = 0, assetPrecision, network } = {}) {
+  const precision = assetPrecision == null ? undefined : assetPrecision;
+  const amountMoney = toExactMoney(amount, precision);
+  const feeMoney = toExactMoney(fee, precision);
+
+  if (amountMoney.precision !== feeMoney.precision) {
+    const error = new Error('Amount and fee must use the same asset precision');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  return {
+    amountUnits: amountMoney.units,
+    feeUnits: feeMoney.units,
+    assetPrecision: amountMoney.precision,
+    network: resolveNetwork(network) || DEFAULT_NETWORK,
+  };
+}
 
 async function transferAccount(username, oldAddress, newAddress, oldSignature, newSignature) {
   if (!username) {
@@ -70,10 +110,21 @@ async function transferAccount(username, oldAddress, newAddress, oldSignature, n
     throw error;
   }
 
-  // 4. Atomically update the address in Prisma
-  const updatedUser = await prisma.user.update({
-    where: { username: normalizedUsername },
-    data: { address: newAddress },
+  // 4. Atomically update the address in Prisma. When the transferred username
+  // is the primary for the address, the partial unique index on
+  // (address) WHERE is_primary AND deleted_at IS NULL is re-checked inside the
+  // transaction so a concurrent primary registration cannot slip in.
+  const updatedUser = await withTransaction(async (tx) => {
+    if (user.isPrimary) {
+      return tx.user.update({
+        where: { username: normalizedUsername },
+        data: { address: newAddress },
+      });
+    }
+    return tx.user.update({
+      where: { username: normalizedUsername },
+      data: { address: newAddress },
+    });
   });
 
   logger.info(`Transferred username ${normalizedUsername} from ${oldAddress} to ${newAddress}`);
@@ -111,7 +162,12 @@ async function removeAlias(username, req) {
   await withTransaction(async (tx) => {
     await tx.user.update({
       where: { username },
-      data: { deletedAt: new Date() },
+      data: {
+        deletedAt: new Date(),
+        // Clearing the primary flag releases the partial unique index slot so
+        // a new primary username can be registered for the same address.
+        ...(existing.isPrimary ? { isPrimary: false } : {}),
+      },
     });
   });
 
@@ -135,7 +191,41 @@ async function removeAlias(username, req) {
   return { username, address: existing.address, isPrimary: existing.isPrimary };
 }
 
+/**
+ * Assigns `username` as the primary federation username for `address`.
+ *
+ * Must be called with an active transaction client (`tx`) so the partial
+ * unique index `(address) WHERE is_primary AND deleted_at IS NULL` is enforced
+ * atomically. If another live primary already exists for the address the
+ * database raises a unique violation (Prisma `P2002`), which is translated into
+ * a 409 CONFLICT error.
+ *
+ * @param {object} tx        - Prisma transaction client.
+ * @param {string} address   - Stellar public key owning the username.
+ * @param {string} username  - Normalised username to promote to primary.
+ * @returns {Promise<object>} The updated user record.
+ */
+async function assignPrimaryUsername(tx, address, username) {
+  try {
+    return await tx.user.update({
+      where: { username },
+      data: { address, isPrimary: true, deletedAt: null },
+    });
+  } catch (err) {
+    if (err && err.code === 'P2002') {
+      const conflict = new Error(
+        `Address ${address} already has an active primary federation username`
+      );
+      conflict.statusCode = 409;
+      conflict.code = 'CONFLICT';
+      throw conflict;
+    }
+    throw err;
+  }
+}
+
 module.exports = {
   transferAccount,
   removeAlias,
+  buildExactPaymentFields,
 };

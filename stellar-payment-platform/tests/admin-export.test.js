@@ -15,6 +15,11 @@ jest.mock('../src/cleanup-cron', () => ({ scheduleCleanupJob: jest.fn() }));
 jest.mock('../src/soft-delete-purge-cron', () => ({ scheduleSoftDeletePurgeJob: jest.fn() }));
 
 const mockFindMany = jest.fn();
+const mockExportJobCreate = jest.fn();
+const mockExportJobFindUnique = jest.fn();
+const mockExportJobFindFirst = jest.fn();
+const mockExportJobUpdate = jest.fn();
+const mockExportJobFindMany = jest.fn();
 jest.mock('../prismaClient', () => ({
   prisma: {
     user: {
@@ -28,6 +33,13 @@ jest.mock('../prismaClient', () => ({
     payment: {
       findMany: (query) => query.select ? Promise.resolve([]) : mockFindMany(query),
     },
+    exportJob: {
+      create: (...args) => mockExportJobCreate(...args),
+      findUnique: (...args) => mockExportJobFindUnique(...args),
+      findFirst: (...args) => mockExportJobFindFirst(...args),
+      findMany: (...args) => mockExportJobFindMany(...args),
+      update: (...args) => mockExportJobUpdate(...args),
+    },
     $transaction: jest.fn().mockResolvedValue([0, []]),
     $queryRaw: jest.fn().mockResolvedValue([]),
     $metrics: { json: jest.fn().mockResolvedValue({ counters: [], gauges: [], histograms: [] }) },
@@ -35,23 +47,15 @@ jest.mock('../prismaClient', () => ({
   isPrismaConnectionError: () => false,
 }));
 
-// ── step-up verification mock (issue #374) ───────────────────────────────────
-
-const mockIssueStepUpChallenge = jest.fn();
-const mockConsumeStepUpChallenge = jest.fn();
-const mockRecordStepUpAudit = jest.fn();
-
-jest.mock('../src/step-up-verification', () => ({
-  STEP_UP_ACTIONS: {
-    CONTRACT_UPGRADE: 'contract_upgrade',
-    TREASURY_CHANGE: 'treasury_change',
-    BULK_EXPORT: 'bulk_export',
-  },
-  issueStepUpChallenge: (...args) => mockIssueStepUpChallenge(...args),
-  consumeStepUpChallenge: (...args) => mockConsumeStepUpChallenge(...args),
-  recordStepUpAudit: (...args) => mockRecordStepUpAudit(...args),
-  hashExportPayload: (query) => JSON.stringify(query),
-}));
+// Mock the background export job service so tests can drive job state directly.
+const mockExportJobService = {
+  createExportJob: jest.fn(),
+  getExportJob: jest.fn(),
+  cancelExportJob: jest.fn(),
+  getDownloadArtifact: jest.fn(),
+  runExportJob: jest.fn(),
+};
+jest.mock('../src/export-job-service', () => mockExportJobService);
 
 jest.mock('@stellar/stellar-sdk', () => ({
   Horizon: { Server: jest.fn().mockImplementation(() => ({ payments: jest.fn() })) },
@@ -284,147 +288,250 @@ describe('GET /admin/export', () => {
   });
 });
 
-// ── step-up verification (issue #374) ────────────────────────────────────────
+// ── background job flow ──────────────────────────────────────────────────────
 
-const STEP_UP_HEADER = 'x-step-up-token';
+const makeJob = (overrides = {}) => ({
+  id: 'job-1',
+  ownerId: 'admin',
+  status: 'queued',
+  format: 'csv',
+  progress: 0,
+  totalRecords: null,
+  processedRecords: 0,
+  artifactPath: null,
+  artifactExpiresAt: null,
+  error: null,
+  createdAt: new Date('2026-01-15T12:00:00Z'),
+  updatedAt: new Date('2026-01-15T12:00:00Z'),
+  ...overrides,
+});
 
-describe('GET /admin/export step-up verification', () => {
+describe('POST /admin/export/jobs', () => {
   beforeEach(() => {
-    mockFindMany.mockReset();
-    mockIssueStepUpChallenge.mockReset();
-    mockConsumeStepUpChallenge.mockReset();
-    mockRecordStepUpAudit.mockReset();
-    mockRecordStepUpAudit.mockResolvedValue(undefined);
+    jest.clearAllMocks();
   });
 
-  it('streams the export when a valid step-up challenge is presented', async () => {
-    mockConsumeStepUpChallenge.mockResolvedValueOnce({ ok: true, challengeId: 'chal-1' });
-    mockFindMany.mockResolvedValueOnce([makeRecord(1)]).mockResolvedValueOnce([]);
+  it('returns 401 without API key', async () => {
+    const res = await request(app).post('/api/v1/admin/export/jobs').send({ format: 'csv' });
+    expect(res.status).toBe(401);
+    expect(mockExportJobService.createExportJob).not.toHaveBeenCalled();
+  });
+
+  it('creates a job and returns 202 with job id', async () => {
+    mockExportJobService.createExportJob.mockResolvedValueOnce(makeJob());
 
     const res = await request(app)
-      .get('/api/v1/admin/export')
+      .post('/api/v1/admin/export/jobs')
       .set('x-api-key', 'test-admin-key')
-      .set(STEP_UP_HEADER, 'step-up-token-1');
+      .send({ format: 'csv', startDate: '2026-01-01', endDate: '2026-01-31' });
 
-    expect(res.status).toBe(200);
-    expect(res.text).toMatch(/txn-1/);
-    expect(mockConsumeStepUpChallenge).toHaveBeenCalledWith(
+    expect(res.status).toBe(202);
+    expect(res.body.id).toBe('job-1');
+    expect(res.body.status).toBe('queued');
+    expect(res.headers.location).toMatch(/\/admin\/export\/jobs\/job-1/);
+    expect(mockExportJobService.createExportJob).toHaveBeenCalledWith(
       expect.objectContaining({
-        token: 'step-up-token-1',
-        action: 'bulk_export',
-        payloadHash: expect.any(String),
+        ownerId: expect.any(String),
+        format: 'csv',
+        startDate: expect.any(Date),
+        endDate: expect.any(Date),
       }),
     );
   });
 
-  it('records audit evidence on successful export', async () => {
-    mockConsumeStepUpChallenge.mockResolvedValueOnce({ ok: true, challengeId: 'chal-1' });
-    mockFindMany.mockResolvedValueOnce([makeRecord(1)]).mockResolvedValueOnce([]);
-
-    await request(app)
-      .get('/api/v1/admin/export')
+  it('rejects invalid format with 400', async () => {
+    const res = await request(app)
+      .post('/api/v1/admin/export/jobs')
       .set('x-api-key', 'test-admin-key')
-      .set(STEP_UP_HEADER, 'step-up-token-1');
+      .send({ format: 'xml' });
 
-    expect(mockRecordStepUpAudit).toHaveBeenCalledWith(
-      expect.objectContaining({
-        action: 'bulk_export',
-        outcome: 'success',
-        challengeId: 'chal-1',
-        payloadHash: expect.any(String),
-      }),
-    );
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('INVALID_INPUT');
+    expect(mockExportJobService.createExportJob).not.toHaveBeenCalled();
   });
 
-  it('rejects the export with 401 when the step-up token is missing', async () => {
+  it('rejects startDate after endDate with 400', async () => {
     const res = await request(app)
-      .get('/api/v1/admin/export')
+      .post('/api/v1/admin/export/jobs')
+      .set('x-api-key', 'test-admin-key')
+      .send({ format: 'csv', startDate: '2026-02-01', endDate: '2026-01-01' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('INVALID_INPUT');
+    expect(mockExportJobService.createExportJob).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET /admin/export/jobs/:id', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('returns 401 without API key', async () => {
+    const res = await request(app).get('/api/v1/admin/export/jobs/job-1');
+    expect(res.status).toBe(401);
+  });
+
+  it('returns job status and progress for the owner', async () => {
+    mockExportJobService.getExportJob.mockResolvedValueOnce(
+      makeJob({ status: 'running', progress: 42, processedRecords: 420, totalRecords: 1000 }),
+    );
+
+    const res = await request(app)
+      .get('/api/v1/admin/export/jobs/job-1')
       .set('x-api-key', 'test-admin-key');
 
+    expect(res.status).toBe(200);
+    expect(res.body.id).toBe('job-1');
+    expect(res.body.status).toBe('running');
+    expect(res.body.progress).toBe(42);
+    expect(res.body.processedRecords).toBe(420);
+    expect(res.body.totalRecords).toBe(1000);
+  });
+
+  it('returns 404 for an unknown job', async () => {
+    mockExportJobService.getExportJob.mockResolvedValueOnce(null);
+
+    const res = await request(app)
+      .get('/api/v1/admin/export/jobs/missing')
+      .set('x-api-key', 'test-admin-key');
+
+    expect(res.status).toBe(404);
+    expect(res.body.code).toBe('NOT_FOUND');
+  });
+
+  it('returns 403 when the job belongs to another owner', async () => {
+    mockExportJobService.getExportJob.mockResolvedValueOnce(
+      makeJob({ ownerId: 'someone-else' }),
+    );
+
+    const res = await request(app)
+      .get('/api/v1/admin/export/jobs/job-1')
+      .set('x-api-key', 'test-admin-key');
+
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe('FORBIDDEN');
+  });
+});
+
+describe('POST /admin/export/jobs/:id/cancel', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('returns 401 without API key', async () => {
+    const res = await request(app).post('/api/v1/admin/export/jobs/job-1/cancel');
     expect(res.status).toBe(401);
-    expect(res.body.code).toBe('STEP_UP_REQUIRED');
-    expect(mockFindMany).not.toHaveBeenCalled();
-    expect(mockRecordStepUpAudit).toHaveBeenCalledWith(
-      expect.objectContaining({ action: 'bulk_export', outcome: 'failure', reason: 'missing' }),
+  });
+
+  it('cancels a queued job and returns the cancelled status', async () => {
+    mockExportJobService.cancelExportJob.mockResolvedValueOnce(
+      makeJob({ status: 'cancelled' }),
+    );
+
+    const res = await request(app)
+      .post('/api/v1/admin/export/jobs/job-1/cancel')
+      .set('x-api-key', 'test-admin-key');
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('cancelled');
+    expect(mockExportJobService.cancelExportJob).toHaveBeenCalledWith(
+      expect.objectContaining({ jobId: 'job-1', ownerId: expect.any(String) }),
     );
   });
 
-  it('rejects the export with 401 when the step-up token is expired', async () => {
-    mockConsumeStepUpChallenge.mockResolvedValueOnce({ ok: false, reason: 'expired' });
+  it('returns 409 when the job has already completed', async () => {
+    const err = new Error('Job already finished');
+    err.code = 'JOB_NOT_CANCELLABLE';
+    mockExportJobService.cancelExportJob.mockRejectedValueOnce(err);
 
     const res = await request(app)
-      .get('/api/v1/admin/export')
-      .set('x-api-key', 'test-admin-key')
-      .set(STEP_UP_HEADER, 'expired-token');
-
-    expect(res.status).toBe(401);
-    expect(res.body.code).toBe('STEP_UP_EXPIRED');
-    expect(mockFindMany).not.toHaveBeenCalled();
-    expect(mockRecordStepUpAudit).toHaveBeenCalledWith(
-      expect.objectContaining({ action: 'bulk_export', outcome: 'failure', reason: 'expired' }),
-    );
-  });
-
-  it('rejects the export with 401 when the step-up token was already used', async () => {
-    mockConsumeStepUpChallenge.mockResolvedValueOnce({ ok: false, reason: 'reused' });
-
-    const res = await request(app)
-      .get('/api/v1/admin/export')
-      .set('x-api-key', 'test-admin-key')
-      .set(STEP_UP_HEADER, 'used-token');
-
-    expect(res.status).toBe(401);
-    expect(res.body.code).toBe('STEP_UP_REUSED');
-    expect(mockFindMany).not.toHaveBeenCalled();
-    expect(mockRecordStepUpAudit).toHaveBeenCalledWith(
-      expect.objectContaining({ action: 'bulk_export', outcome: 'failure', reason: 'reused' }),
-    );
-  });
-
-  it('rejects the export with 409 when the payload hash does not match', async () => {
-    mockConsumeStepUpChallenge.mockResolvedValueOnce({ ok: false, reason: 'payload_mismatch' });
-
-    const res = await request(app)
-      .get('/api/v1/admin/export?format=json')
-      .set('x-api-key', 'test-admin-key')
-      .set(STEP_UP_HEADER, 'token-for-other-payload');
+      .post('/api/v1/admin/export/jobs/job-1/cancel')
+      .set('x-api-key', 'test-admin-key');
 
     expect(res.status).toBe(409);
-    expect(res.body.code).toBe('STEP_UP_PAYLOAD_MISMATCH');
-    expect(mockFindMany).not.toHaveBeenCalled();
-    expect(mockRecordStepUpAudit).toHaveBeenCalledWith(
-      expect.objectContaining({
-        action: 'bulk_export',
-        outcome: 'failure',
-        reason: 'payload_mismatch',
-      }),
-    );
+    expect(res.body.code).toBe('JOB_NOT_CANCELLABLE');
   });
 
-  it('allows only one of two concurrent requests to consume the same challenge', async () => {
-    // First consumer wins; the second sees the challenge as already used.
-    mockConsumeStepUpChallenge
-      .mockResolvedValueOnce({ ok: true, challengeId: 'chal-race' })
-      .mockResolvedValueOnce({ ok: false, reason: 'reused' });
-    mockFindMany.mockResolvedValueOnce([makeRecord(1)]).mockResolvedValueOnce([]);
+  it('returns 403 when cancelling another owner\'s job', async () => {
+    const err = new Error('Forbidden');
+    err.code = 'FORBIDDEN';
+    mockExportJobService.cancelExportJob.mockRejectedValueOnce(err);
 
-    const [first, second] = await Promise.all([
-      request(app)
-        .get('/api/v1/admin/export')
-        .set('x-api-key', 'test-admin-key')
-        .set(STEP_UP_HEADER, 'race-token'),
-      request(app)
-        .get('/api/v1/admin/export')
-        .set('x-api-key', 'test-admin-key')
-        .set(STEP_UP_HEADER, 'race-token'),
-    ]);
+    const res = await request(app)
+      .post('/api/v1/admin/export/jobs/job-1/cancel')
+      .set('x-api-key', 'test-admin-key');
 
-    const statuses = [first.status, second.status].sort();
-    expect(statuses).toEqual([200, 401]);
-    const rejected = first.status === 401 ? first : second;
-    expect(rejected.body.code).toBe('STEP_UP_REUSED');
-    expect(mockRecordStepUpAudit).toHaveBeenCalledWith(
-      expect.objectContaining({ action: 'bulk_export', outcome: 'failure', reason: 'reused' }),
-    );
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe('FORBIDDEN');
+  });
+});
+
+describe('GET /admin/export/jobs/:id/download', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('returns 401 without API key', async () => {
+    const res = await request(app).get('/api/v1/admin/export/jobs/job-1/download');
+    expect(res.status).toBe(401);
+  });
+
+  it('streams the completed artifact for the owner', async () => {
+    const { Readable } = require('stream');
+    mockExportJobService.getDownloadArtifact.mockResolvedValueOnce({
+      stream: Readable.from(['"id"\ntxn-1\n']),
+      filename: 'export-job-1.csv',
+      contentType: 'text/csv',
+      size: 13,
+    });
+
+    const res = await request(app)
+      .get('/api/v1/admin/export/jobs/job-1/download')
+      .set('x-api-key', 'test-admin-key');
+
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toMatch(/text\/csv/);
+    expect(res.headers['content-disposition']).toMatch(/export-job-1\.csv/);
+    expect(res.text).toMatch(/txn-1/);
+  });
+
+  it('returns 409 when the job is not yet complete', async () => {
+    const err = new Error('Job not complete');
+    err.code = 'JOB_NOT_COMPLETE';
+    mockExportJobService.getDownloadArtifact.mockRejectedValueOnce(err);
+
+    const res = await request(app)
+      .get('/api/v1/admin/export/jobs/job-1/download')
+      .set('x-api-key', 'test-admin-key');
+
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe('JOB_NOT_COMPLETE');
+  });
+
+  it('returns 410 when the artifact has expired', async () => {
+    const err = new Error('Artifact expired');
+    err.code = 'ARTIFACT_EXPIRED';
+    mockExportJobService.getDownloadArtifact.mockRejectedValueOnce(err);
+
+    const res = await request(app)
+      .get('/api/v1/admin/export/jobs/job-1/download')
+      .set('x-api-key', 'test-admin-key');
+
+    expect(res.status).toBe(410);
+    expect(res.body.code).toBe('ARTIFACT_EXPIRED');
+  });
+
+  it('returns 403 when downloading another owner\'s artifact', async () => {
+    const err = new Error('Forbidden');
+    err.code = 'FORBIDDEN';
+    mockExportJobService.getDownloadArtifact.mockRejectedValueOnce(err);
+
+    const res = await request(app)
+      .get('/api/v1/admin/export/jobs/job-1/download')
+      .set('x-api-key', 'test-admin-key');
+
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe('FORBIDDEN');
   });
 });

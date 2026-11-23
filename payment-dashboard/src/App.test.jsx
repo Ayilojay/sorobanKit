@@ -1,6 +1,21 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react';
+import { axe } from 'jest-axe';
 import App from './App';
+import {
+  parseFeatureFlags,
+  DEFAULT_FEATURE_FLAGS,
+  FEATURE_FLAG_SCHEMA,
+} from './featureFlags';
+import {
+  createFocusManager,
+  ANNOUNCEMENT_POLITENESS,
+} from './focusManager';
+import {
+  createPaymentCoordinator,
+  PAYMENT_COORDINATION_KEY,
+  PAYMENT_COORDINATION_TTL_MS,
+} from './paymentCoordinator';
 
 const STORAGE_KEY = 'stellar_dashboard_wallet_pubkey';
 const PENDING_KEY = 'stellar_dashboard_pending_payment';
@@ -9,6 +24,38 @@ const OTHER_PUBLIC_KEY = 'GZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ
 
 const mockConnect = vi.fn();
 const mockDisconnect = vi.fn();
+
+// Target WCAG level for all automated dashboard checks.
+const WCAG_TARGET = 'WCAG 2.1 AA';
+
+// Reviewed exceptions allowlist. Each entry must reference a tracked issue and
+// a justification; unreviewed violations fail the suite.
+const AXE_EXCEPTIONS = [
+  {
+    id: 'color-contrast',
+    issue: '#446',
+    justification:
+      'Brand accent on the payment CTA is pending a design token update; tracked in #446.',
+  },
+];
+
+const axeOptions = {
+  runOnly: {
+    type: 'tag',
+    values: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'],
+  },
+  rules: AXE_EXCEPTIONS.reduce((acc, exception) => {
+    acc[exception.id] = { enabled: false };
+    return acc;
+  }, {}),
+};
+
+async function expectNoUnreviewedViolations(container) {
+  const results = await axe(container, axeOptions);
+  const allowed = new Set(AXE_EXCEPTIONS.map((exception) => exception.id));
+  const unreviewed = results.violations.filter((violation) => !allowed.has(violation.id));
+  expect(unreviewed).toEqual([]);
+}
 
 vi.mock('@stellar/freighter-api', () => ({
   isConnected: vi.fn(),
@@ -341,5 +388,257 @@ describe('App pending payment resume after reload', () => {
     await waitFor(() => {
       expect(localStorage.getItem(PENDING_KEY)).toBeNull();
     });
+  });
+});
+
+describe('Feature flag schema parsing', () => {
+  it('accepts a well-formed payload and returns typed values', () => {
+    const payload = {
+      version: 1,
+      flags: {
+        enableMultiTabPayment: true,
+        announceRouteChanges: false,
+        maxRetryCount: 3,
+      },
+    };
+
+    const result = parseFeatureFlags(payload);
+
+    expect(result.ok).toBe(true);
+    expect(result.flags.enableMultiTabPayment).toBe(true);
+    expect(result.flags.announceRouteChanges).toBe(false);
+    expect(result.flags.maxRetryCount).toBe(3);
+  });
+
+  it('falls back to defaults for unknown flag names', () => {
+    const result = parseFeatureFlags({
+      version: 1,
+      flags: { totallyUnknownFlag: true },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.flags).toEqual(DEFAULT_FEATURE_FLAGS);
+    expect(result.ignored).toContain('totallyUnknownFlag');
+  });
+
+  it('falls back to defaults when a flag has the wrong type', () => {
+    const result = parseFeatureFlags({
+      version: 1,
+      flags: { enableMultiTabPayment: 'yes' },
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.flags).toEqual(DEFAULT_FEATURE_FLAGS);
+    expect(result.errors.length).toBeGreaterThan(0);
+  });
+
+  it('falls back safely on malformed JSON input', () => {
+    const result = parseFeatureFlags('{not valid json');
+
+    expect(result.ok).toBe(false);
+    expect(result.flags).toEqual(DEFAULT_FEATURE_FLAGS);
+  });
+
+  it('falls back safely on null or non-object payloads', () => {
+    expect(parseFeatureFlags(null).flags).toEqual(DEFAULT_FEATURE_FLAGS);
+    expect(parseFeatureFlags(42).flags).toEqual(DEFAULT_FEATURE_FLAGS);
+    expect(parseFeatureFlags([]).flags).toEqual(DEFAULT_FEATURE_FLAGS);
+  });
+
+  it('rejects stale payloads whose version is behind the schema', () => {
+    const result = parseFeatureFlags({
+      version: FEATURE_FLAG_SCHEMA.version - 1,
+      flags: { enableMultiTabPayment: true },
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.stale).toBe(true);
+    expect(result.flags).toEqual(DEFAULT_FEATURE_FLAGS);
+  });
+
+  it('rejects payloads from a future schema version', () => {
+    const result = parseFeatureFlags({
+      version: FEATURE_FLAG_SCHEMA.version + 1,
+      flags: {},
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.flags).toEqual(DEFAULT_FEATURE_FLAGS);
+  });
+
+  it('strips secret-looking keys so they never reach the client', () => {
+    const result = parseFeatureFlags({
+      version: 1,
+      flags: {
+        enableMultiTabPayment: true,
+        apiSecret: 'super-secret',
+        privateKey: 'S...',
+      },
+    });
+
+    expect(result.flags.apiSecret).toBeUndefined();
+    expect(result.flags.privateKey).toBeUndefined();
+    expect(result.redacted).toEqual(
+      expect.arrayContaining(['apiSecret', 'privateKey']),
+    );
+  });
+});
+
+describe('Focus and announcement manager', () => {
+  let manager;
+
+  beforeEach(() => {
+    document.body.innerHTML = '';
+    manager = createFocusManager({ document });
+  });
+
+  afterEach(() => {
+    manager.destroy();
+    document.body.innerHTML = '';
+  });
+
+  it('moves focus to the route heading on navigation', () => {
+    const heading = document.createElement('h1');
+    heading.tabIndex = -1;
+    heading.textContent = 'Dashboard';
+    document.body.appendChild(heading);
+
+    manager.focusRouteHeading(heading);
+
+    expect(document.activeElement).toBe(heading);
+  });
+
+  it('does not steal focus during a background refresh', () => {
+    const heading = document.createElement('h1');
+    heading.tabIndex = -1;
+    document.body.appendChild(heading);
+
+    const input = document.createElement('input');
+    document.body.appendChild(input);
+    input.focus();
+
+    manager.focusRouteHeading(heading, { background: true });
+
+    expect(document.activeElement).toBe(input);
+  });
+
+  it('announces async success through a polite live region', () => {
+    manager.announce('Payment submitted', { politeness: ANNOUNCEMENT_POLITENESS.POLITE });
+
+    const region = document.querySelector('[aria-live="polite"]');
+    expect(region).toBeTruthy();
+    expect(region.textContent).toBe('Payment submitted');
+  });
+
+  it('announces async failure through an assertive live region', () => {
+    manager.announce('Payment failed', { politeness: ANNOUNCEMENT_POLITENESS.ASSERTIVE });
+
+    const region = document.querySelector('[aria-live="assertive"]');
+    expect(region).toBeTruthy();
+    expect(region.textContent).toBe('Payment failed');
+  });
+
+  it('reuses a single live region across repeated announcements', () => {
+    manager.announce('First');
+    manager.announce('Second');
+
+    const regions = document.querySelectorAll('[aria-live]');
+    expect(regions.length).toBe(1);
+    expect(regions[0].textContent).toBe('Second');
+  });
+});
+
+describe('Cross-tab payment coordination', () => {
+  let coordinator;
+
+  beforeEach(() => {
+    localStorage.clear();
+    vi.useFakeTimers();
+    coordinator = createPaymentCoordinator({ storage: localStorage });
+  });
+
+  afterEach(() => {
+    coordinator.destroy();
+    vi.useRealTimers();
+    localStorage.clear();
+  });
+
+  it('shares only a non-sensitive operation reference across tabs', () => {
+    coordinator.claim({
+      operationRef: 'op_ref_abc123',
+      account: TEST_PUBLIC_KEY,
+      network: 'TESTNET',
+    });
+
+    const raw = localStorage.getItem(PAYMENT_COORDINATION_KEY);
+    const parsed = JSON.parse(raw);
+
+    expect(parsed.operationRef).toBe('op_ref_abc123');
+    expect(parsed.account).toBe(TEST_PUBLIC_KEY);
+    expect(parsed.network).toBe('TESTNET');
+    expect(parsed.amount).toBeUndefined();
+    expect(parsed.destination).toBeUndefined();
+    expect(parsed.secret).toBeUndefined();
+  });
+
+  it('prevents a second tab from starting a duplicate payment attempt', () => {
+    coordinator.claim({
+      operationRef: 'op_ref_abc123',
+      account: TEST_PUBLIC_KEY,
+      network: 'TESTNET',
+    });
+
+    const otherTab = createPaymentCoordinator({ storage: localStorage });
+    const result = otherTab.claim({
+      operationRef: 'op_ref_other',
+      account: TEST_PUBLIC_KEY,
+      network: 'TESTNET',
+    });
+
+    expect(result.acquired).toBe(false);
+    expect(result.existing.operationRef).toBe('op_ref_abc123');
+
+    otherTab.destroy();
+  });
+
+  it('expires stale coordination state after the TTL', () => {
+    coordinator.claim({
+      operationRef: 'op_ref_abc123',
+      account: TEST_PUBLIC_KEY,
+      network: 'TESTNET',
+    });
+
+    vi.advanceTimersByTime(PAYMENT_COORDINATION_TTL_MS + 1);
+
+    expect(coordinator.read()).toBeNull();
+  });
+
+  it('ignores coordination state bound to a different account', () => {
+    coordinator.claim({
+      operationRef: 'op_ref_abc123',
+      account: OTHER_PUBLIC_KEY,
+      network: 'TESTNET',
+    });
+
+    expect(coordinator.read({ account: TEST_PUBLIC_KEY, network: 'TESTNET' })).toBeNull();
+  });
+
+  it('releases coordination state once the operation reaches a terminal state', () => {
+    coordinator.claim({
+      operationRef: 'op_ref_abc123',
+      account: TEST_PUBLIC_KEY,
+      network: 'TESTNET',
+    });
+
+    coordinator.release();
+
+    expect(localStorage.getItem(PAYMENT_COORDINATION_KEY)).toBeNull();
+  });
+
+  it('recovers from malformed coordination state without throwing', () => {
+    localStorage.setItem(PAYMENT_COORDINATION_KEY, '{broken');
+
+    expect(() => coordinator.read()).not.toThrow();
+    expect(coordinator.read()).toBeNull();
   });
 });
