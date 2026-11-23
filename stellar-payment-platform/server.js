@@ -82,6 +82,7 @@ const {
   shouldFallbackToLocalRegistry,
 } = require("./src/utils");
 const { getCachedApprovedOrigins } = require("./src/originCache");
+const { setShuttingDown } = require("./src/shutdownState");
 
 dotenv.config();
 
@@ -1391,32 +1392,76 @@ app.use(buildErrorHandler(isPrismaConnectionError));
 
 const SHUTDOWN_TIMEOUT_MS =
   parseInt(process.env.SHUTDOWN_TIMEOUT_MS, 10) || 10_000;
-let isShuttingDown = false;
 
-const gracefulShutdown = (server, prismaClient, signal, redis = null) => {
-  if (isShuttingDown) return;
-  isShuttingDown = true;
+// #380 — Single idempotent shutdown coordinator. Repeated SIGTERM/SIGINT
+// signals (or a signal racing a forced exit) are no-ops because the whole
+// routine is guarded by one memoised promise.
+let shutdownPromise = null;
 
-  logger.info(`\nReceived ${signal}. Shutting down gracefully...`);
+const gracefulShutdown = (
+  server,
+  prismaClient,
+  signal,
+  redis = null,
+  { timeoutMs = SHUTDOWN_TIMEOUT_MS } = {},
+) => {
+  if (shutdownPromise) {
+    logger.info(`Received ${signal} while already shutting down; ignoring.`);
+    return shutdownPromise;
+  }
 
-  // Stop the pool monitor so it doesn't produce misleading warnings during
-  // the shutdown window.
-  poolMonitor.stop();
+  shutdownPromise = (async () => {
+    logger.info(`\nReceived ${signal}. Shutting down gracefully...`);
 
-  const timer = setTimeout(() => {
-    logger.error(
-      `Graceful shutdown timed out after ${SHUTDOWN_TIMEOUT_MS / 1000}s, forcing exit.`,
-    );
-    process.exit(1);
-  }, SHUTDOWN_TIMEOUT_MS);
+    // 1. Flip readiness so health checks report draining and load balancers
+    //    stop routing new traffic to this instance.
+    setShuttingDown(true);
 
-  server.close(async () => {
-    clearTimeout(timer);
+    // 2. Stop accepting new HTTP connections and let in-flight requests drain.
+    const closeServer = new Promise((resolve) => {
+      if (!server || typeof server.close !== "function") return resolve();
+      server.close(() => resolve());
+      // Also drop idle keep-alive sockets so close() can complete promptly.
+      if (typeof server.closeIdleConnections === "function") {
+        server.closeIdleConnections();
+      }
+    });
+
+    // 3. Abort new background scheduling and stop the pool monitor so it
+    //    doesn't produce misleading warnings during the shutdown window.
     try {
-      await prismaClient.$disconnect();
+      poolMonitor.stop();
     } catch (err) {
-      logger.error(err, "Error disconnecting Prisma during shutdown:");
+      logger.error(err, "Error stopping pool monitor during shutdown:");
     }
+
+    // 4. Await bounded in-flight work under a single deadline.
+    let deadlineTimer;
+    const deadline = new Promise((resolve) => {
+      deadlineTimer = setTimeout(() => {
+        logger.error(
+          `Graceful shutdown timed out after ${timeoutMs / 1000}s, forcing exit.`,
+        );
+        resolve("timeout");
+      }, timeoutMs);
+      if (typeof deadlineTimer.unref === "function") deadlineTimer.unref();
+    });
+
+    const outcome = await Promise.race([
+      closeServer.then(() => "drained"),
+      deadline,
+    ]);
+
+    // 5. Close resources in order: webhook worker/queue, Redis, then Prisma.
+    try {
+      const { closeWebhookWorker } = require("./src/webhooks/worker");
+      if (typeof closeWebhookWorker === "function") {
+        await closeWebhookWorker();
+      }
+    } catch (err) {
+      logger.error(err, "Error closing webhook worker during shutdown:");
+    }
+
     if (redis) {
       try {
         await redis.quit();
@@ -1424,8 +1469,18 @@ const gracefulShutdown = (server, prismaClient, signal, redis = null) => {
         logger.error(err, "Error disconnecting Redis during shutdown:");
       }
     }
-    process.exit(0);
-  });
+
+    try {
+      await prismaClient.$disconnect();
+    } catch (err) {
+      logger.error(err, "Error disconnecting Prisma during shutdown:");
+    }
+
+    clearTimeout(deadlineTimer);
+    return outcome;
+  })();
+
+  return shutdownPromise;
 };
 
 if (require.main === module) {
@@ -1449,12 +1504,18 @@ if (require.main === module) {
       }
     });
 
-    process.on("SIGTERM", (sig) =>
-      gracefulShutdown(server, prisma, sig, redisClient),
-    );
-    process.on("SIGINT", (sig) =>
-      gracefulShutdown(server, prisma, sig, redisClient),
-    );
+    const onSignal = (sig) => {
+      gracefulShutdown(server, prisma, sig, redisClient)
+        .then((outcome) => {
+          process.exit(outcome === "timeout" ? 1 : 0);
+        })
+        .catch((err) => {
+          logger.error(err, "Unexpected error during graceful shutdown:");
+          process.exit(1);
+        });
+    };
+    process.on("SIGTERM", onSignal);
+    process.on("SIGINT", onSignal);
   };
 
   // Verify the database is not out of sync with the Prisma migrations before
@@ -1484,4 +1545,10 @@ if (require.main === module) {
     });
 }
 
-module.exports = { app, gracefulShutdown, rejectNestedObjects, validateMemo };
+module.exports = {
+  app,
+  gracefulShutdown,
+  rejectNestedObjects,
+  validateMemo,
+  isShuttingDown: () => shutdownPromise !== null,
+};

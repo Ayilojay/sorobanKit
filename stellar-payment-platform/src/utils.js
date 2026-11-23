@@ -96,6 +96,98 @@ const shouldFallbackToLocalRegistry = (error) => {
   );
 };
 
+// #378 — shared decimal-safe Stellar amount boundary. All conversions use
+// string/BigInt arithmetic so no value ever passes through a JS float.
+const STELLAR_DECIMALS = 7;
+const STELLAR_SCALE = 10n ** BigInt(STELLAR_DECIMALS);
+const STELLAR_MAX_UNITS = 9223372036854775807n; // int64 max
+const STELLAR_MIN_UNITS = -9223372036854775808n; // int64 min
+const AMOUNT_RE = /^(\d+)(?:\.(\d+))?$/;
+
+class AmountError extends Error {
+  constructor(message, code) {
+    super(message);
+    this.name = 'AmountError';
+    this.code = code;
+  }
+}
+
+function parseAmount(value, options = {}) {
+  const { decimals = STELLAR_DECIMALS, allowNegative = false, allowZero = true } = options;
+  if (typeof value !== 'string') {
+    throw new AmountError('amount must be a decimal string.', 'AMOUNT_NOT_STRING');
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    throw new AmountError('amount must not be empty.', 'AMOUNT_EMPTY');
+  }
+  let negative = false;
+  let body = trimmed;
+  if (body.startsWith('-')) {
+    if (!allowNegative) {
+      throw new AmountError('amount must not be negative.', 'AMOUNT_NEGATIVE');
+    }
+    negative = true;
+    body = body.slice(1);
+  } else if (body.startsWith('+')) {
+    throw new AmountError('amount must not use a leading plus sign.', 'AMOUNT_BAD_NOTATION');
+  }
+  if (/[eE]/.test(body)) {
+    throw new AmountError('amount must not use scientific notation.', 'AMOUNT_BAD_NOTATION');
+  }
+  const match = AMOUNT_RE.exec(body);
+  if (!match) {
+    throw new AmountError('amount must be a plain decimal string.', 'AMOUNT_BAD_NOTATION');
+  }
+  const whole = match[1];
+  const fraction = match[2] || '';
+  if (fraction.length > decimals) {
+    throw new AmountError(`amount must not exceed ${decimals} decimal places.`, 'AMOUNT_PRECISION');
+  }
+  const padded = fraction.padEnd(decimals, '0');
+  const units = BigInt(whole) * 10n ** BigInt(decimals) + BigInt(padded || '0');
+  const signed = negative ? -units : units;
+  if (signed > STELLAR_MAX_UNITS || signed < STELLAR_MIN_UNITS) {
+    throw new AmountError('amount exceeds the int64 range.', 'AMOUNT_OVERFLOW');
+  }
+  if (!allowZero && signed === 0n) {
+    throw new AmountError('amount must be greater than zero.', 'AMOUNT_ZERO');
+  }
+  return signed;
+}
+
+function formatAmount(units, options = {}) {
+  const { decimals = STELLAR_DECIMALS } = options;
+  const value = typeof units === 'bigint' ? units : BigInt(units);
+  const negative = value < 0n;
+  const abs = negative ? -value : value;
+  const scale = 10n ** BigInt(decimals);
+  const whole = abs / scale;
+  const fraction = (abs % scale).toString().padStart(decimals, '0').replace(/0+$/, '');
+  const body = fraction ? `${whole}.${fraction}` : whole.toString();
+  return negative ? `-${body}` : body;
+}
+
+function isValidAmount(value, options = {}) {
+  try {
+    parseAmount(value, options);
+    return true;
+  } catch (error) {
+    if (error instanceof AmountError) return false;
+    throw error;
+  }
+}
+
+function validateAmount(value, options = {}) {
+  try {
+    parseAmount(value, options);
+    return null;
+  } catch (error) {
+    if (error instanceof AmountError) return error.message;
+    throw error;
+  }
+}
+
 module.exports = {
   normalizeNameTag,
   validateMemo,
@@ -108,4 +200,12 @@ module.exports = {
   exponentialDelay,
   DEFAULT_RETRY_FACTOR,
   DEFAULT_RETRY_JITTER,
+  STELLAR_DECIMALS,
+  STELLAR_MAX_UNITS,
+  STELLAR_MIN_UNITS,
+  AmountError,
+  parseAmount,
+  formatAmount,
+  isValidAmount,
+  validateAmount,
 };

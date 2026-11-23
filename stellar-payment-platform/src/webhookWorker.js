@@ -7,6 +7,11 @@ const {
   updatePaymentIntentStatus,
   VALID_TRANSITIONS,
 } = require('./services/paymentIntentStateMachine');
+const {
+  recordWebhookAttempt,
+  observeWebhookDeliveryLatency,
+  refreshWebhookQueueHealth,
+} = require('./services/webhookQueueHealth');
 
 const WEBHOOK_TIMEOUT_MS = 10_000;
 const WEBHOOK_QUEUE_NAME = 'webhook-deliveries';
@@ -47,6 +52,13 @@ let webhookQueue;
 let webhookWorker;
 let queueConnection;
 let workerConnection;
+
+// Shutdown / draining state. Once `draining` is true the worker stops picking
+// up new jobs and `enqueueWebhookDelivery` refuses to schedule new deliveries.
+let draining = false;
+let shutdownPromise = null;
+const inFlightJobs = new Set();
+let inFlightDrainResolvers = [];
 
 const computeSignature = (secret, timestamp, rawBody) => {
   return crypto.createHmac('sha256', secret).update(`${timestamp}.${rawBody}`).digest('hex');
@@ -323,6 +335,17 @@ const applyWebhookPaymentIntentStatus = async ({
 const processWebhookJob = async (job, { prisma, poolRunFn }) => {
   const { webhook, payload } = job.data;
   const now = new Date();
+  const attemptNumber = (job.attemptsMade || 0) + 1;
+  const startedAt = Date.now();
+
+  // Metric updates are best-effort: a Redis/DB outage must never break delivery.
+  const safeRecordAttempt = async (outcome) => {
+    try {
+      await recordWebhookAttempt({ attempt: attemptNumber, outcome });
+    } catch (metricError) {
+      logger.warn(`[webhook-worker] Failed to record attempt metric: ${metricError.message}`);
+    }
+  };
 
   try {
     await sendWebhook(webhook.url, payload, webhook.secret);
@@ -334,8 +357,16 @@ const processWebhookJob = async (job, { prisma, poolRunFn }) => {
         `[webhook-worker] Failed to mark failure for webhook ${webhook.id}: ${databaseError.message}`,
       );
     }
+    await safeRecordAttempt('failure');
     throw error;
   }
+
+  try {
+    await observeWebhookDeliveryLatency(Date.now() - startedAt);
+  } catch (metricError) {
+    logger.warn(`[webhook-worker] Failed to record latency metric: ${metricError.message}`);
+  }
+  await safeRecordAttempt('success');
 
   try {
     await markWebhookSuccess(prisma, poolRunFn, webhook.id, now);
@@ -383,13 +414,62 @@ const getWebhookQueue = () => {
   return webhookQueue;
 };
 
+const isDraining = () => draining;
+
+const trackInFlightJob = (promise) => {
+  inFlightJobs.add(promise);
+  const settle = () => {
+    inFlightJobs.delete(promise);
+    if (inFlightJobs.size === 0 && inFlightDrainResolvers.length > 0) {
+      const resolvers = inFlightDrainResolvers;
+      inFlightDrainResolvers = [];
+      resolvers.forEach((resolve) => resolve());
+    }
+  };
+  promise.then(settle, settle);
+  return promise;
+};
+
+/**
+ * Wait for all currently in-flight webhook jobs to settle, bounded by
+ * `timeoutMs`. Resolves with `{ drained: boolean, remaining: number }`.
+ */
+const awaitInFlightJobs = (timeoutMs) => {
+  if (inFlightJobs.size === 0) {
+    return Promise.resolve({ drained: true, remaining: 0 });
+  }
+
+  return new Promise((resolve) => {
+    let timer;
+    const onDrained = () => {
+      clearTimeout(timer);
+      resolve({ drained: true, remaining: 0 });
+    };
+    inFlightDrainResolvers.push(onDrained);
+
+    if (Number.isFinite(timeoutMs) && timeoutMs >= 0) {
+      timer = setTimeout(() => {
+        inFlightDrainResolvers = inFlightDrainResolvers.filter((r) => r !== onDrained);
+        resolve({ drained: false, remaining: inFlightJobs.size });
+      }, timeoutMs);
+      if (typeof timer.unref === 'function') timer.unref();
+    }
+  });
+};
+
 const startWebhookWorker = ({ prisma, poolRunFn }) => {
   if (webhookWorker) return webhookWorker;
 
   workerConnection = createRedisConnection();
   webhookWorker = new Worker(
     WEBHOOK_QUEUE_NAME,
-    (job) => processWebhookJob(job, { prisma, poolRunFn }),
+    (job) => {
+      // Refuse to start new work once draining has begun.
+      if (draining) {
+        throw new Error('Webhook worker is shutting down; job not processed');
+      }
+      return trackInFlightJob(processWebhookJob(job, { prisma, poolRunFn }));
+    },
     {
       connection: workerConnection,
       concurrency: WEBHOOK_WORKER_CONCURRENCY,
@@ -414,10 +494,26 @@ const startWebhookWorker = ({ prisma, poolRunFn }) => {
         `retry scheduled in ${nextDelayMs}ms (${attemptsMade}/${maxAttempts})`,
       );
     }
+
+    // Refresh queue-health gauges (oldest pending, DLQ age). Best-effort only.
+    try {
+      await refreshWebhookQueueHealth({ prisma, poolRunFn, queue: webhookQueue });
+    } catch (metricError) {
+      logger.warn(`[webhook-worker] Failed to refresh queue health metrics: ${metricError.message}`);
+    }
   });
 
   webhookWorker.on('error', (error) => {
     logger.error(`[webhook-worker] Redis error: ${error.message}`);
+  });
+
+  webhookWorker.on('completed', async () => {
+    // Keep gauges fresh after successful deliveries as well. Best-effort only.
+    try {
+      await refreshWebhookQueueHealth({ prisma, poolRunFn, queue: webhookQueue });
+    } catch (metricError) {
+      logger.warn(`[webhook-worker] Failed to refresh queue health metrics: ${metricError.message}`);
+    }
   });
 
   logger.info(
@@ -431,6 +527,12 @@ const buildJobId = (webhookId, eventId) => {
 };
 
 const enqueueWebhookDelivery = async (webhook, payload, queue = getWebhookQueue()) => {
+  if (draining) {
+    logger.warn(
+      `[webhook-queue] Refusing to enqueue event=${payload?.event_id} webhook=${webhook?.id}: worker is draining`,
+    );
+    return null;
+  }
   return queue.add(
     'deliver',
     { webhook, payload },
@@ -489,17 +591,75 @@ const dispatchPaymentWebhooks = async ({ prisma, poolGetFn, payment, queue }) =>
   }));
 };
 
-const closeWebhookQueue = async () => {
-  const resources = [webhookWorker, webhookQueue].filter(Boolean);
-  await Promise.all(resources.map((resource) => resource.close()));
+/**
+ * Gracefully drain and close the webhook worker, queue and Redis connections.
+ *
+ * Order of operations:
+ *  1. Flip the draining flag so no new jobs are accepted or scheduled.
+ *  2. Wait (bounded by `timeoutMs`) for in-flight jobs to settle.
+ *  3. Close the Worker (stops fetching new jobs), then the Queue.
+ *  4. Quit the underlying Redis connections.
+ *
+ * Idempotent: repeated calls return the same in-flight promise.
+ *
+ * @param {object} [options]
+ * @param {number} [options.timeoutMs] max time to wait for in-flight jobs
+ * @returns {Promise<{ drained: boolean, remaining: number }>}
+ */
+const closeWebhookQueue = async ({ timeoutMs = 30_000 } = {}) => {
+  if (shutdownPromise) return shutdownPromise;
 
-  const connections = [workerConnection, queueConnection].filter(Boolean);
-  await Promise.all(connections.map((connection) => connection.quit()));
+  draining = true;
 
-  webhookWorker = undefined;
-  webhookQueue = undefined;
-  workerConnection = undefined;
-  queueConnection = undefined;
+  shutdownPromise = (async () => {
+    let drainResult = { drained: true, remaining: 0 };
+    try {
+      drainResult = await awaitInFlightJobs(timeoutMs);
+      if (!drainResult.drained) {
+        logger.warn(
+          `[webhook-worker] Shutdown deadline reached with ${drainResult.remaining} job(s) still in flight`,
+        );
+      }
+    } catch (error) {
+      logger.error(`[webhook-worker] Error while draining in-flight jobs: ${error.message}`);
+    }
+
+    const resources = [webhookWorker, webhookQueue].filter(Boolean);
+    await Promise.all(
+      resources.map((resource) => resource.close().catch((error) => {
+        logger.error(`[webhook-worker] Error closing resource: ${error.message}`);
+      })),
+    );
+
+    const connections = [workerConnection, queueConnection].filter(Boolean);
+    await Promise.all(
+      connections.map((connection) => connection.quit().catch((error) => {
+        logger.error(`[webhook-worker] Error quitting Redis connection: ${error.message}`);
+      })),
+    );
+
+    webhookWorker = undefined;
+    webhookQueue = undefined;
+    workerConnection = undefined;
+    queueConnection = undefined;
+    inFlightJobs.clear();
+    inFlightDrainResolvers = [];
+
+    return drainResult;
+  })();
+
+  return shutdownPromise;
+};
+
+/**
+ * Reset shutdown state. Intended for tests so a fresh worker can be started
+ * after a previous shutdown.
+ */
+const resetWebhookWorkerState = () => {
+  draining = false;
+  shutdownPromise = null;
+  inFlightJobs.clear();
+  inFlightDrainResolvers = [];
 };
 
 // ── Dead Letter Queue (DLQ) ──────────────────────────────────────────────
@@ -700,6 +860,9 @@ module.exports = {
   enqueueWebhookDelivery,
   startWebhookWorker,
   closeWebhookQueue,
+  resetWebhookWorkerState,
+  isDraining,
+  awaitInFlightJobs,
   processWebhookJob,
   applyWebhookPaymentIntentStatus,
   sendWebhook,

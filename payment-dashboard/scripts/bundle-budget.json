@@ -1,0 +1,24 @@
+{
+  "$schema": "./bundle-budget.schema.json",
+  "description": "Per-route JavaScript and asset performance budgets. Each route defines the maximum initial (uncompressed) and gzip (compressed) transfer sizes in bytes. CI fails when a route chunk exceeds its budget without an approved update to this file.",
+  "comment": "To update a budget: measure the route chunk with `npm run build && npm run budget:report`, adjust the threshold below, and open a PR. Budget increases require reviewer approval from the performance owners (see CODEOWNERS). Never raise a budget to mask a regression; investigate the offending dependency first.",
+  "units": "bytes",
+  "routes": {
+    "registration": {
+      "initial": 262144,
+      "gzip": 81920
+    },
+    "history": {
+      "initial": 327680,
+      "gzip": 102400
+    },
+    "analytics": {
+      "initial": 393216,
+      "gzip": 122880
+    },
+    "help": {
+      "initial": 196608,
+      "gzip": 61440
+    }
+  }
+}

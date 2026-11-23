@@ -72,7 +72,12 @@ function AnalyticsPage({
   /** @type {[string | null, (value: string | null) => void]} */
   const [loadError, setLoadError] = useState(null);
   const [retryCount, setRetryCount] = useState(0);
-  const [isDisconnectDialogOpen, setIsDisconnectDialogOpen] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isOffline, setIsOffline] = useState(
+    typeof navigator !== "undefined" && navigator.onLine === false,
+  );
+  /** @type {[number | null, (value: number | null) => void]} */
+  const [cachedAt, setCachedAt] = useState(null);
   const {
     menuRef,
     isOpen: isWalletMenuOpen,
@@ -96,6 +101,23 @@ function AnalyticsPage({
       setIsConnecting(false);
     }
   };
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return undefined;
+    }
+
+    const handleOnline = () => setIsOffline(false);
+    const handleOffline = () => setIsOffline(true);
+
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, []);
 
   useEffect(() => {
     let isActive = true;
@@ -274,6 +296,8 @@ function AnalyticsPage({
       currentController = controller;
       const sinceMs = Date.now() - ANALYTICS_WINDOW_MS;
 
+      setIsLoading(true);
+
       try {
         const [routingVolume, avgConfirmation, successRate] = await Promise.all(
           [
@@ -293,6 +317,7 @@ function AnalyticsPage({
           successRate,
         });
         setLoadError(null);
+        setCachedAt(null);
       } catch (error) {
         if (
           !isActive ||
@@ -306,12 +331,16 @@ function AnalyticsPage({
           avgConfirmation: null,
           successRate: null,
         });
+        setCachedAt(null);
         setLoadError(
           error instanceof Error && error.message
             ? error.message
             : "Failed to load analytics.",
         );
       } finally {
+        if (isActive) {
+          setIsLoading(false);
+        }
         if (currentController === controller) {
           currentController = null;
         }
@@ -354,6 +383,14 @@ function AnalyticsPage({
     analyticsMetrics.successRate === null
       ? fallbackValue
       : analyticsMetrics.successRate.toFixed(1);
+
+  const freshnessLabel =
+    cachedAt === null
+      ? null
+      : `Cached ${new Date(cachedAt).toLocaleTimeString("en-US", {
+          hour: "2-digit",
+          minute: "2-digit",
+        })}`;
 
   return (
     <div className={`dashboard ${isNavOpen ? "nav-open" : ""}`}>
@@ -465,15 +502,43 @@ function AnalyticsPage({
           </div>
         </section>
 
+        {freshnessLabel && (
+          <section
+            className="card reveal"
+            data-testid="analytics-freshness"
+            aria-live="polite"
+          >
+            <p className="subtle">{freshnessLabel}</p>
+          </section>
+        )}
+
+        {isLoading && !loadError && (
+          <section
+            className="card reveal"
+            data-testid="analytics-loading"
+            role="status"
+            aria-live="polite"
+          >
+            <p className="subtle">Loading analytics…</p>
+          </section>
+        )}
+
         {loadError && (
-          <section className="card reveal" role="alert">
+          <section
+            className="card reveal"
+            role="alert"
+            data-testid="analytics-error"
+          >
             <p className="field-error">
               Unable to load analytics: {loadError}
             </p>
             <button
               type="button"
               className="connect-pill"
+              data-testid="analytics-retry"
               onClick={() => setRetryCount((count) => count + 1)}
+              disabled={isOffline}
+              title={isOffline ? "Reconnect to retry" : undefined}
             >
               Retry
             </button>
@@ -482,7 +547,7 @@ function AnalyticsPage({
 
         {!loadError && (
           <section className="grid columns-3">
-            <div className="card reveal">
+            <div className="card reveal" data-testid="analytics-metric-volume">
               <div className="card-header">
                 <h2>Flow volume</h2>
                 <span className="badge">Last 1h</span>
@@ -491,7 +556,10 @@ function AnalyticsPage({
                 {routingVolumeValue} <span>XLM</span>
               </div>
             </div>
-            <div className="card reveal">
+            <div
+              className="card reveal"
+              data-testid="analytics-metric-confirmation"
+            >
               <div className="card-header">
                 <h2>Avg confirmation</h2>
                 <span className="badge">Network</span>
@@ -500,7 +568,10 @@ function AnalyticsPage({
                 {avgConfirmationValue} <span>sec</span>
               </div>
             </div>
-            <div className="card reveal">
+            <div
+              className="card reveal"
+              data-testid="analytics-metric-success-rate"
+            >
               <div className="card-header">
                 <h2>Routing reliability</h2>
                 <span className="badge">Last 1h</span>

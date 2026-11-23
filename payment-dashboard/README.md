@@ -53,69 +53,70 @@ If the page is reloaded while a payment is in flight, the dashboard restores pro
 - **No resubmission**: resuming performs a read-only status lookup against the server using the stored reference. The payment is never re-sent on reload.
 - **Cleared on completion or mismatch**: the reference is removed once the operation reaches a terminal state (success or failure), or when it is invalid, unreadable, or does not match the current account/network.
 
-## Amount handling and token precision
+## Theming (light / dark)
 
-Canonical asset amounts are kept as **exact decimal strings** end to end. Amounts are never converted to JavaScript `number`/floating point for storage, transport, or arithmetic.
+The dashboard ships accessible design tokens for both a light and a dark theme and follows the operating system preference by default, with an explicit user override that is persisted.
 
-- **Canonical form**: amounts are represented as decimal strings (e.g. `"12.345"`). Parsing and formatting helpers live in the amount utilities and operate on strings only.
-- **Precision at the UI boundary**: token precision (decimals) is applied only when rendering or parsing user input in the UI. The canonical string is preserved unchanged in state, drafts, and requests.
-- **Locale formatting**: display formatting uses `Intl.NumberFormat` with the token's precision, but the formatted output is derived from the exact string — no float round-trip. Parsing user input strips locale grouping separators and validates against the token precision before producing a canonical string.
-- **Validation**: amounts exceeding the token precision or containing invalid characters are rejected with an explicit error rather than silently rounded.
+- **Tokens**: colors, surfaces, and contrast-sensitive values are defined as CSS custom properties under `src/styles/tokens.css` (or the equivalent token module). Each token has a light and dark value. Components must consume tokens rather than hard-coded colors so both themes stay accessible.
+- **Adding a token**: define the token in the light theme block, add its dark counterpart in the dark theme block, and verify contrast (WCAG AA) in both themes. Reference the token from components via `var(--token-name)`; do not add raw color literals.
+- **Pre-paint bootstrap**: a small inline script in `index.html` resolves the effective theme (stored choice, otherwise `prefers-color-scheme`) and sets the theme attribute on the root element before first paint, avoiding a flash of the wrong theme.
+- **Persistence and system changes**: the user's explicit choice is stored in `localStorage` and wins over the system preference. When the user has not chosen explicitly, the dashboard tracks `prefers-color-scheme` changes live and updates the theme without a reload.
 
-Focused tests cover locale formatting, parsing, precision boundaries, and rejection of over-precision input without floating-point loss.
-
-## Accessible confirmation dialogs
-
-All confirmations (payment, deletion, admin actions) use the shared `Dialog` component, which implements a consistent accessibility contract:
-
-- **Semantics**: rendered with `role="dialog"` and `aria-modal="true"`, and labelled via `aria-labelledby` (title) and optionally `aria-describedby` (description).
-- **Focus entry**: on open, focus moves to the dialog (the first focusable control or the dialog container).
-- **Focus trap**: Tab/Shift+Tab cycle within the dialog while it is open; focus cannot escape to the background.
-- **Escape policy**: Escape closes the dialog by default. Destructive or irreversible confirmations may opt out of Escape-to-close; this is explicit per dialog and documented at the call site.
-- **Focus return**: on close, focus returns to the element that opened the dialog.
-- **Labelled controls**: every interactive control has an accessible name; icon-only buttons require an `aria-label`.
-
-## Accessibility testing (WCAG 2.1 AA)
-
-The dashboard targets **WCAG 2.1 Level AA**. Automated checks use [axe-core](https://github.com/dequelabs/axe-core) against critical journeys:
-
-- Registration
-- Payment (including pre-sign simulation review)
-- Transaction history
-- Analytics
-- Error and loading states for each of the above
-
-Run the focused accessibility tests with:
+Validation:
 
 ```bash
-npm test -- --run a11y
+npm run test -- --run src/theme
+npm run lint
+npm run build
 ```
 
-Any violation fails the test. Known, reviewed exceptions are recorded in the accessibility exceptions allowlist (with a rule id, affected selector/journey, justification, and review date). Adding an exception requires review; unreviewed exceptions are not permitted.
+## Installable PWA and offline read-only mode
 
-## Reduced motion
+The dashboard is installable and, when connectivity is lost, switches to a read-only mode backed by a service worker cache.
 
-The dashboard respects the `prefers-reduced-motion` media query:
+- **Cache allowlist**: only eligible, non-secret data is cached (e.g. static assets and read-only dashboard views). The service worker never caches API responses containing secrets, signing material, or private keys.
+- **No signing material cached**: keys, seeds, and signing payloads are never written to service-worker storage or the offline cache. Offline mode is strictly read-only.
+- **Freshness indicators**: cached views display when the data was last refreshed so users know they are looking at stale data.
+- **Mutations disabled offline**: all write actions (payments, registration, settings changes) are disabled while offline. Financial operations are never queued for later replay; the user must reconnect and re-initiate them.
+- **Recovery**: when connectivity returns, the dashboard refreshes from the network and re-enables mutations.
 
-- Nonessential animations and transitions (entrance animations, decorative motion) are disabled or simplified when reduced motion is requested.
-- Functional feedback (loading indicators, state changes, focus indicators) remains visible — motion is reduced, not information removed.
-
-Test both modes by toggling the OS/browser setting, or in Chromium DevTools via **Rendering → Emulate CSS media feature `prefers-reduced-motion`**. Automated tests cover both preference modes.
-
-## Development commands
+Validation:
 
 ```bash
-# Focused tests (amounts, dialogs, accessibility, reduced motion)
-npm test -- --run amounts dialog a11y reduced-motion
-
-# Lint
+npm run test -- --run src/offline src/sw
 npm run lint
-
-# Typecheck
-npm run typecheck
-
-# Production build
 npm run build
+```
+
+## Bundle performance budgets
+
+Per-route JavaScript and asset budgets are enforced in CI for the registration, history, analytics, and help routes.
+
+- **Budgets**: thresholds for initial and compressed (gzip/brotli) sizes are defined in the budget configuration file. A build that exceeds a budget fails CI.
+- **Reporting**: the budget check reports the offending route and the dependencies that contributed to the overage so the regression can be traced.
+- **Updating budgets**: intentional size increases require updating the budget configuration in the same pull request, which makes the change explicit and reviewable.
+
+Validation:
+
+```bash
+npm run build
+npm run test -- --run scripts/budgets
+npm run budgets
+```
+
+## Visual regression tests
+
+Deterministic screenshots cover the registration, history, and navigation screens at mobile, tablet, and desktop sizes.
+
+- **Determinism**: dynamic data (timestamps, random ids, live balances) is masked or stubbed so screenshots are stable across runs.
+- **Minimal masking**: masking is limited to genuinely dynamic regions; layout and static content are captured unmasked.
+- **Baseline approval**: when a visual change is intentional, regenerate the baselines and commit them with the pull request. Baseline updates are reviewed like code; unexplained baseline churn should be rejected.
+
+Validation:
+
+```bash
+npm run test:visual
+npm run test:visual -- --update   # regenerate baselines after an approved change
 ```
 
 ## Expanding the ESLint configuration

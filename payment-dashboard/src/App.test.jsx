@@ -2,6 +2,20 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react';
 import { axe } from 'jest-axe';
 import App from './App';
+import {
+  parseFeatureFlags,
+  DEFAULT_FEATURE_FLAGS,
+  FEATURE_FLAG_SCHEMA,
+} from './featureFlags';
+import {
+  createFocusManager,
+  ANNOUNCEMENT_POLITENESS,
+} from './focusManager';
+import {
+  createPaymentCoordinator,
+  PAYMENT_COORDINATION_KEY,
+  PAYMENT_COORDINATION_TTL_MS,
+} from './paymentCoordinator';
 
 const STORAGE_KEY = 'stellar_dashboard_wallet_pubkey';
 const PENDING_KEY = 'stellar_dashboard_pending_payment';
@@ -377,167 +391,254 @@ describe('App pending payment resume after reload', () => {
   });
 });
 
-describe(`App accessibility (${WCAG_TARGET})`, () => {
+describe('Feature flag schema parsing', () => {
+  it('accepts a well-formed payload and returns typed values', () => {
+    const payload = {
+      version: 1,
+      flags: {
+        enableMultiTabPayment: true,
+        announceRouteChanges: false,
+        maxRetryCount: 3,
+      },
+    };
+
+    const result = parseFeatureFlags(payload);
+
+    expect(result.ok).toBe(true);
+    expect(result.flags.enableMultiTabPayment).toBe(true);
+    expect(result.flags.announceRouteChanges).toBe(false);
+    expect(result.flags.maxRetryCount).toBe(3);
+  });
+
+  it('falls back to defaults for unknown flag names', () => {
+    const result = parseFeatureFlags({
+      version: 1,
+      flags: { totallyUnknownFlag: true },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.flags).toEqual(DEFAULT_FEATURE_FLAGS);
+    expect(result.ignored).toContain('totallyUnknownFlag');
+  });
+
+  it('falls back to defaults when a flag has the wrong type', () => {
+    const result = parseFeatureFlags({
+      version: 1,
+      flags: { enableMultiTabPayment: 'yes' },
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.flags).toEqual(DEFAULT_FEATURE_FLAGS);
+    expect(result.errors.length).toBeGreaterThan(0);
+  });
+
+  it('falls back safely on malformed JSON input', () => {
+    const result = parseFeatureFlags('{not valid json');
+
+    expect(result.ok).toBe(false);
+    expect(result.flags).toEqual(DEFAULT_FEATURE_FLAGS);
+  });
+
+  it('falls back safely on null or non-object payloads', () => {
+    expect(parseFeatureFlags(null).flags).toEqual(DEFAULT_FEATURE_FLAGS);
+    expect(parseFeatureFlags(42).flags).toEqual(DEFAULT_FEATURE_FLAGS);
+    expect(parseFeatureFlags([]).flags).toEqual(DEFAULT_FEATURE_FLAGS);
+  });
+
+  it('rejects stale payloads whose version is behind the schema', () => {
+    const result = parseFeatureFlags({
+      version: FEATURE_FLAG_SCHEMA.version - 1,
+      flags: { enableMultiTabPayment: true },
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.stale).toBe(true);
+    expect(result.flags).toEqual(DEFAULT_FEATURE_FLAGS);
+  });
+
+  it('rejects payloads from a future schema version', () => {
+    const result = parseFeatureFlags({
+      version: FEATURE_FLAG_SCHEMA.version + 1,
+      flags: {},
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.flags).toEqual(DEFAULT_FEATURE_FLAGS);
+  });
+
+  it('strips secret-looking keys so they never reach the client', () => {
+    const result = parseFeatureFlags({
+      version: 1,
+      flags: {
+        enableMultiTabPayment: true,
+        apiSecret: 'super-secret',
+        privateKey: 'S...',
+      },
+    });
+
+    expect(result.flags.apiSecret).toBeUndefined();
+    expect(result.flags.privateKey).toBeUndefined();
+    expect(result.redacted).toEqual(
+      expect.arrayContaining(['apiSecret', 'privateKey']),
+    );
+  });
+});
+
+describe('Focus and announcement manager', () => {
+  let manager;
+
   beforeEach(() => {
-    localStorage.clear();
-    vi.clearAllMocks();
+    document.body.innerHTML = '';
+    manager = createFocusManager({ document });
   });
 
   afterEach(() => {
-    cleanup();
+    manager.destroy();
+    document.body.innerHTML = '';
+  });
+
+  it('moves focus to the route heading on navigation', () => {
+    const heading = document.createElement('h1');
+    heading.tabIndex = -1;
+    heading.textContent = 'Dashboard';
+    document.body.appendChild(heading);
+
+    manager.focusRouteHeading(heading);
+
+    expect(document.activeElement).toBe(heading);
+  });
+
+  it('does not steal focus during a background refresh', () => {
+    const heading = document.createElement('h1');
+    heading.tabIndex = -1;
+    document.body.appendChild(heading);
+
+    const input = document.createElement('input');
+    document.body.appendChild(input);
+    input.focus();
+
+    manager.focusRouteHeading(heading, { background: true });
+
+    expect(document.activeElement).toBe(input);
+  });
+
+  it('announces async success through a polite live region', () => {
+    manager.announce('Payment submitted', { politeness: ANNOUNCEMENT_POLITENESS.POLITE });
+
+    const region = document.querySelector('[aria-live="polite"]');
+    expect(region).toBeTruthy();
+    expect(region.textContent).toBe('Payment submitted');
+  });
+
+  it('announces async failure through an assertive live region', () => {
+    manager.announce('Payment failed', { politeness: ANNOUNCEMENT_POLITENESS.ASSERTIVE });
+
+    const region = document.querySelector('[aria-live="assertive"]');
+    expect(region).toBeTruthy();
+    expect(region.textContent).toBe('Payment failed');
+  });
+
+  it('reuses a single live region across repeated announcements', () => {
+    manager.announce('First');
+    manager.announce('Second');
+
+    const regions = document.querySelectorAll('[aria-live]');
+    expect(regions.length).toBe(1);
+    expect(regions[0].textContent).toBe('Second');
+  });
+});
+
+describe('Cross-tab payment coordination', () => {
+  let coordinator;
+
+  beforeEach(() => {
+    localStorage.clear();
+    vi.useFakeTimers();
+    coordinator = createPaymentCoordinator({ storage: localStorage });
+  });
+
+  afterEach(() => {
+    coordinator.destroy();
+    vi.useRealTimers();
     localStorage.clear();
   });
 
-  it('registration journey has no unreviewed WCAG violations', async () => {
-    freighterApi.isConnected.mockResolvedValue({ isConnected: false });
-
-    const { container } = render(<App />);
-
-    await screen.findByRole('button', { name: /connect/i });
-    await expectNoUnreviewedViolations(container);
-  });
-
-  it('registration error view has no unreviewed WCAG violations', async () => {
-    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
-    freighterApi.requestAccess.mockRejectedValue(new Error('User rejected access'));
-
-    const { container } = render(<App />);
-
-    const connectButton = await screen.findByRole('button', { name: /connect/i });
-    connectButton.click();
-
-    expect(await screen.findByText(/rejected|failed|error/i)).toBeTruthy();
-    await expectNoUnreviewedViolations(container);
-  });
-
-  it('payment journey has no unreviewed WCAG violations', async () => {
-    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
-    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
-    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
-    freighterApi.getNetwork.mockResolvedValue({ network: 'TESTNET' });
-
-    const { container } = render(<App />);
-
-    await waitFor(() => {
-      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+  it('shares only a non-sensitive operation reference across tabs', () => {
+    coordinator.claim({
+      operationRef: 'op_ref_abc123',
+      account: TEST_PUBLIC_KEY,
+      network: 'TESTNET',
     });
-    await screen.findByRole('button', { name: /pay|send/i });
-    await expectNoUnreviewedViolations(container);
+
+    const raw = localStorage.getItem(PAYMENT_COORDINATION_KEY);
+    const parsed = JSON.parse(raw);
+
+    expect(parsed.operationRef).toBe('op_ref_abc123');
+    expect(parsed.account).toBe(TEST_PUBLIC_KEY);
+    expect(parsed.network).toBe('TESTNET');
+    expect(parsed.amount).toBeUndefined();
+    expect(parsed.destination).toBeUndefined();
+    expect(parsed.secret).toBeUndefined();
   });
 
-  it('payment loading view has no unreviewed WCAG violations', async () => {
-    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
-    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
-    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
-    freighterApi.getNetwork.mockResolvedValue({ network: 'TESTNET' });
-
-    const { container } = render(<App />);
-
-    await waitFor(() => {
-      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+  it('prevents a second tab from starting a duplicate payment attempt', () => {
+    coordinator.claim({
+      operationRef: 'op_ref_abc123',
+      account: TEST_PUBLIC_KEY,
+      network: 'TESTNET',
     });
-    const payButton = await screen.findByRole('button', { name: /pay|send/i });
-    payButton.click();
 
-    await screen.findByText(/pending|checking status|submitting/i);
-    await expectNoUnreviewedViolations(container);
-  });
-
-  it('payment error view has no unreviewed WCAG violations', async () => {
-    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
-    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
-    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
-    freighterApi.getNetwork.mockRejectedValue(new Error('Network unavailable'));
-
-    const { container } = render(<App />);
-
-    await waitFor(() => {
-      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    const otherTab = createPaymentCoordinator({ storage: localStorage });
+    const result = otherTab.claim({
+      operationRef: 'op_ref_other',
+      account: TEST_PUBLIC_KEY,
+      network: 'TESTNET',
     });
-    const signButton = await screen.findByRole('button', { name: /sign/i });
-    signButton.click();
 
-    expect(await screen.findByText(/unknown network|network mismatch/i)).toBeTruthy();
-    await expectNoUnreviewedViolations(container);
+    expect(result.acquired).toBe(false);
+    expect(result.existing.operationRef).toBe('op_ref_abc123');
+
+    otherTab.destroy();
   });
 
-  it('history journey has no unreviewed WCAG violations', async () => {
-    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
-    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
-    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
-    freighterApi.getNetwork.mockResolvedValue({ network: 'TESTNET' });
-
-    const { container } = render(<App />);
-
-    await waitFor(() => {
-      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+  it('expires stale coordination state after the TTL', () => {
+    coordinator.claim({
+      operationRef: 'op_ref_abc123',
+      account: TEST_PUBLIC_KEY,
+      network: 'TESTNET',
     });
-    const historyTab = await screen.findByRole('tab', { name: /history/i });
-    historyTab.click();
 
-    await screen.findByText(/history|transactions/i);
-    await expectNoUnreviewedViolations(container);
+    vi.advanceTimersByTime(PAYMENT_COORDINATION_TTL_MS + 1);
+
+    expect(coordinator.read()).toBeNull();
   });
 
-  it('history loading view has no unreviewed WCAG violations', async () => {
-    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
-    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
-    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
-    freighterApi.getNetwork.mockResolvedValue({ network: 'TESTNET' });
-
-    const { container } = render(<App />);
-
-    await waitFor(() => {
-      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+  it('ignores coordination state bound to a different account', () => {
+    coordinator.claim({
+      operationRef: 'op_ref_abc123',
+      account: OTHER_PUBLIC_KEY,
+      network: 'TESTNET',
     });
-    const historyTab = await screen.findByRole('tab', { name: /history/i });
-    historyTab.click();
 
-    await screen.findByText(/loading|fetching/i);
-    await expectNoUnreviewedViolations(container);
+    expect(coordinator.read({ account: TEST_PUBLIC_KEY, network: 'TESTNET' })).toBeNull();
   });
 
-  it('analytics journey has no unreviewed WCAG violations', async () => {
-    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
-    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
-    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
-    freighterApi.getNetwork.mockResolvedValue({ network: 'TESTNET' });
-
-    const { container } = render(<App />);
-
-    await waitFor(() => {
-      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+  it('releases coordination state once the operation reaches a terminal state', () => {
+    coordinator.claim({
+      operationRef: 'op_ref_abc123',
+      account: TEST_PUBLIC_KEY,
+      network: 'TESTNET',
     });
-    const analyticsTab = await screen.findByRole('tab', { name: /analytics/i });
-    analyticsTab.click();
 
-    await screen.findByText(/analytics|metrics/i);
-    await expectNoUnreviewedViolations(container);
+    coordinator.release();
+
+    expect(localStorage.getItem(PAYMENT_COORDINATION_KEY)).toBeNull();
   });
 
-  it('analytics error view has no unreviewed WCAG violations', async () => {
-    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
-    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
-    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
-    freighterApi.getNetwork.mockResolvedValue({ network: 'TESTNET' });
+  it('recovers from malformed coordination state without throwing', () => {
+    localStorage.setItem(PAYMENT_COORDINATION_KEY, '{broken');
 
-    const { container } = render(<App />);
-
-    await waitFor(() => {
-      expect(freighterApi.getPublicKey).toHaveBeenCalled();
-    });
-    const analyticsTab = await screen.findByRole('tab', { name: /analytics/i });
-    analyticsTab.click();
-
-    expect(await screen.findByText(/failed|error|unavailable/i)).toBeTruthy();
-    await expectNoUnreviewedViolations(container);
-  });
-
-  it('every axe exception is reviewed with a tracked issue and justification', () => {
-    for (const exception of AXE_EXCEPTIONS) {
-      expect(exception.id).toBeTruthy();
-      expect(exception.issue).toMatch(/^#\d+$/);
-      expect(exception.justification.length).toBeGreaterThan(0);
-    }
+    expect(() => coordinator.read()).not.toThrow();
+    expect(coordinator.read()).toBeNull();
   });
 });

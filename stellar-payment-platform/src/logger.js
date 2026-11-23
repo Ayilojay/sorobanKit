@@ -92,6 +92,61 @@ const redactSensitive = (obj) => {
   return clone;
 };
 
+// Structured helpers for background export job lifecycle events. Each helper
+// emits a single record with a stable `event` field plus the job identifiers
+// and progress/duration metadata so operators can trace an export end-to-end
+// (created -> started -> progress -> completed/cancelled/failed/expired) and
+// correlate recovery of interrupted jobs after a restart.
+const EXPORT_JOB_EVENTS = Object.freeze({
+  CREATED: 'export_job.created',
+  STARTED: 'export_job.started',
+  PROGRESS: 'export_job.progress',
+  CANCELLED: 'export_job.cancelled',
+  COMPLETED: 'export_job.completed',
+  FAILED: 'export_job.failed',
+  EXPIRED: 'export_job.expired',
+  RECOVERED: 'export_job.recovered',
+});
+
+const normaliseExportJobFields = (fields = {}) => {
+  const out = {};
+  if (fields.jobId !== undefined && fields.jobId !== null) out.jobId = String(fields.jobId);
+  if (fields.ownerId !== undefined && fields.ownerId !== null) out.ownerId = String(fields.ownerId);
+  if (fields.progress !== undefined && fields.progress !== null) out.progress = fields.progress;
+  if (fields.durationMs !== undefined && fields.durationMs !== null) out.durationMs = fields.durationMs;
+  if (fields.status !== undefined && fields.status !== null) out.status = fields.status;
+  if (fields.error !== undefined && fields.error !== null) {
+    out.error = fields.error instanceof Error ? fields.error.message : String(fields.error);
+  }
+  if (fields.reason !== undefined && fields.reason !== null) out.reason = String(fields.reason);
+  return out;
+};
+
+const logExportJobEvent = (event, fields = {}) => {
+  const record = { event, ...normaliseExportJobFields(fields) };
+  // Failures are logged at error level so they surface in alerting; everything
+  // else is informational lifecycle noise.
+  if (event === EXPORT_JOB_EVENTS.FAILED) {
+    logger.error(record, 'export job failed');
+  } else if (event === EXPORT_JOB_EVENTS.CANCELLED || event === EXPORT_JOB_EVENTS.EXPIRED) {
+    logger.warn(record, 'export job terminated');
+  } else {
+    logger.info(record, 'export job lifecycle');
+  }
+  return record;
+};
+
+const exportJobLogger = {
+  created: (fields) => logExportJobEvent(EXPORT_JOB_EVENTS.CREATED, fields),
+  started: (fields) => logExportJobEvent(EXPORT_JOB_EVENTS.STARTED, fields),
+  progress: (fields) => logExportJobEvent(EXPORT_JOB_EVENTS.PROGRESS, fields),
+  cancelled: (fields) => logExportJobEvent(EXPORT_JOB_EVENTS.CANCELLED, fields),
+  completed: (fields) => logExportJobEvent(EXPORT_JOB_EVENTS.COMPLETED, fields),
+  failed: (fields) => logExportJobEvent(EXPORT_JOB_EVENTS.FAILED, fields),
+  expired: (fields) => logExportJobEvent(EXPORT_JOB_EVENTS.EXPIRED, fields),
+  recovered: (fields) => logExportJobEvent(EXPORT_JOB_EVENTS.RECOVERED, fields),
+};
+
 const httpLogger = pinoHttp({
   logger,
   autoLogging: true,
@@ -120,4 +175,10 @@ const httpLogger = pinoHttp({
   }
 });
 
-module.exports = { logger, httpLogger, sanitiseStellarAddresses };
+module.exports = {
+  logger,
+  httpLogger,
+  sanitiseStellarAddresses,
+  exportJobLogger,
+  EXPORT_JOB_EVENTS,
+};

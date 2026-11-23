@@ -1,4 +1,4 @@
-import { useReducedMotion } from "../hooks/useReducedMotion";
+import { useRouteFocus } from "../focus/useRouteFocus";
 
 /**
  * @typedef {Object} MobileNavProps
@@ -23,18 +23,27 @@ function MobileNav({
   onRegisterClick,
   canRegister,
 }) {
-  const prefersReducedMotion = useReducedMotion();
+  const { focusRouteHeading } = useRouteFocus();
+
+  /**
+   * Wrap a navigation handler so the centralized focus manager moves focus to
+   * the destination route heading once the navigation has been triggered.
+   * @param {() => void} handler
+   * @returns {() => void}
+   */
+  const navigate = (handler) => () => {
+    handler();
+    focusRouteHeading();
+  };
 
   return (
-    <nav
-      className={`mobile-nav${prefersReducedMotion ? " mobile-nav--reduced-motion" : ""}`}
-      aria-label="Primary"
-      data-reduced-motion={prefersReducedMotion ? "true" : "false"}
-    >
+    <nav className="mobile-nav" aria-label="Primary" data-testid="mobile-nav">
       <button
         type="button"
+        data-testid="mobile-nav-dashboard"
+        data-active={active === "dashboard" ? "true" : "false"}
         className={active === "dashboard" ? "is-active" : ""}
-        onClick={onDashboardClick}
+        onClick={navigate(onDashboardClick)}
         aria-current={active === "dashboard" ? "page" : undefined}
       >
         <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -44,8 +53,10 @@ function MobileNav({
       </button>
       <button
         type="button"
+        data-testid="mobile-nav-history"
+        data-active={active === "history" ? "true" : "false"}
         className={active === "history" ? "is-active" : ""}
-        onClick={onHistoryClick}
+        onClick={navigate(onHistoryClick)}
         aria-current={active === "history" ? "page" : undefined}
       >
         <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -55,8 +66,10 @@ function MobileNav({
       </button>
       <button
         type="button"
+        data-testid="mobile-nav-analytics"
+        data-active={active === "analytics" ? "true" : "false"}
         className={active === "analytics" ? "is-active" : ""}
-        onClick={onAnalyticsClick}
+        onClick={navigate(onAnalyticsClick)}
         aria-current={active === "analytics" ? "page" : undefined}
       >
         <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -66,8 +79,10 @@ function MobileNav({
       </button>
       <button
         type="button"
+        data-testid="mobile-nav-help"
+        data-active={active === "help" ? "true" : "false"}
         className={active === "help" ? "is-active" : ""}
-        onClick={onHelpClick}
+        onClick={navigate(onHelpClick)}
         aria-current={active === "help" ? "page" : undefined}
       >
         <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -79,8 +94,10 @@ function MobileNav({
       {canRegister && (
         <button
           type="button"
+          data-testid="mobile-nav-register"
+          data-active={active === "register" ? "true" : "false"}
           className={active === "register" ? "is-active" : ""}
-          onClick={onRegisterClick}
+          onClick={navigate(onRegisterClick)}
           aria-current={active === "register" ? "page" : undefined}
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
