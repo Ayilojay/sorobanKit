@@ -14,6 +14,16 @@ Use this checklist for every deployment. Do not skip steps.
       (address/version/interface) before any timelocked authority change is
       scheduled. A candidate whose interface handshake does not match the
       expected version must be rejected and must not be delegated to.
+- [ ] Run the focused compatibility tests (contract interface handshake and
+      API/webhook contract tests) against the candidate build and confirm they
+      pass before promoting the release
+- [ ] Confirm a threat-model review has been completed and recorded for any
+      change touching payment settlement, webhook delivery, database failover,
+      or contract pause/authority paths
+- [ ] Review the incident runbooks in `docs/runbooks/` (delayed settlement,
+      webhook backlog, database failover, contract pause) and confirm the
+      on-call rotation has access to the linked dashboards and escalation
+      contacts
 
 ## Testnet Deployment
 
@@ -37,3 +47,14 @@ Use this checklist for every deployment. Do not skip steps.
 - [ ] Verify the deployed version/commit matches the intended release
 - [ ] Monitor logs and metrics for errors
 - [ ] Notify the team that the deployment is complete
+- [ ] If a rollback is required, follow the rollback procedure in the relevant
+      runbook under `docs/runbooks/` rather than improvising steps
+
+## Local Development Bootstrap
+
+- [ ] For local verification, use the one-command bootstrap
+      (`scripts/bootstrap.sh` or the documented `make bootstrap` target) instead
+      of manual service setup. It validates tool versions, starts isolated
+      services, applies migrations, and reports readiness, and fails with
+      actionable prerequisite messages. It must never target production
+      resources.

@@ -5,9 +5,19 @@
 #   docker compose --profile full up         the same, plus the built frontend
 #   docker compose --profile test up         API under test + its own database
 #   docker compose --profile integration up  local standalone Stellar network
+#   docker compose --profile local up        isolated bootstrap stack (see below)
 #
 # dev and test use separate databases on separate host ports, so both can run
 # at once without colliding.
+#
+# The `local` profile is the one-command development bootstrap (scripts/dev-bootstrap.*).
+# It is deliberately isolated from dev/test/integration: its own database
+# (stellar_tags_local on host port 5434), its own Redis (host port 6380), its
+# own backend port (5002), and its own named volumes. It never references
+# production resources, uses only local credentials, and every service has a
+# healthcheck so the bootstrap can wait for readiness before applying
+# migrations. Because the ports differ, `local` can run alongside `dev` and
+# `test` without collisions.
 #
 # Database ports are published to 127.0.0.1 only. Binding to localhost keeps
 # the dev and test Postgres instances reachable from the host (for psql, the
@@ -141,6 +151,71 @@ services:
       retries: 5
       start_period: 10s
 
+  # ── local (one-command bootstrap) ──────────────────────────────────────────
+  # Non-production defaults only: throwaway credentials, localhost-only
+  # bindings, and no external/production endpoints. Started by
+  # scripts/dev-bootstrap.* via `docker compose --profile local up`.
+  postgres-local:
+    profiles: ["local"]
+    image: postgres:16.9-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: stellar_tags_local
+    # 5434 on the host so dev (5432) and test (5433) can stay up. Bound to
+    # 127.0.0.1 so the local database is not reachable from the network.
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - postgres_local_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d stellar_tags_local"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis-local:
+    profiles: ["local"]
+    image: redis:7.4.2-alpine
+    # 6380 on the host so the dev redis (6379) can stay up.
+    ports:
+      - "127.0.0.1:6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend-local:
+    profiles: ["local"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: backend
+    # 5002 on the host so the dev backend (5000) can stay up.
+    ports:
+      - "127.0.0.1:5002:5000"
+    environment:
+      # Local-only defaults. No production URLs or secrets are referenced.
+      DATABASE_URL: postgresql://postgres:postgres@postgres-local:5432/stellar_tags_local?schema=public
+      REDIS_URL: redis://redis-local:6379
+      PORT: "5000"
+      LOG_DIR: /app/logs
+      NODE_ENV: development
+    volumes:
+      - backend_local_logs:/app/logs
+    depends_on:
+      postgres-local:
+        condition: service_healthy
+      redis-local:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+
   # ── integration ────────────────────────────────────────────────────────────
   # Standalone Stellar network (Soroban-enabled) used by the contract
   # integration tests. Exposes both the Horizon REST API (8000) and the
@@ -171,3 +246,7 @@ volumes:
   # Dev-profile Postgres data. Persists across down/up; remove it to start fresh.
   postgres_dev_data:
   backendlogs:
+  # Local-bootstrap Postgres data. Isolated from dev so a bootstrap reset never
+  # touches dev data. Remove it to start fresh.
+  postgres_local_data:
+  backend_local_logs:

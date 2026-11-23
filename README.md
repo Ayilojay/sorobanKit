@@ -831,6 +831,54 @@ remains active until acceptance. The current admin can cancel a nomination;
 anyone can clear it after expiry. `emergency_freeze` remains immediate, while
 unfreezing requires a matured `Unfreeze` action.
 
+## Security and threat model
+
+Assets, trust boundaries, attacker capabilities, mitigations and owners across
+wallet signing, admin actions, webhooks, persistence, RPC and contract
+governance are documented in
+[docs/security/threat-model.md](docs/security/threat-model.md). Read it before
+changing anything that crosses one of those boundaries (signature
+verification, admin credentials, webhook delivery, database access, Horizon
+calls, or timelocked contract actions).
+
+Operational response procedures live alongside it:
+
+- [docs/runbooks/payment-failures.md](docs/runbooks/payment-failures.md) —
+  delayed settlement, webhook backlog, contract pause events.
+- [docs/runbooks/infrastructure-failures.md](docs/runbooks/infrastructure-failures.md) —
+  database failover and dependency outages.
+
+Each runbook lists diagnostics, escalation, rollback and dashboard links, and
+only uses commands that are safe to run against the affected environment.
+
+## Local bootstrap
+
+`npm run bootstrap` (from the repository root) is the supported one-command
+local setup. It validates the required tool versions, starts the isolated
+`dev` Compose stack, applies migrations, seeds the database and reports
+readiness. It refuses to run against non-local resources and exits with an
+actionable message when a prerequisite is missing.
+
+```bash
+npm run bootstrap          # full setup
+npm run bootstrap -- --check   # validate prerequisites only
+```
+
+## Compatibility tests
+
+Contract and API compatibility is covered by focused suites that must pass
+before merging changes to the contract ABI, the OpenAPI document, or the
+generated bindings:
+
+```bash
+# contract ABI / interface compatibility
+cd payment_router && cargo test
+
+# API contract and generated-binding drift
+cd stellar-payment-platform && npm run test:contract
+cd payment-dashboard && npm run api:check
+```
+
 ## Architecture notes
 
 - The React dashboard runs on `http://localhost:3000` in dev (Vite) and provides the UI.

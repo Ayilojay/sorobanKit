@@ -3,7 +3,7 @@
   "info": {
     "title": "Stellar Tags API",
     "version": "1.0.0",
-    "description": "OpenAPI specification for the Stellar Tags API. Covers the documented endpoints for tags, addresses, activity, and stats. API errors use a stable envelope with a machine-readable code and retryable flag; validation details contain only field names and safe messages.\n\n## Soft-delete, restore, and username reuse semantics\n\n- **Reservation window**: when a tag (username) is soft-deleted, its name is reserved for a fixed `SOFT_DELETE_RESERVATION_DAYS` (default 30 days) from `deletedAt`. During this window the name cannot be claimed by any other owner.\n- **Restoration proof**: restoring a soft-deleted tag requires the original owner's authenticated identity (bearer token whose subject matches the tag's `ownerId`). The restore request must reference the tag id and the `deletedAt` value observed at deletion time; a mismatch (stale or already-restored) is rejected with `409 Conflict`.\n- **Post-expiry reuse**: once the reservation window elapses, the name becomes reusable. A new registration may claim it; the prior soft-deleted record is retained for audit but can no longer be restored (`410 Gone`).\n- **Transactional transitions**: delete, restore, and registration are enforced transactionally (row-level lock on the name). Concurrent delete/restore/registration cannot produce multiple active owners; losers receive `409 Conflict`.",
+    "description": "OpenAPI specification for the Stellar Tags API. Covers the documented endpoints for tags, addresses, activity, and stats. API errors use a stable envelope with a machine-readable code and retryable flag; validation details contain only field names and safe messages.\n\n## Soft-delete, restore, and username reuse semantics\n\n- **Reservation window**: when a tag (username) is soft-deleted, its name is reserved for a fixed `SOFT_DELETE_RESERVATION_DAYS` (default 30 days) from `deletedAt`. During this window the name cannot be claimed by any other owner.\n- **Restoration proof**: restoring a soft-deleted tag requires the original owner's authenticated identity (bearer token whose subject matches the tag's `ownerId`). The restore request must reference the tag id and the `deletedAt` value observed at deletion time; a mismatch (stale or already-restored) is rejected with `409 Conflict`.\n- **Post-expiry reuse**: once the reservation window elapses, the name becomes reusable. A new registration may claim it; the prior soft-deleted record is retained for audit but can no longer be restored (`410 Gone`).\n- **Transactional transitions**: delete, restore, and registration are enforced transactionally (row-level lock on the name). Concurrent delete/restore/registration cannot produce multiple active owners; losers receive `409 Conflict`.\n\n## API versioning and backward compatibility\n\n- **Version negotiation**: clients may pin a published contract version with the `X-API-Version` request header (e.g. `1.0.0`). When the header is absent the server uses the current contract version. Unknown or unsupported versions are rejected with `400 INVALID_INPUT`.\n- **Compatibility policy**: within a major version, changes are additive only. Existing response fields, types, and status codes are never removed or narrowed; new optional fields may be added. Breaking changes require a new major version.\n- **Deprecation window**: deprecated fields and endpoints are announced via the `Deprecation` and `Sunset` response headers and remain functional for at least `API_DEPRECATION_WINDOW_DAYS` (default 90 days) before removal in the next major version.\n- **Compatibility testing**: released client contracts are checked into the repository and replayed against candidate server behavior in CI; any breaking response or request change fails the build with a diff.",
     "license": {
       "name": "MIT"
     }
@@ -400,6 +400,13 @@
       }
     },
     "parameters": {
+      "ApiVersionParam": {
+        "name": "X-API-Version",
+        "in": "header",
+        "required": false,
+        "description": "Pinned published contract version (semver). Defaults to the current contract version when omitted. Unsupported versions are rejected with 400 INVALID_INPUT.",
+        "schema": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" }
+      },
       "PageParam": {
         "name": "page",
         "in": "query",
@@ -494,6 +501,20 @@
         }
       }
     },
+    "headers": {
+      "ApiVersion": {
+        "description": "The contract version used to serve the response.",
+        "schema": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" }
+      },
+      "Deprecation": {
+        "description": "Present when the endpoint or a field in the response is deprecated. Value is the RFC 9745 deprecation timestamp.",
+        "schema": { "type": "string" }
+      },
+      "Sunset": {
+        "description": "Present when the endpoint or a field in the response is deprecated. Value is the RFC 8594 sunset timestamp after which removal may occur (at least API_DEPRECATION_WINDOW_DAYS after Deprecation).",
+        "schema": { "type": "string" }
+      }
+    },
     "schemas": {
       "TagInput": {
         "type": "object",
@@ -512,6 +533,44 @@
           "address": { "type": "string" },
           "createdAt": { "type": "string", "format": "date-time" },
           "deletedAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "CompatibilityReport": {
+        "type": "object",
+        "description": "Result of replaying a released client contract against the candidate server behavior.",
+        "required": ["version", "compatible"],
+        "properties": {
+          "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+          "compatible": { "type": "boolean" },
+          "breakingChanges": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["path", "method", "kind", "diff"],
+              "properties": {
+                "path": { "type": "string" },
+                "method": { "type": "string" },
+                "kind": {
+                  "type": "string",
+                  "enum": ["response_field_removed", "response_type_changed", "status_code_removed", "request_field_required", "request_field_removed"]
+                },
+                "diff": { "type": "string" }
+              }
+            }
+          },
+          "deprecations": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["path", "method", "deprecatedAt", "sunsetAt"],
+              "properties": {
+                "path": { "type": "string" },
+                "method": { "type": "string" },
+                "deprecatedAt": { "type": "string", "format": "date-time" },
+                "sunsetAt": { "type": "string", "format": "date-time" }
+              }
+            }
+          }
         }
       },
       "TagList": {

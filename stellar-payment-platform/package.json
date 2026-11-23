@@ -6,7 +6,9 @@
   "scripts": {
     "start": "node server.js",
     "dev": "tsx watch server.js",
+    "dev:bootstrap": "node scripts/dev-bootstrap.js",
     "test": "jest --forceExit --maxWorkers=2",
+    "test:bootstrap": "jest --forceExit --maxWorkers=1 --testPathPattern=dev-bootstrap",
     "test:coverage": "jest --coverage --forceExit --maxWorkers=2",
     "test:memory": "node --expose-gc node_modules/.bin/jest --forceExit --testPathPattern=memory --globals '{\"gc\":true}'",
     "test:integration": "TEST_API_URL=http://localhost:5001 jest --forceExit --testPathPattern=integration",

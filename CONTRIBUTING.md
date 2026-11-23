@@ -10,6 +10,52 @@ requests.
 2. Install dependencies with your package manager of choice.
 3. Make your change, keeping the diff focused on the issue you are solving.
 
+### One-command local bootstrap
+
+For a reproducible local environment, use the supported bootstrap command
+instead of wiring services up by hand:
+
+```sh
+./scripts/bootstrap.sh
+```
+
+The bootstrap path:
+
+- **Validates tool versions.** It checks that the required toolchain
+  (package manager, runtime, and database client) is installed and meets the
+  minimum versions. If a prerequisite is missing or too old, it exits with an
+  actionable message naming the tool, the version found, and the version
+  required.
+- **Starts isolated services.** It brings up local-only services (database and
+  supporting dependencies) in an isolated namespace so they do not collide
+  with other local projects.
+- **Applies migrations.** It runs the pending database migrations against the
+  local database.
+- **Reports readiness.** On success it prints a readiness summary listing each
+  service and its status, so you can confirm the environment is usable before
+  running tests.
+
+The bootstrap refuses to run against production resources. It only targets the
+local, isolated configuration; if it detects a production endpoint it stops
+without making changes. Re-running the command is safe and idempotent.
+
+If bootstrap fails, read the reported prerequisite or service error, fix the
+underlying cause, and re-run. Do not work around a failed prerequisite check by
+pointing the bootstrap at shared or production resources.
+
+## Security and operations references
+
+Before changing wallet signing, admin actions, webhooks, persistence, RPC, or
+contract governance, review the published threat model. It documents the
+assets, trust boundaries, attacker capabilities, mitigations, and owners for
+each of those areas.
+
+If you are changing payment or infrastructure behavior, also review the
+incident runbooks. They describe safe procedures for delayed settlement,
+webhook backlog, database failover, and contract pause events, including
+diagnostics, escalation, rollback, dashboard links, and tested commands. Keep
+the runbooks up to date when your change affects those procedures.
+
 ## Running checks
 
 Before opening a pull request, run the focused workspace tests and the
