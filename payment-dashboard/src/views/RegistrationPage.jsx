@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { API_BASE, apiErrorMessage, walletKit } from './shared'; // <-- 1. Import walletKit instead of Freighter
 import { getLookup } from '../api/client';
 import { useConnectivity } from '../hooks/useConnectivity';
@@ -55,6 +55,35 @@ function RegistrationPage({
     setStatus({ text, tone });
   };
 
+  /**
+   * Announce async success/failure through the shared live region.
+   * @param {string} text
+   * @param {"success" | "error"} tone
+   */
+  const announceStatus = (text, tone) => {
+    setStatusMessage(text, tone);
+    announce(text, { politeness: tone === "error" ? "assertive" : "polite" });
+  };
+
+  /**
+   * Resolve a server error payload into actionable, accessible guidance.
+   * @param {unknown} data
+   * @param {string} [fallback]
+   */
+  const resolveApiError = (data, fallback = "Registration failed.") => {
+    const code =
+      data && typeof data === "object" && "code" in data
+        ? /** @type {{ code?: unknown }} */ (data).code
+        : undefined;
+    const guidance = getApiErrorGuidance(
+      typeof code === "string" ? code : undefined,
+    );
+    if (guidance) {
+      return guidance;
+    }
+    return { message: apiErrorMessage(data, fallback), retryable: false };
+  };
+
   useEffect(() => {
     if (!userPublicKey) {
       return;
@@ -93,7 +122,7 @@ function RegistrationPage({
         }
       });
     } catch {
-      setStatusMessage("Wallet connection cancelled or failed.", "error");
+      announceStatus("Wallet connection cancelled or failed.", "error");
     } finally {
       setIsConnecting(false);
     }
@@ -109,17 +138,17 @@ function RegistrationPage({
     const cleaned = username.trim();
 
     if (!userPublicKey) {
-      setStatusMessage("Connect a wallet before registering.", "error");
+      announceStatus("Connect a wallet before registering.", "error");
       return;
     }
 
     if (cleaned.length < 3) {
-      setStatusMessage("Username must be at least 3 characters.", "error");
+      announceStatus("Username must be at least 3 characters.", "error");
       return;
     }
 
     if (!USERNAME_REGEX.test(cleaned)) {
-      setStatusMessage(
+      announceStatus(
         "Username may only contain letters, numbers, hyphens, and underscores.",
         "error",
       );
@@ -204,13 +233,13 @@ function RegistrationPage({
       const message = err instanceof Error ? err.message : String(err);
       // Check if it's the specific LOBSTR unsupported error
       if (message.includes("signMessage")) {
-        setStatusMessage(
+        announceStatus(
           "LOBSTR does not support registration signatures. Please click 'Back to dashboard' to skip this step, or connect with Freighter.",
           "error"
         );
       } else {
         // Handle all other normal errors
-        setStatusMessage(message || "Signature request cancelled.", "error");
+        announceStatus(message || "Signature request cancelled.", "error");
       }
       setIsSubmitting(false);
       return;
@@ -261,9 +290,8 @@ function RegistrationPage({
               return null;
             }
 
-            throw new Error(
-              apiErrorMessage(data, "Registration failed."),
-            );
+            const guidance = resolveApiError(data, "Registration failed.");
+            throw new Error(guidance.message);
           }
           return data;
         })
@@ -271,7 +299,7 @@ function RegistrationPage({
           if (data === null) {
             return;
           }
-          setStatusMessage("Username reserved and saved.", "success");
+          announceStatus("Username reserved and saved.", "success");
 
           setTimeout(() => {
             if (typeof onRegistered === 'function') {
@@ -281,14 +309,14 @@ function RegistrationPage({
         })
         .catch((error) => {
           const message = error instanceof Error ? error.message : String(error);
-          setStatusMessage(message || "Registration failed.", "error");
+          announceStatus(message || "Registration failed.", "error");
         })
         .finally(() => {
           setIsSubmitting(false);
         });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      setStatusMessage(message || "Registration failed.", "error");
+      announceStatus(message || "Registration failed.", "error");
     } finally {
       setIsSubmitting(false);
     }
@@ -301,7 +329,9 @@ function RegistrationPage({
           <div className="brand-mark">S</div>
           <div>
             <p className="brand-eyebrow">Stellar Pay</p>
-            <h1>Claim your on-chain identity.</h1>
+            <h1 ref={headingRef} tabIndex={-1}>
+              Claim your on-chain identity.
+            </h1>
           </div>
         </div>
         <p className="hero-copy">

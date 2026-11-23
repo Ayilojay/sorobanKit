@@ -1,9 +1,11 @@
-import { Fragment, useCallback, useEffect, useState } from 'react';
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
 import NetworkBadge from '../NetworkBadge';
 import ScrollToTop from '../ScrollToTop';
 import LoadingSpinner from '../LoadingSpinner';
 import MobileNav from './MobileNav';
 import { NAV_STORAGE_KEY, formatShortAddress, useNavState, useWalletMenu } from './shared';
+import { useFocusAnnouncement } from '../focusAnnouncement';
+import { getApiErrorMessage } from '../apiErrorCatalog';
 
 const HISTORY_CACHE_KEY = 'stellar-history-cache';
 
@@ -133,6 +135,11 @@ function HistoryPage({
   const [isConnecting, setIsConnecting] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [historyError, setHistoryError] = useState("");
+  const headingRef = useRef(null);
+  const { announce, liveRegion } = useFocusAnnouncement({
+    routeKey: "history",
+    headingRef,
+  });
   /** @type {[HistoryEntry[], (value: HistoryEntry[] | ((prev: HistoryEntry[]) => HistoryEntry[])) => void]} */
   const [history, setHistory] = useState([]);
   /** @type {[string | null, (value: string | null | ((prev: string | null) => string | null)) => void]} */
@@ -198,7 +205,11 @@ function HistoryPage({
         const url = `${HORIZON_BASE}/transactions/export?account=${encodeURIComponent(userPublicKey)}&page=${pageNumber}&limit=${PAGE_LIMIT}`;
         const response = await fetch(url, { signal, cache: "no-store" });
         if (!response.ok) {
-          throw new Error(`Export error (${response.status}).`);
+          throw new Error(
+            getApiErrorMessage(response.status, {
+              fallback: "Unable to load transaction history.",
+            }),
+          );
         }
 
         const data = await response.json();
@@ -341,7 +352,7 @@ function HistoryPage({
         setIsLoading(false);
       }
     },
-    [onRefreshBalance, userPublicKey, PAGE_LIMIT],
+    [announce, onRefreshBalance, userPublicKey, PAGE_LIMIT],
   );
 
   const handlePreviousPage = () => {
@@ -453,7 +464,9 @@ function HistoryPage({
             <span />
           </button>
           <div>
-            <h2 className="headline">Transaction history</h2>
+            <h2 className="headline" ref={headingRef} tabIndex={-1}>
+              Transaction history
+            </h2>
             <p className="subtle">
               Connect your wallet to review recent transactions.
             </p>
@@ -680,6 +693,7 @@ function HistoryPage({
         canRegister={canRegister}
       />
       <ScrollToTop />
+      {liveRegion}
     </div>
   );
 }

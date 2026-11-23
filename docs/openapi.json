@@ -221,7 +221,10 @@
         "tags": ["Tags"],
         "summary": "Create a tag",
         "operationId": "createTag",
-        "description": "Registers a new tag (username). If the name was soft-deleted and its reservation window has not expired, registration is rejected with `409 Conflict`. Once the window expires the name is reusable.",
+        "description": "Registers a new tag (username). If the name was soft-deleted and its reservation window has not expired, registration is rejected with `409 Conflict`. Once the window expires the name is reusable. Supports idempotent submission via `X-Idempotency-Key`; replays return the original outcome with `X-Idempotent-Replay: true`.",
+        "parameters": [
+          { "$ref": "#/components/parameters/IdempotencyKeyParam" }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -269,6 +272,10 @@
         "tags": ["Tags"],
         "summary": "Update a tag",
         "operationId": "updateTag",
+        "description": "Supports idempotent submission via `X-Idempotency-Key`; replays return the original outcome with `X-Idempotent-Replay: true`.",
+        "parameters": [
+          { "$ref": "#/components/parameters/IdempotencyKeyParam" }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -295,7 +302,10 @@
         "tags": ["Tags"],
         "summary": "Soft-delete a tag",
         "operationId": "deleteTag",
-        "description": "Soft-deletes the tag and starts the reservation window (`SOFT_DELETE_RESERVATION_DAYS`, default 30 days) during which the name cannot be reused. The transition is transactional; concurrent deletes/restores/registrations cannot create multiple owners.",
+        "description": "Soft-deletes the tag and starts the reservation window (`SOFT_DELETE_RESERVATION_DAYS`, default 30 days) during which the name cannot be reused. The transition is transactional; concurrent deletes/restores/registrations cannot create multiple owners. Supports idempotent submission via `X-Idempotency-Key`; replays return the original outcome with `X-Idempotent-Replay: true`.",
+        "parameters": [
+          { "$ref": "#/components/parameters/IdempotencyKeyParam" }
+        ],
         "responses": {
           "204": { "description": "Tag soft-deleted" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
@@ -312,8 +322,11 @@
         "tags": ["Tags"],
         "summary": "Restore a soft-deleted tag",
         "operationId": "restoreTag",
-        "description": "Restores a soft-deleted tag within its reservation window. Requires the original owner's authenticated identity and the `deletedAt` value observed at deletion time as restoration proof. Fails with `409 Conflict` on stale/already-restored state and `410 Gone` after the reservation window expires.",
+        "description": "Restores a soft-deleted tag within its reservation window. Requires the original owner's authenticated identity and the `deletedAt` value observed at deletion time as restoration proof. Fails with `409 Conflict` on stale/already-restored state and `410 Gone` after the reservation window expires. Supports idempotent submission via `X-Idempotency-Key`; replays return the original outcome with `X-Idempotent-Replay: true`.",
         "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "$ref": "#/components/parameters/IdempotencyKeyParam" }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -523,11 +536,21 @@
         "required": true,
         "description": "Token identifier (asset code or contract address)",
         "schema": { "type": "string" }
+      },
+      "IdempotencyKeyParam": {
+        "name": "X-Idempotency-Key",
+        "in": "header",
+        "required": false,
+        "description": "Client-generated idempotency key scoped to the authenticated principal and operation. Reusing the key for retries of the same logical operation returns the original outcome and sets `X-Idempotent-Replay: true`. Generate a fresh key per logical operation; keys expire.",
+        "schema": { "type": "string", "minLength": 8, "maxLength": 255 }
       }
     },
     "responses": {
       "ApiErrorResponse": {
-        "description": "A standardized API error",
+        "description": "A standardized API error. Clients map `error.code` to a central catalog for actionable, accessible recovery guidance, fall back safely for unknown codes, honor `error.retryable` for retry behavior, and display `reference_id` for support correlation.",
+        "headers": {
+          "X-Idempotent-Replay": { "$ref": "#/components/headers/IdempotentReplayHeader" }
+        },
         "content": {
           "application/json": {
             "schema": { "$ref": "#/components/schemas/Error" }
@@ -714,8 +737,14 @@
                   "SERVICE_UNAVAILABLE"
                 ]
               },
-              "message": { "type": "string" },
-              "retryable": { "type": "boolean" },
+              "message": {
+                "type": "string",
+                "description": "Safe, human-readable message. Clients should prefer their central code-to-message catalog and use this only as a fallback."
+              },
+              "retryable": {
+                "type": "boolean",
+                "description": "Whether the client may retry the same operation. When `true`, retry with backoff (reusing the same `X-Idempotency-Key` for state-changing requests). When `false`, do not auto-retry; surface remediation guidance instead."
+              },
               "details": {
                 "type": "array",
                 "items": {
@@ -729,8 +758,14 @@
               }
             }
           },
-          "correlation_id": { "type": "string" },
-          "reference_id": { "type": "string" }
+          "correlation_id": {
+            "type": "string",
+            "description": "Opaque tracing identifier. Safe to display and log; never contains internal details."
+          },
+          "reference_id": {
+            "type": "string",
+            "description": "Safe, opaque, non-sensitive reference identifier for support correlation. Display to the user when present. Never a secret and never contains server internals."
+          }
         }
       },
       "HealthStatus": {

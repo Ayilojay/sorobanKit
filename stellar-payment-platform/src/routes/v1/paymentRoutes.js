@@ -17,10 +17,10 @@ const {
 module.exports = (redisClient) => {
   const router = express.Router();
   
-  router.use(idempotencyMiddleware(redisClient));
-
   // ── Idempotency protection for payment intent creation (POST /payments/bulk).
-  // Duplicate submissions within 24h return the originally created intents. ──
+  // Duplicate submissions within 24h (including from other browser tabs) return
+  // the originally created intents. Registered once so the Idempotency-Key
+  // header is honored exactly once per request. ──
   router.use(idempotencyMiddleware(redisClient));
 
   // POST /payments/bulk

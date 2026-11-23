@@ -7,6 +7,7 @@ import ThemeToggle from './components/ThemeToggle';
 import { useTheme } from './hooks/useTheme';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
 import { HORIZON_BASE, API_BASE, walletKit } from './views/shared';
+import { loadFeatureFlags } from './featureFlags';
 
 const Dashboard = lazy(() => import('./views/Dashboard.jsx'));
 const HelpPage = lazy(() => import('./views/HelpPage.jsx'));

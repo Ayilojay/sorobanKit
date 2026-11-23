@@ -7,6 +7,10 @@ import {
   LobstrModule
 } from '@creit.tech/stellar-wallets-kit';
 import { useEffect, useRef, useState } from 'react';
+import {
+  describeApiError,
+  getApiErrorDetails,
+} from '../api/errorCatalog';
 
 export { API_BASE } from '../api/baseUrl';
 
@@ -66,31 +70,19 @@ export const resolveRecipient = async (inputValue) => {
 /**
  * Pulls a displayable message out of an API error body.
  *
- * The API answers `{ success: false, error: { code, message, details } }`. The
- * flat `error`/`detail`/`message` fallbacks cover responses that do not come
- * from the platform's error handler, such as a proxy or CDN error page.
+ * Platform errors (`{ success: false, error: { code, message, details } }`) are
+ * resolved through the central error catalog so views never surface raw server
+ * messages or internals. Responses that do not come from the platform's error
+ * handler (proxy/CDN pages, flat `error`/`detail`/`message` bodies) fall back to
+ * the caller-provided message.
  *
  * @param {unknown} data
  * @param {string} fallback
  * @returns {string}
  */
 export const apiErrorMessage = (data, fallback) => {
-  if (data && typeof data === 'object') {
-    const { error } = data;
-    if (error && typeof error === 'object' && error.message) {
-      return error.message;
-    }
-    if (typeof error === 'string' && error) {
-      return error;
-    }
-    if (typeof data.detail === 'string' && data.detail) {
-      return data.detail;
-    }
-    if (typeof data.message === 'string' && data.message) {
-      return data.message;
-    }
-  }
-  return fallback;
+  const described = describeApiError(data, fallback);
+  return described.message;
 };
 
 /**
@@ -99,13 +91,7 @@ export const apiErrorMessage = (data, fallback) => {
  * @param {unknown} data
  * @returns {unknown[]}
  */
-export const apiErrorDetails = (data) => {
-  const details =
-    data && typeof data === 'object' && 'error' in data
-      ? /** @type {{ error?: { details?: unknown } }} */ (data).error?.details
-      : undefined;
-  return Array.isArray(details) ? details : [];
-};
+export const apiErrorDetails = (data) => getApiErrorDetails(data);
 
 export const formatUsername = (value) => {
   if (!value) {
