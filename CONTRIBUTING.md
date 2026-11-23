@@ -63,6 +63,7 @@ verification and review; they are never connected to production.
 ## Pull requests
 
 - Keep changes scoped to the issue being addressed.
+=======
 - Update operational, API, contract, migration, or contributor documentation
   and generated artifacts where your change affects them.
 - Describe the validation you performed, including exact commands and results.

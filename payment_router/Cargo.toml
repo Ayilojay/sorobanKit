@@ -35,3 +35,19 @@ lto = true
 [package.metadata]
 strict-clippy = true
 clippy-note = "CI enforces 'cargo clippy --all-targets --all-features -- -D warnings'"
+
+[package.metadata.sbom]
+# SBOM generation metadata for the Rust contract artifact.
+# Consumed by the release SBOM step to produce a consistent inventory
+# tied to the source revision and the optimized WASM artifact digest.
+format = "CycloneDX"
+spec-version = "1.5"
+tool = "cargo-cyclonedx"
+tool-version = "0.5"
+artifact = "payment_router.wasm"
+artifact-path = "target/wasm32-unknown-unknown/release/payment_router.wasm"
+digest-algorithm = "sha256"
+digest-field = "artifact-digest"
+digest-scope = "optimized-wasm"
+source-revision-field = "source-revision"
+output = "payment_router.cdx.json"

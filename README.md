@@ -385,6 +385,62 @@ import { get_refund_balance } from '@stellar-tags/payment-router';
 Importing one method no longer pulls the rest of the binding module into the
 Vite bundle.
 
+## Software Bill of Materials (SBOM)
+
+Every releasable artifact ships with a CycloneDX JSON inventory so consumers can
+audit exactly what went into a release and tie it back to the source revision
+and the artifact digest.
+
+### What gets an SBOM
+
+| Artifact | Produced by | SBOM covers |
+| --- | --- | --- |
+| Node packages (`stellar-payment-platform`, `payment-dashboard`, `packages/types`) | `npm run sbom` in each package | `package-lock.json` dependency tree |
+| Rust contract WASM (`payment_router`) | `cargo build --release --target wasm32-unknown-unknown` | `Cargo.lock` crates plus the compiled `.wasm` |
+| Container images (backend, frontend) | `docker build` | OS packages and the bundled Node/Rust artifacts |
+
+### Format and naming
+
+SBOMs are emitted as **CycloneDX JSON** (`bomFormat: "CycloneDX"`, spec version
+1.5) and named:
+
+```text
+<artifact>-<version>-<sha>.cdx.json
+```
+
+`<artifact>` is the package or image name, `<version>` is the release version
+(or `0.0.0-dev` for unreleased builds), and `<sha>` is the first 12 characters
+of the artifact digest — the npm tarball SHA-512 for Node packages, the WASM
+SHA-256 for the contract, and the image digest for containers. Each document
+records the source revision in `metadata.component.properties` as
+`vcs.revision` (the full git commit SHA) alongside `vcs.url`.
+
+### Attaching SBOMs to releases
+
+The release workflow runs `scripts/generate-sbom.sh` for each artifact and
+uploads the resulting `*.cdx.json` files as assets on the GitHub Release, next
+to the artifact they describe. A release is not considered complete until every
+artifact has a matching SBOM.
+
+### Generating and verifying locally
+
+```bash
+# Generate SBOMs for all artifacts into ./sbom/
+./scripts/generate-sbom.sh --all --out ./sbom
+
+# Generate for a single artifact
+./scripts/generate-sbom.sh --artifact payment_router --out ./sbom
+
+# Verify an SBOM matches a source revision and artifact digest
+./scripts/generate-sbom.sh --verify ./sbom/payment_router-1.2.0-<sha>.cdx.json \
+  --revision "$(git rev-parse HEAD)" \
+  --digest "sha256:<artifact-sha256>"
+```
+
+`--verify` recomputes the artifact digest, compares it with the digest recorded
+in the SBOM, and checks that `vcs.revision` matches the supplied revision. It
+exits non-zero on any mismatch, so it can be used as a release gate or in CI.
+
 ## Webhook signature verification
 
 Every webhook delivery includes an HMAC-SHA256 signature in the
