@@ -62,6 +62,10 @@ const {
   createBreaker,
   HORIZON_BASE,
   BREAKER_THRESHOLD,
+  observeSubmissionToFinality,
+  getConfirmationLagSnapshot,
+  resetConfirmationLagMetrics,
+  CONFIRMATION_LAG_OBJECTIVE_MS,
 } = require('../src/services/stellarService');
 
 describe('StellarService — Circuit Breaker', () => {
@@ -259,6 +263,194 @@ describe('StellarService — Circuit Breaker', () => {
 
       const nextPage = await result.next();
       expect(nextPage).toEqual({ records: [] });
+    });
+  });
+
+  describe('ledger confirmation lag instrumentation', () => {
+    beforeEach(() => {
+      resetConfirmationLagMetrics();
+    });
+
+    it('exports a documented confirmation lag objective', () => {
+      expect(typeof CONFIRMATION_LAG_OBJECTIVE_MS).toBe('number');
+      expect(CONFIRMATION_LAG_OBJECTIVE_MS).toBeGreaterThan(0);
+    });
+
+    it('records submission-to-finality observations labeled by network and outcome', () => {
+      observeSubmissionToFinality({
+        network: 'testnet',
+        outcome: 'success',
+        submittedAt: 1000,
+        finalizedAt: 3500,
+      });
+
+      const snapshot = getConfirmationLagSnapshot();
+      const series = snapshot.series.find(
+        (s) => s.network === 'testnet' && s.outcome === 'success'
+      );
+
+      expect(series).toBeDefined();
+      expect(series.count).toBe(1);
+      expect(series.lagMs).toBe(2500);
+    });
+
+    it('never includes user identifiers in metric labels', () => {
+      observeSubmissionToFinality({
+        network: 'testnet',
+        outcome: 'success',
+        submittedAt: 0,
+        finalizedAt: 1000,
+        account: 'GABCDEF1234567890',
+        intentId: 'intent-42',
+        txHash: 'deadbeef',
+      });
+
+      const snapshot = getConfirmationLagSnapshot();
+      const serialized = JSON.stringify(snapshot);
+
+      expect(serialized).not.toContain('GABCDEF1234567890');
+      expect(serialized).not.toContain('intent-42');
+      expect(serialized).not.toContain('deadbeef');
+
+      for (const series of snapshot.series) {
+        expect(Object.keys(series.labels).sort()).toEqual(['network', 'outcome']);
+      }
+    });
+
+    it('aggregates percentiles across multiple observations', () => {
+      const lags = [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000];
+      lags.forEach((lag, i) => {
+        observeSubmissionToFinality({
+          network: 'mainnet',
+          outcome: 'success',
+          submittedAt: i * 10000,
+          finalizedAt: i * 10000 + lag,
+        });
+      });
+
+      const snapshot = getConfirmationLagSnapshot();
+      const series = snapshot.series.find(
+        (s) => s.network === 'mainnet' && s.outcome === 'success'
+      );
+
+      expect(series.count).toBe(10);
+      expect(series.p50).toBeGreaterThanOrEqual(500);
+      expect(series.p50).toBeLessThanOrEqual(600);
+      expect(series.p95).toBeGreaterThanOrEqual(900);
+      expect(series.p95).toBeLessThanOrEqual(1000);
+      expect(series.p99).toBeGreaterThanOrEqual(900);
+    });
+
+    it('tracks failures separately from successes', () => {
+      observeSubmissionToFinality({
+        network: 'testnet',
+        outcome: 'success',
+        submittedAt: 0,
+        finalizedAt: 1000,
+      });
+      observeSubmissionToFinality({
+        network: 'testnet',
+        outcome: 'failure',
+        submittedAt: 0,
+        finalizedAt: 5000,
+      });
+
+      const snapshot = getConfirmationLagSnapshot();
+      expect(snapshot.series).toHaveLength(2);
+      expect(
+        snapshot.series.find((s) => s.outcome === 'success').count
+      ).toBe(1);
+      expect(
+        snapshot.series.find((s) => s.outcome === 'failure').count
+      ).toBe(1);
+    });
+
+    it('flags breach when p95 exceeds the documented objective', () => {
+      for (let i = 0; i < 20; i++) {
+        observeSubmissionToFinality({
+          network: 'mainnet',
+          outcome: 'success',
+          submittedAt: 0,
+          finalizedAt: CONFIRMATION_LAG_OBJECTIVE_MS * 2,
+        });
+      }
+
+      const snapshot = getConfirmationLagSnapshot();
+      const series = snapshot.series.find(
+        (s) => s.network === 'mainnet' && s.outcome === 'success'
+      );
+
+      expect(series.objectiveBreached).toBe(true);
+    });
+
+    it('does not flag breach when p95 is within the documented objective', () => {
+      for (let i = 0; i < 20; i++) {
+        observeSubmissionToFinality({
+          network: 'mainnet',
+          outcome: 'success',
+          submittedAt: 0,
+          finalizedAt: Math.floor(CONFIRMATION_LAG_OBJECTIVE_MS / 2),
+        });
+      }
+
+      const snapshot = getConfirmationLagSnapshot();
+      const series = snapshot.series.find(
+        (s) => s.network === 'mainnet' && s.outcome === 'success'
+      );
+
+      expect(series.objectiveBreached).toBe(false);
+    });
+
+    it('ignores observations with missing or invalid timestamps', () => {
+      observeSubmissionToFinality({
+        network: 'testnet',
+        outcome: 'success',
+        submittedAt: undefined,
+        finalizedAt: 1000,
+      });
+      observeSubmissionToFinality({
+        network: 'testnet',
+        outcome: 'success',
+        submittedAt: 2000,
+        finalizedAt: 1000,
+      });
+
+      const snapshot = getConfirmationLagSnapshot();
+      expect(snapshot.series).toHaveLength(0);
+    });
+
+    it('resetConfirmationLagMetrics clears accumulated observations', () => {
+      observeSubmissionToFinality({
+        network: 'testnet',
+        outcome: 'success',
+        submittedAt: 0,
+        finalizedAt: 1000,
+      });
+      expect(getConfirmationLagSnapshot().series).toHaveLength(1);
+
+      resetConfirmationLagMetrics();
+      expect(getConfirmationLagSnapshot().series).toHaveLength(0);
+    });
+
+    it('handles concurrent observations without losing counts', async () => {
+      const observations = Array.from({ length: 50 }, (_, i) =>
+        Promise.resolve().then(() =>
+          observeSubmissionToFinality({
+            network: 'testnet',
+            outcome: 'success',
+            submittedAt: i * 1000,
+            finalizedAt: i * 1000 + 500,
+          })
+        )
+      );
+
+      await Promise.all(observations);
+
+      const snapshot = getConfirmationLagSnapshot();
+      const series = snapshot.series.find(
+        (s) => s.network === 'testnet' && s.outcome === 'success'
+      );
+      expect(series.count).toBe(50);
     });
   });
 

@@ -383,6 +383,124 @@ describe('Prometheus Metrics Endpoint', () => {
     });
   });
 
+  // Issues #474 / #475 — SLI metrics for registration, federation lookup and
+  // payment flows, plus ledger-confirmation lag and reconciliation backlog.
+  // These tests assert the metric families exist, that their labels are
+  // low-cardinality, and that no user identifiers (addresses, emails,
+  // usernames) ever leak into label values.
+  describe('SLI and SLO metrics (issues #474, #475)', () => {
+    const USER_IDENTIFIER_PATTERNS = [
+      /G[A-Z2-7]{55}/, // Stellar account address
+      /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/, // email
+      /user\d+/, // generated usernames
+      /alice/i,
+    ];
+
+    const collectLabelValues = (metricsText) => {
+      const values = [];
+      const labelRegex = /[a-zA-Z_][a-zA-Z0-9_]*="([^"]*)"/g;
+      let match;
+      while ((match = labelRegex.exec(metricsText)) !== null) {
+        values.push(match[1]);
+      }
+      return values;
+    };
+
+    const expectNoUserIdentifiers = (metricsText) => {
+      for (const value of collectLabelValues(metricsText)) {
+        for (const pattern of USER_IDENTIFIER_PATTERNS) {
+          expect(value).not.toMatch(pattern);
+        }
+      }
+    };
+
+    test('should expose registration SLI metrics with bounded labels', async () => {
+      await request(app)
+        .post('/api/v1/register')
+        .send({ username: 'alice', email: 'alice@example.com' });
+
+      const response = await request(app).get('/metrics');
+      const metricsText = response.text;
+
+      expect(metricsText).toContain('stellar_tags_sli_registration_total');
+      expect(metricsText).toContain('stellar_tags_sli_registration_duration_seconds');
+      expect(metricsText).toMatch(/stellar_tags_sli_registration_total\{.*outcome="(success|failure)"/);
+      expectNoUserIdentifiers(metricsText);
+    });
+
+    test('should expose federation lookup SLI metrics with bounded labels', async () => {
+      await request(app)
+        .get('/federation')
+        .query({ type: 'name', q: 'alice*example.com' });
+
+      const response = await request(app).get('/metrics');
+      const metricsText = response.text;
+
+      expect(metricsText).toContain('stellar_tags_sli_federation_lookup_total');
+      expect(metricsText).toContain('stellar_tags_sli_federation_lookup_duration_seconds');
+      expect(metricsText).toMatch(/stellar_tags_sli_federation_lookup_total\{.*outcome="(hit|miss|error)"/);
+      expectNoUserIdentifiers(metricsText);
+    });
+
+    test('should expose payment flow SLI metrics with bounded labels', async () => {
+      await request(app)
+        .post('/api/v1/payments')
+        .send({ destination: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF', amount: '1' });
+
+      const response = await request(app).get('/metrics');
+      const metricsText = response.text;
+
+      expect(metricsText).toContain('stellar_tags_sli_payment_total');
+      expect(metricsText).toContain('stellar_tags_sli_payment_duration_seconds');
+      expect(metricsText).toMatch(/stellar_tags_sli_payment_total\{.*outcome="(success|failure)"/);
+      expectNoUserIdentifiers(metricsText);
+    });
+
+    test('should expose submission-to-finality percentile metrics by network', async () => {
+      const response = await request(app).get('/metrics');
+      const metricsText = response.text;
+
+      expect(metricsText).toContain('stellar_tags_ledger_confirmation_lag_seconds');
+      expect(metricsText).toMatch(/stellar_tags_ledger_confirmation_lag_seconds\{.*network="(testnet|mainnet|futurenet)"/);
+      expectNoUserIdentifiers(metricsText);
+    });
+
+    test('should expose oldest unreconciled intent age by network', async () => {
+      const response = await request(app).get('/metrics');
+      const metricsText = response.text;
+
+      expect(metricsText).toContain('stellar_tags_reconciliation_oldest_intent_age_seconds');
+      expect(metricsText).toMatch(/stellar_tags_reconciliation_oldest_intent_age_seconds\{.*network="(testnet|mainnet|futurenet)"/);
+      expectNoUserIdentifiers(metricsText);
+    });
+
+    test('should not leak user identifiers into SLI labels after many distinct users', async () => {
+      for (let i = 0; i < 25; i += 1) {
+        await request(app)
+          .post('/api/v1/register')
+          .send({ username: `user${i}`, email: `user${i}@example.com` });
+        await request(app)
+          .get('/federation')
+          .query({ type: 'name', q: `user${i}*example.com` });
+      }
+
+      const response = await request(app).get('/metrics');
+      const metricsText = response.text;
+
+      expectNoUserIdentifiers(metricsText);
+
+      // The registration outcome label set must stay bounded regardless of
+      // how many distinct users registered.
+      const outcomes = new Set();
+      const outcomeRegex = /stellar_tags_sli_registration_total\{[^}]*outcome="([^"]*)"/g;
+      let match;
+      while ((match = outcomeRegex.exec(metricsText)) !== null) {
+        outcomes.add(match[1]);
+      }
+      expect(outcomes.size).toBeLessThanOrEqual(2);
+    });
+  });
+
   describe('Prometheus format compliance', () => {
     test('should return properly formatted Prometheus text', async () => {
       const response = await request(app).get('/metrics');
