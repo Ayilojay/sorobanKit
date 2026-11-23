@@ -11,6 +11,7 @@ import MobileNav from './MobileNav';
 import RecentAddresses from '../components/RecentAddresses';
 import { useRecentAddresses } from '../useRecentAddresses';
 import { getFederation, getLookup } from '../api/client';
+import { useConnectivity } from '../useConnectivity';
 import {
   API_BASE,
   NAV_STORAGE_KEY,
@@ -59,6 +60,7 @@ function Dashboard({
   canRegister,
 }) {
   const [isNavOpen, setIsNavOpen] = useNavState();
+  const { isOnline } = useConnectivity();
   const {
     menuRef,
     isOpen: isWalletMenuOpen,
@@ -153,10 +155,16 @@ function Dashboard({
     [parsedAmount],
   );
 
-  // Derived state: whether the payment form can be submitted.
+  // Derived state: whether the payment form can be submitted. Mutations are
+  // disabled while offline so no financial operation is ever queued.
   const canSubmitPayment = useMemo(
-    () => hasValidRecipient && hasValidAmount && !isSubmitting && !isProcessing,
-    [hasValidRecipient, hasValidAmount, isSubmitting, isProcessing],
+    () =>
+      hasValidRecipient &&
+      hasValidAmount &&
+      !isSubmitting &&
+      !isProcessing &&
+      isOnline,
+    [hasValidRecipient, hasValidAmount, isSubmitting, isProcessing, isOnline],
   );
 
   // Derived state: recent addresses list, recomputed only when it changes.
@@ -294,6 +302,10 @@ function Dashboard({
 
   const handleLookup = async () => {
     if (isSubmitting) return;
+    if (!isOnline) {
+      toast.error("You are offline. Payments are disabled until you reconnect.");
+      return;
+    }
     setIsSubmitting(true);
 
     const recipientInput = nameTag.trim();
@@ -371,7 +383,7 @@ function Dashboard({
   };
 
   return (
-    <div className="dashboard">
+    <div className="dashboard" data-testid="dashboard-root">
       <MobileNav
         isOpen={isNavOpen}
         onClose={closeNav}
@@ -381,10 +393,14 @@ function Dashboard({
         onHistoryClick={onHistoryClick}
         onHelpClick={onHelpClick}
       />
-      <header className="dashboard-header">
-        <NetworkBadge />
-        <LatencyGauge tracker={latencyTracker} />
-        <div className="wallet-menu" ref={menuRef}>
+      <header className="dashboard-header" data-testid="dashboard-header">
+        <div data-testid="dashboard-network-badge">
+          <NetworkBadge />
+        </div>
+        <div data-testid="dashboard-latency-gauge" data-visual-mask="dynamic">
+          <LatencyGauge tracker={latencyTracker} />
+        </div>
+        <div className="wallet-menu" ref={menuRef} data-testid="dashboard-wallet-menu">
           <button
             type="button"
             className="wallet-menu-trigger"
@@ -408,7 +424,19 @@ function Dashboard({
         </div>
       </header>
 
-      <section className="balance-panel">
+      {!isOnline && (
+        <p
+          className="offline-notice"
+          role="status"
+          aria-live="polite"
+          data-testid="dashboard-offline-notice"
+        >
+          You are offline. Showing cached data; payments and balance refresh are
+          disabled until your connection returns.
+        </p>
+      )}
+
+      <section className="balance-panel" data-testid="dashboard-balance-card">
         <div className="balance-header">
           <span className="balance-label">Balance</span>
           <button
@@ -418,20 +446,23 @@ function Dashboard({
             {showBalance ? "Hide" : "Show"}
           </button>
         </div>
-        <div className="balance-value">
+        <div className="balance-value" data-testid="dashboard-balance-value">
           {showBalance ? formattedBalance : "••••••"}
         </div>
         {balanceError && <p className="balance-error">{balanceError}</p>}
         <button
           type="button"
           onClick={onRefreshBalance}
-          disabled={isRefreshing}
+          disabled={isRefreshing || !isOnline}
+          aria-disabled={isRefreshing || !isOnline}
+          title={!isOnline ? "Balance refresh is unavailable while offline." : undefined}
+          data-testid="dashboard-refresh-balance"
         >
           {isRefreshing ? "Refreshing..." : "Refresh"}
         </button>
       </section>
 
-      <section className="payment-form">
+      <section className="payment-form" data-testid="dashboard-payment-form">
         <label htmlFor="recipient">Recipient</label>
         <input
           id="recipient"
@@ -466,6 +497,10 @@ function Dashboard({
           type="button"
           onClick={handleLookup}
           disabled={!canSubmitPayment}
+          aria-disabled={!canSubmitPayment}
+          aria-describedby={!isOnline ? "dashboard-offline-notice" : undefined}
+          title={!isOnline ? "Payments are disabled while offline." : undefined}
+          data-testid="dashboard-submit-payment"
         >
           {isProcessing ? "Processing..." : "Send Payment"}
         </button>
@@ -480,7 +515,7 @@ function Dashboard({
         )}
       </section>
 
-      <section className="receive-panel">
+      <section className="receive-panel" data-testid="dashboard-receive-panel">
         <h2>Receive</h2>
         {isReceiving ? (
           <p>Loading...</p>
