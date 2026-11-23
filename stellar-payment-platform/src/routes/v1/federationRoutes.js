@@ -1,4 +1,5 @@
 const express = require('express');
+const crypto = require('crypto');
 const { prisma } = require('../../../prismaClient');
 const { normalizeNameTag, etagCache, USER_DATABASE } = require('../../db');
 const { PRIMARY_USERNAME_ORDER } = require('../../utils');
@@ -11,6 +12,68 @@ const { validateSchema } = require('../../middleware/validateSchema');
 const { ApiError } = require('../../errors');
 const { federationQuerySchema } = require('../../schemas');
 const { asyncHandler } = require('../../middleware/asyncHandler');
+
+/**
+ * Canonical JSON serialization: object keys are sorted recursively so the
+ * same logical payload always produces the same byte sequence (and ETag).
+ */
+function canonicalize(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalize).join(',')}]`;
+  }
+  if (value && typeof value === 'object') {
+    const keys = Object.keys(value).sort();
+    return `{${keys
+      .map((key) => `${JSON.stringify(key)}:${canonicalize(value[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function computeEtag(body) {
+  const digest = crypto.createHash('sha256').update(canonicalize(body)).digest('base64url');
+  return `"${digest}"`;
+}
+
+function etagMatches(ifNoneMatch, etag) {
+  if (!ifNoneMatch) return false;
+  if (ifNoneMatch.trim() === '*') return true;
+  return ifNoneMatch
+    .split(',')
+    .map((candidate) => candidate.trim().replace(/^W\//, ''))
+    .some((candidate) => candidate === etag);
+}
+
+/**
+ * Attaches a strong ETag derived from the canonical response body, honors
+ * If-None-Match with a 304, and sets caching headers. Authorization-dependent
+ * responses are never shared-cached.
+ */
+function federationEtag({ isPublic }) {
+  return (req, res, next) => {
+    const originalJson = res.json.bind(res);
+    res.json = (body) => {
+      const etag = computeEtag(body);
+      res.set('ETag', etag);
+
+      const publicResponse = typeof isPublic === 'function' ? isPublic(req) : Boolean(isPublic);
+      if (publicResponse) {
+        res.set('Cache-Control', 'public, max-age=0, must-revalidate');
+      } else {
+        res.set('Cache-Control', 'private, no-store');
+        res.set('Vary', 'Authorization');
+      }
+
+      if (etagMatches(req.headers['if-none-match'], etag)) {
+        res.status(304);
+        return res.end();
+      }
+
+      return originalJson(body);
+    };
+    next();
+  };
+}
 
 module.exports = (redisClient) => {
   const router = express.Router();
@@ -30,6 +93,10 @@ module.exports = (redisClient) => {
 router.get(
   '/federation',
   etagCache,
+  // Federation lookups are public metadata, but responses may vary by
+  // authorization (e.g. hidden/deleted accounts); keep them out of shared
+  // caches unless the request is unauthenticated.
+  federationEtag({ isPublic: (req) => !req.headers.authorization }),
   validateSchema({ query: federationQuerySchema }),
   asyncHandler(async (req, res, next) => {
     const { q: queryValue, type } = req.query;
@@ -67,6 +134,8 @@ router.get(
           return next(notFoundError);
         }
 
+        // Invalidate cached federation data whenever the resolved user row
+        // changes (mutation hooks call this via the shared cache module).
         return res.json(cached);
       } else if (type === 'name' || !type) {
         const nameTag = normalizeNameTag(queryValue);
@@ -116,3 +185,8 @@ router.get(
 
   return router;
 };
+
+module.exports.canonicalize = canonicalize;
+module.exports.computeEtag = computeEtag;
+module.exports.etagMatches = etagMatches;
+module.exports.federationEtag = federationEtag;

@@ -1,5 +1,6 @@
 'use strict';
 
+const { EventEmitter } = require('events');
 const { ApiError } = require('../errors');
 
 /**
@@ -16,6 +17,213 @@ const VALID_TRANSITIONS = Object.freeze({
 });
 
 const ALL_STATUSES = Object.freeze(Object.keys(VALID_TRANSITIONS));
+
+/**
+ * Default maximum number of concurrent SSE subscribers.
+ */
+const DEFAULT_MAX_SSE_CONNECTIONS = 100;
+
+/**
+ * Default heartbeat interval (ms) for SSE connections.
+ */
+const DEFAULT_SSE_HEARTBEAT_MS = 15000;
+
+/**
+ * Bounded registry of server-sent-event subscribers for payment intent status
+ * updates.
+ *
+ * Each subscriber receives versioned events (`{ version, ... }`) so clients can
+ * resume from a reconnect cursor. The registry enforces a hard connection limit
+ * and guarantees that every subscriber is removed on disconnect so slow or
+ * abandoned clients cannot leak resources.
+ */
+class PaymentIntentEventStream extends EventEmitter {
+  /**
+   * @param {object} [options]
+   * @param {number} [options.maxConnections]
+   * @param {number} [options.heartbeatMs]
+   */
+  constructor(options = {}) {
+    super();
+    this.setMaxListeners(0);
+    this.maxConnections =
+      Number.isInteger(options.maxConnections) && options.maxConnections > 0
+        ? options.maxConnections
+        : DEFAULT_MAX_SSE_CONNECTIONS;
+    this.heartbeatMs =
+      Number.isInteger(options.heartbeatMs) && options.heartbeatMs > 0
+        ? options.heartbeatMs
+        : DEFAULT_SSE_HEARTBEAT_MS;
+    this.version = 0;
+    this._subscribers = new Map();
+    this._nextSubscriberId = 1;
+  }
+
+  /**
+   * Number of currently connected subscribers.
+   * @returns {number}
+   */
+  get size() {
+    return this._subscribers.size;
+  }
+
+  /**
+   * Registers a subscriber.
+   *
+   * @param {object} params
+   * @param {string} [params.paymentIntentId] - Optional filter; when set the
+   *   subscriber only receives events for that payment intent.
+   * @param {number} [params.lastEventId] - Reconnect cursor; the subscriber is
+   *   told the current version so it can detect gaps.
+   * @param {function} params.send - Called with each event payload.
+   * @param {function} [params.onHeartbeat] - Called on each heartbeat tick.
+   * @returns {{ id: number, version: number, close: function }}
+   * @throws {ApiError} TOO_MANY_REQUESTS when the connection limit is reached.
+   */
+  subscribe({ paymentIntentId, lastEventId, send, onHeartbeat } = {}) {
+    if (typeof send !== 'function') {
+      throw new ApiError('BAD_REQUEST', 'SSE subscriber requires a send function');
+    }
+    if (this._subscribers.size >= this.maxConnections) {
+      throw new ApiError(
+        'TOO_MANY_REQUESTS',
+        `SSE connection limit reached (${this.maxConnections})`
+      );
+    }
+
+    const id = this._nextSubscriberId++;
+    const subscriber = {
+      id,
+      paymentIntentId: paymentIntentId || null,
+      send,
+      onHeartbeat: typeof onHeartbeat === 'function' ? onHeartbeat : null,
+      timer: null,
+      closed: false,
+    };
+
+    if (this.heartbeatMs > 0 && subscriber.onHeartbeat) {
+      subscriber.timer = setInterval(() => {
+        if (subscriber.closed) {
+          return;
+        }
+        try {
+          subscriber.onHeartbeat();
+        } catch (_err) {
+          // A failing heartbeat means the client is gone; drop it.
+          this.unsubscribe(id);
+        }
+      }, this.heartbeatMs);
+      if (typeof subscriber.timer.unref === 'function') {
+        subscriber.timer.unref();
+      }
+    }
+
+    this._subscribers.set(id, subscriber);
+
+    const cursor = Number.isInteger(lastEventId) ? lastEventId : 0;
+    if (cursor > 0 && cursor < this.version) {
+      // Client missed events while disconnected; tell it to resync.
+      this._safeSend(subscriber, {
+        type: 'resync',
+        version: this.version,
+        lastEventId: cursor,
+      });
+    }
+
+    return {
+      id,
+      version: this.version,
+      close: () => this.unsubscribe(id),
+    };
+  }
+
+  /**
+   * Removes a subscriber and clears its heartbeat timer. Safe to call twice.
+   *
+   * @param {number} id
+   * @returns {boolean} true if a subscriber was removed
+   */
+  unsubscribe(id) {
+    const subscriber = this._subscribers.get(id);
+    if (!subscriber) {
+      return false;
+    }
+    subscriber.closed = true;
+    if (subscriber.timer) {
+      clearInterval(subscriber.timer);
+      subscriber.timer = null;
+    }
+    this._subscribers.delete(id);
+    return true;
+  }
+
+  /**
+   * Removes all subscribers. Used on shutdown.
+   */
+  closeAll() {
+    for (const id of Array.from(this._subscribers.keys())) {
+      this.unsubscribe(id);
+    }
+  }
+
+  /**
+   * Publishes a versioned status event to matching subscribers.
+   *
+   * @param {object} params
+   * @param {string} params.paymentIntentId
+   * @param {string} params.status
+   * @param {string} [params.previousStatus]
+   * @param {object} [params.data]
+   * @returns {{ version: number, delivered: number }}
+   */
+  publish({ paymentIntentId, status, previousStatus, data } = {}) {
+    this.version += 1;
+    const event = {
+      type: 'payment_intent.status',
+      version: this.version,
+      paymentIntentId,
+      status,
+      previousStatus: previousStatus || null,
+      data: data || null,
+      timestamp: new Date().toISOString(),
+    };
+
+    let delivered = 0;
+    for (const subscriber of Array.from(this._subscribers.values())) {
+      if (subscriber.paymentIntentId && subscriber.paymentIntentId !== paymentIntentId) {
+        continue;
+      }
+      if (this._safeSend(subscriber, event)) {
+        delivered += 1;
+      }
+    }
+
+    this.emit('event', event);
+    return { version: event.version, delivered };
+  }
+
+  /**
+   * @private
+   */
+  _safeSend(subscriber, payload) {
+    if (subscriber.closed) {
+      return false;
+    }
+    try {
+      subscriber.send(payload);
+      return true;
+    } catch (_err) {
+      // Slow or disconnected client: drop it so resources are released.
+      this.unsubscribe(subscriber.id);
+      return false;
+    }
+  }
+}
+
+/**
+ * Process-wide default event stream used by the state machine helpers.
+ */
+const defaultEventStream = new PaymentIntentEventStream();
 
 /**
  * Returns true if transitioning from `from` to `to` is allowed.
@@ -76,7 +284,7 @@ function buildGuardedWhere(id, from) {
  * @param {object} [params.data] - Additional fields to update
  * @returns {Promise<object>} The updated payment intent
  */
-async function updatePaymentIntentStatus(prisma, { id, to, data = {} }) {
+async function updatePaymentIntentStatus(prisma, { id, to, data = {}, eventStream } = {}) {
   if (!ALL_STATUSES.includes(to)) {
     throw new ApiError('CONFLICT', `Unknown payment intent status: ${to}`);
   }
@@ -105,7 +313,28 @@ async function updatePaymentIntentStatus(prisma, { id, to, data = {} }) {
     );
   }
 
-  return prisma.paymentIntent.findUnique({ where: { id } });
+  const updated = await prisma.paymentIntent.findUnique({ where: { id } });
+  publishStatusEvent(eventStream, {
+    paymentIntentId: id,
+    status: to,
+    previousStatus: current.status,
+    data: updated,
+  });
+  return updated;
+}
+
+/**
+ * Publishes a status event to the given stream (or the process-wide default).
+ *
+ * @param {PaymentIntentEventStream} [eventStream]
+ * @param {object} params
+ */
+function publishStatusEvent(eventStream, params) {
+  const stream = eventStream || defaultEventStream;
+  if (!stream || typeof stream.publish !== 'function') {
+    return null;
+  }
+  return stream.publish(params);
 }
 
 /**
@@ -120,12 +349,12 @@ async function updatePaymentIntentStatus(prisma, { id, to, data = {} }) {
  * @param {object} [params.data]
  * @returns {Promise<object>}
  */
-async function updatePaymentIntentStatusTx(prisma, { id, to, data = {} }) {
+async function updatePaymentIntentStatusTx(prisma, { id, to, data = {}, eventStream } = {}) {
   if (!ALL_STATUSES.includes(to)) {
     throw new ApiError('CONFLICT', `Unknown payment intent status: ${to}`);
   }
 
-  return prisma.$transaction(async (tx) => {
+  const { updated, previousStatus } = await prisma.$transaction(async (tx) => {
     const current = await tx.paymentIntent.findUnique({
       where: { id },
       select: { id: true, status: true },
@@ -149,16 +378,32 @@ async function updatePaymentIntentStatusTx(prisma, { id, to, data = {} }) {
       );
     }
 
-    return tx.paymentIntent.findUnique({ where: { id } });
+    const record = await tx.paymentIntent.findUnique({ where: { id } });
+    return { updated: record, previousStatus: current.status };
   });
+
+  // Publish only after the transaction commits so subscribers never observe
+  // events for rolled-back transitions.
+  publishStatusEvent(eventStream, {
+    paymentIntentId: id,
+    status: to,
+    previousStatus,
+    data: updated,
+  });
+  return updated;
 }
 
 module.exports = {
   VALID_TRANSITIONS,
   ALL_STATUSES,
+  DEFAULT_MAX_SSE_CONNECTIONS,
+  DEFAULT_SSE_HEARTBEAT_MS,
+  PaymentIntentEventStream,
+  defaultEventStream,
   isValidTransition,
   assertValidTransition,
   buildGuardedWhere,
+  publishStatusEvent,
   updatePaymentIntentStatus,
   updatePaymentIntentStatusTx,
 };

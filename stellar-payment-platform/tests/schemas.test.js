@@ -279,6 +279,73 @@ describe('request schemas', () => {
     });
   });
 
+  describe('shared amount boundary', () => {
+    const {
+      parseAmount,
+      serializeAmount,
+      AmountError,
+      MAX_AMOUNT,
+      MAX_SCALE,
+    } = require('../src/utils/amount');
+
+    test('round trips smallest units without floating point loss', () => {
+      const cases = [
+        { value: '0.0000001', scale: 7 },
+        { value: '1', scale: 0 },
+        { value: '123456789.1234567', scale: 7 },
+        { value: '0.1', scale: 1 },
+        { value: '9999999999999.9999999', scale: 7 },
+      ];
+      for (const { value, scale } of cases) {
+        const parsed = parseAmount(value, { scale });
+        expect(serializeAmount(parsed, { scale })).toBe(value);
+      }
+    });
+
+    test('preserves exact smallest-unit integer for large values', () => {
+      const parsed = parseAmount('123456789.1234567', { scale: 7 });
+      expect(parsed.units).toBe(1234567891234567n);
+    });
+
+    test('accepts precision at the asset scale boundary', () => {
+      expect(parseAmount('0.1234567', { scale: 7 }).units).toBe(1234567n);
+      expect(parseAmount('1.1', { scale: 1 }).units).toBe(11n);
+    });
+
+    test('rejects precision beyond the asset scale', () => {
+      expect(() => parseAmount('0.12345678', { scale: 7 })).toThrow(AmountError);
+      expect(() => parseAmount('1.11', { scale: 1 })).toThrow(AmountError);
+    });
+
+    test('rejects values above the maximum amount', () => {
+      expect(() => parseAmount(MAX_AMOUNT + '1', { scale: MAX_SCALE })).toThrow(AmountError);
+      expect(parseAmount(MAX_AMOUNT, { scale: MAX_SCALE }).units).toBeGreaterThan(0n);
+    });
+
+    test.each([
+      ['exponent notation', '1e7'],
+      ['leading plus', '+1'],
+      ['leading dot', '.5'],
+      ['trailing dot', '5.'],
+      ['empty string', ''],
+      ['whitespace only', '   '],
+      ['hex', '0x10'],
+      ['comma grouping', '1,000'],
+      ['negative', '-1'],
+      ['non-numeric', 'abc'],
+    ])('rejects unsupported notation: %s', (_label, value) => {
+      expect(() => parseAmount(value, { scale: 7 })).toThrow(AmountError);
+    });
+
+    test('rejects a non-string input', () => {
+      expect(() => parseAmount(1.5, { scale: 7 })).toThrow(AmountError);
+    });
+
+    test('serializes zero consistently', () => {
+      expect(serializeAmount(parseAmount('0', { scale: 7 }), { scale: 7 })).toBe('0');
+    });
+  });
+
   describe('auth and admin schemas', () => {
     test('requires a well-formed email', () => {
       expect(verifyEmailBodySchema.safeParse({ email: 'a@b.com' }).success).toBe(true);
