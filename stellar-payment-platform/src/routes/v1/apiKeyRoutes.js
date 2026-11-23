@@ -6,7 +6,13 @@ const { requireJson } = require('../../middleware/requireJson');
 const { createApiKeyBodySchema, revokeApiKeyBodySchema, rotateApiKeyBodySchema } = require('../../schemas');
 const { asyncHandler } = require('../../middleware/asyncHandler');
 const { requireAuth } = require('../../utils/jwt');
-const { hashKey, validateApiKey } = require('../../services/apiKeyService');
+const {
+  hashKey,
+  validateApiKey,
+  rotateApiKey,
+  revokeApiKey,
+  recordApiKeyAuditEvent,
+} = require('../../services/apiKeyService');
 
 module.exports = (redisClient) => {
   const router = express.Router();
@@ -136,10 +142,20 @@ router.get('/', requireAuth, asyncHandler(async (req, res, next) => {
           revokedBy: true,
           lastUsedAt: true,
           createdAt: true,
+          predecessorId: true,
+          successorId: true,
+          overlapExpiresAt: true,
         },
       });
 
-      return res.json({ success: true, data: keys });
+      // Raw key material is never persisted; only the prefix is ever exposed.
+      const redacted = keys.map((k) => ({
+        ...k,
+        key: null,
+        key_redacted: true,
+      }));
+
+      return res.json({ success: true, data: redacted });
     } catch (err) {
       return next(err);
     }
@@ -174,12 +190,20 @@ router.post('/:id/revoke', requireAuth, requireJson, validateSchema({ body: revo
         return next(new ApiError('CONFLICT', 'API key is already revoked'));
       }
 
-      const updated = await prisma.apiKey.update({
-        where: { id },
-        data: {
-          revokedAt: new Date(),
-          revokedBy: revoked_by,
-        },
+      // Revocation is immediate: the key stops validating as soon as revokedAt is set.
+      const updated = await revokeApiKey({
+        id,
+        revokedBy: revoked_by,
+        correlationId: req.correlationId,
+      });
+
+      await recordApiKeyAuditEvent({
+        apiKeyId: id,
+        ownerId: updated.ownerId,
+        action: 'revoke',
+        actor: revoked_by,
+        correlationId: req.correlationId,
+        metadata: { revoked_at: updated.revokedAt },
       });
 
       logger.info(`[Correlation ID: ${req.correlationId}] API key revoked: ${id} by ${revoked_by}`);
@@ -227,36 +251,32 @@ router.post('/:id/rotate', requireAuth, requireJson, validateSchema({ body: rota
         return next(new ApiError('CONFLICT', 'API key is already revoked'));
       }
 
-      // Generate new key
-      const rawKey = KEY_PREFIX + crypto.randomBytes(32).toString('hex');
-      const keyHash = hashKey(rawKey);
-      const keyPrefix = rawKey.slice(0, 12);
+      // Issue a replacement key with a bounded overlap window. The old key keeps
+      // validating until overlapExpiresAt, after which it is treated as revoked.
+      const { newRecord, rawKey, overlapExpiresAt } = await rotateApiKey({
+        id,
+        name,
+        gracePeriodHours: grace_period_hours,
+        correlationId: req.correlationId,
+      });
 
-      // Revoke old key with grace period
-      const graceExpiresAt = new Date(Date.now() + grace_period_hours * 60 * 60 * 1000);
+      await recordApiKeyAuditEvent({
+        apiKeyId: newRecord.id,
+        ownerId: newRecord.ownerId,
+        action: 'rotate',
+        actor: req.auth && req.auth.sub ? req.auth.sub : 'rotation',
+        correlationId: req.correlationId,
+        metadata: {
+          predecessor_id: oldRecord.id,
+          successor_id: newRecord.id,
+          overlap_expires_at: overlapExpiresAt,
+        },
+      });
 
-      const [newRecord] = await prisma.$transaction([
-        prisma.apiKey.create({
-          data: {
-            name: name || oldRecord.name,
-            ownerId: oldRecord.ownerId,
-            keyHash,
-            keyPrefix,
-            scopes: oldRecord.scopes,
-            expiresAt: oldRecord.expiresAt,
-          },
-        }),
-        prisma.apiKey.update({
-          where: { id },
-          data: {
-            revokedAt: new Date(),
-            revokedBy: 'rotation',
-          },
-        }),
-      ]);
+      logger.info(`[Correlation ID: ${req.correlationId}] API key rotated: ${id} -> ${newRecord.id} (overlap: ${grace_period_hours}h)`);
 
-      logger.info(`[Correlation ID: ${req.correlationId}] API key rotated: ${id} -> ${newRecord.id} (grace period: ${grace_period_hours}h)`);
-
+      // Raw key material is returned exactly once, here. It is never persisted
+      // and is redacted on all subsequent reads.
       return res.status(201).json({
         success: true,
         data: {
@@ -269,14 +289,16 @@ router.post('/:id/rotate', requireAuth, requireJson, validateSchema({ body: rota
             scopes: newRecord.scopes,
             expires_at: newRecord.expiresAt,
             created_at: newRecord.createdAt,
+            predecessor_id: oldRecord.id,
           },
           old_key: {
             id: oldRecord.id,
-            revoked_at: new Date(),
-            grace_period_expires_at: graceExpiresAt,
+            revoked_at: newRecord.createdAt,
+            overlap_expires_at: overlapExpiresAt,
+            successor_id: newRecord.id,
           },
         },
-        message: 'New API key created. Old key will remain active during the grace period.',
+        message: 'New API key created. The previous key remains valid until the overlap window expires. Save the new key securely; it will not be shown again.',
       });
     } catch (err) {
       return next(err);

@@ -6,6 +6,13 @@ import NetworkBadge from '../NetworkBadge';
 // in App.jsx. This file currently renders metrics with plain HTML/CSS only.
 import ScrollToTop from '../ScrollToTop';
 import MobileNav from './MobileNav';
+import Dialog from '../Dialog';
+import {
+  EmptyState,
+  ErrorState,
+  LoadingState,
+  PartialDataNotice,
+} from '../components/StateViews';
 import {
   ANALYTICS_MAX_PAGES,
   ANALYTICS_PAGE_LIMIT,
@@ -17,13 +24,23 @@ import {
   useNavState,
   useWalletMenu,
 } from './shared';
+import {
+  addDecimalStrings,
+  formatAmount,
+  normalizeDecimalString,
+} from '../utils/amount';
 
 /**
  * @typedef {Object} AnalyticsMetrics
- * @property {number | null} routingVolume
+ * @property {string | null} routingVolume Canonical decimal string (XLM).
  * @property {number | null} avgConfirmation
  * @property {number | null} successRate
  */
+
+/**
+ * Token precision applied only at the UI boundary when rendering XLM amounts.
+ */
+const XLM_DISPLAY_PRECISION = 7;
 
 /**
  * @typedef {Object} AnalyticsPageProps
@@ -60,6 +77,9 @@ function AnalyticsPage({
   });
   /** @type {[string | null, (value: string | null) => void]} */
   const [loadError, setLoadError] = useState(null);
+  /** @type {[string[], (value: string[]) => void]} */
+  const [partialErrors, setPartialErrors] = useState([]);
+  const [isLoading, setIsLoading] = useState(true);
   const [retryCount, setRetryCount] = useState(0);
   const [isLoading, setIsLoading] = useState(true);
   const [isOffline, setIsOffline] = useState(
@@ -130,13 +150,14 @@ function AnalyticsPage({
     /**
      * @param {number} sinceMs
      * @param {AbortSignal} signal
-     * @returns {Promise<number | null>}
+     * @returns {Promise<string | null>}
      */
     const loadRoutingVolume = async (sinceMs, signal) => {
       /** @type {string | undefined} */
       let url = `${HORIZON_BASE}/payments?order=desc&limit=${ANALYTICS_PAGE_LIMIT}`;
       let pages = 0;
-      let total = 0;
+      /** @type {string} */
+      let total = "0";
 
       while (url && pages < ANALYTICS_MAX_PAGES) {
         const data = await fetchHorizon(url, signal);
@@ -154,7 +175,10 @@ function AnalyticsPage({
           }
 
           if (record.asset_type === "native" && record.amount) {
-            total += Number(record.amount);
+            const amount = normalizeDecimalString(record.amount);
+            if (amount !== null) {
+              total = addDecimalStrings(total, amount);
+            }
           }
         }
 
@@ -166,7 +190,7 @@ function AnalyticsPage({
         pages += 1;
       }
 
-      return Number.isFinite(total) ? total : null;
+      return total;
     };
 
     /**
@@ -272,6 +296,29 @@ function AnalyticsPage({
       return totalDelta / deltaCount;
     };
 
+    /**
+     * @param {() => Promise<number | null>} loader
+     * @param {string} label
+     * @returns {Promise<{ value: number | null, error: string | null }>}
+     */
+    const settleMetric = async (loader, label) => {
+      try {
+        return { value: await loader(), error: null };
+      } catch (error) {
+        if (error instanceof Error && error.name === "AbortError") {
+          throw error;
+        }
+
+        return {
+          value: null,
+          error:
+            error instanceof Error && error.message
+              ? `${label}: ${error.message}`
+              : `${label}: failed to load.`,
+        };
+      }
+    };
+
     const loadMetrics = async () => {
       if (currentController) {
         currentController.abort();
@@ -286,9 +333,18 @@ function AnalyticsPage({
       try {
         const [routingVolume, avgConfirmation, successRate] = await Promise.all(
           [
-            loadRoutingVolume(sinceMs, controller.signal),
-            loadAvgConfirmation(sinceMs, controller.signal),
-            loadSuccessRate(sinceMs, controller.signal),
+            settleMetric(
+              () => loadRoutingVolume(sinceMs, controller.signal),
+              "Flow volume",
+            ),
+            settleMetric(
+              () => loadAvgConfirmation(sinceMs, controller.signal),
+              "Avg confirmation",
+            ),
+            settleMetric(
+              () => loadSuccessRate(sinceMs, controller.signal),
+              "Routing reliability",
+            ),
           ],
         );
 
@@ -296,10 +352,14 @@ function AnalyticsPage({
           return;
         }
 
+        const failures = [routingVolume, avgConfirmation, successRate]
+          .map((result) => result.error)
+          .filter((message) => Boolean(message));
+
         setAnalyticsMetrics({
-          routingVolume,
-          avgConfirmation,
-          successRate,
+          routingVolume: routingVolume.value,
+          avgConfirmation: avgConfirmation.value,
+          successRate: successRate.value,
         });
         setLoadError(null);
         setCachedAt(null);
@@ -356,7 +416,8 @@ function AnalyticsPage({
   const routingVolumeValue =
     analyticsMetrics.routingVolume === null
       ? fallbackValue
-      : formatNumber(analyticsMetrics.routingVolume, {
+      : formatAmount(analyticsMetrics.routingVolume, {
+          precision: XLM_DISPLAY_PRECISION,
           maximumFractionDigits: 2,
         });
   const avgConfirmationValue =
@@ -367,6 +428,15 @@ function AnalyticsPage({
     analyticsMetrics.successRate === null
       ? fallbackValue
       : analyticsMetrics.successRate.toFixed(1);
+  const hasAnyMetric =
+    analyticsMetrics.routingVolume !== null ||
+    analyticsMetrics.avgConfirmation !== null ||
+    analyticsMetrics.successRate !== null;
+  const isEmptyResult = !isLoading && !loadError && !hasAnyMetric;
+  const retryAnalytics = () => {
+    setIsLoading(true);
+    setRetryCount((count) => count + 1);
+  };
 
   const freshnessLabel =
     cachedAt === null
@@ -420,7 +490,7 @@ function AnalyticsPage({
           <button
             type="button"
             className="disconnect-button"
-            onClick={onDisconnectWallet}
+            onClick={() => setIsDisconnectDialogOpen(true)}
           >
             Disconnect wallet
           </button>
@@ -471,7 +541,13 @@ function AnalyticsPage({
               </button>
               {userPublicKey && isWalletMenuOpen && (
                 <div className="wallet-dropdown">
-                  <button type="button" onClick={onDisconnectWallet}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsWalletMenuOpen(false);
+                      setIsDisconnectDialogOpen(true);
+                    }}
+                  >
                     Disconnect wallet
                   </button>
                 </div>
@@ -523,7 +599,7 @@ function AnalyticsPage({
           </section>
         )}
 
-        {!loadError && (
+        {!loadError && !isEmptyResult && (
           <section className="grid columns-3">
             <div className="card reveal" data-testid="analytics-metric-volume">
               <div className="card-header">
@@ -569,6 +645,18 @@ function AnalyticsPage({
         onHelpClick={() => handleNav(onHelpClick)}
         onRegisterClick={() => handleNav(onRegisterClick)}
         canRegister={canRegister}
+      />
+      <Dialog
+        open={isDisconnectDialogOpen}
+        title="Disconnect wallet"
+        description="You will need to reconnect your wallet to continue using Stellar Pay."
+        confirmLabel="Disconnect"
+        cancelLabel="Cancel"
+        onConfirm={() => {
+          setIsDisconnectDialogOpen(false);
+          onDisconnectWallet();
+        }}
+        onCancel={() => setIsDisconnectDialogOpen(false)}
       />
       <ScrollToTop />
     </div>

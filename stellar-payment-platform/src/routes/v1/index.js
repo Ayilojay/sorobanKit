@@ -7,6 +7,7 @@ const webhookRoutes = require('./webhookRoutes');
 const statsRoutes = require('./statsRoutes');
 const historyRoutes = require('./historyRoutes');
 const exportRoutes = require('./exportRoutes');
+const exportJobRoutes = require('./exportJobRoutes');
 const paymentRoutes = require('./paymentRoutes');
 
 module.exports = (redisClient) => {
@@ -14,6 +15,7 @@ module.exports = (redisClient) => {
 
   const federationRoutes = require('./federationRoutes')(redisClient);
   const adminRoutes = require('./adminRoutes')(redisClient);
+  const stepUpRoutes = require('./stepUpRoutes')(redisClient);
 
   router.use('/', userRoutes);
   router.use('/', federationRoutes);
@@ -21,9 +23,11 @@ module.exports = (redisClient) => {
   router.use('/', contractRoutes);
   router.use('/', historyRoutes);
   router.use('/', exportRoutes);
+  router.use('/', exportJobRoutes(redisClient));
   router.use('/', webhookRoutes(redisClient));
   router.use('/', paymentRoutes(redisClient));
   router.use('/', statsRoutes(redisClient));
+  router.use('/', stepUpRoutes);
   router.use('/', adminRoutes);
 
   return router;

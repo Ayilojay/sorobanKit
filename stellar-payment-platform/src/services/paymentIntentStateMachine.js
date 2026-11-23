@@ -1,5 +1,6 @@
 'use strict';
 
+const { EventEmitter } = require('events');
 const { ApiError } = require('../errors');
 
 /**
@@ -97,7 +98,7 @@ function buildGuardedWhere(id, from) {
  * @param {object} [params.data] - Additional fields to update
  * @returns {Promise<object>} The updated payment intent
  */
-async function updatePaymentIntentStatus(prisma, { id, to, data = {} }) {
+async function updatePaymentIntentStatus(prisma, { id, to, data = {}, eventStream } = {}) {
   if (!ALL_STATUSES.includes(to)) {
     throw new ApiError('CONFLICT', `Unknown payment intent status: ${to}`);
   }
@@ -126,7 +127,28 @@ async function updatePaymentIntentStatus(prisma, { id, to, data = {} }) {
     );
   }
 
-  return prisma.paymentIntent.findUnique({ where: { id } });
+  const updated = await prisma.paymentIntent.findUnique({ where: { id } });
+  publishStatusEvent(eventStream, {
+    paymentIntentId: id,
+    status: to,
+    previousStatus: current.status,
+    data: updated,
+  });
+  return updated;
+}
+
+/**
+ * Publishes a status event to the given stream (or the process-wide default).
+ *
+ * @param {PaymentIntentEventStream} [eventStream]
+ * @param {object} params
+ */
+function publishStatusEvent(eventStream, params) {
+  const stream = eventStream || defaultEventStream;
+  if (!stream || typeof stream.publish !== 'function') {
+    return null;
+  }
+  return stream.publish(params);
 }
 
 /**
@@ -141,12 +163,12 @@ async function updatePaymentIntentStatus(prisma, { id, to, data = {} }) {
  * @param {object} [params.data]
  * @returns {Promise<object>}
  */
-async function updatePaymentIntentStatusTx(prisma, { id, to, data = {} }) {
+async function updatePaymentIntentStatusTx(prisma, { id, to, data = {}, eventStream } = {}) {
   if (!ALL_STATUSES.includes(to)) {
     throw new ApiError('CONFLICT', `Unknown payment intent status: ${to}`);
   }
 
-  return prisma.$transaction(async (tx) => {
+  const { updated, previousStatus } = await prisma.$transaction(async (tx) => {
     const current = await tx.paymentIntent.findUnique({
       where: { id },
       select: { id: true, status: true },
@@ -170,8 +192,19 @@ async function updatePaymentIntentStatusTx(prisma, { id, to, data = {} }) {
       );
     }
 
-    return tx.paymentIntent.findUnique({ where: { id } });
+    const record = await tx.paymentIntent.findUnique({ where: { id } });
+    return { updated: record, previousStatus: current.status };
   });
+
+  // Publish only after the transaction commits so subscribers never observe
+  // events for rolled-back transitions.
+  publishStatusEvent(eventStream, {
+    paymentIntentId: id,
+    status: to,
+    previousStatus,
+    data: updated,
+  });
+  return updated;
 }
 
 /**
@@ -251,6 +284,7 @@ module.exports = {
   isTerminalStatus,
   assertValidTransition,
   buildGuardedWhere,
+  publishStatusEvent,
   updatePaymentIntentStatus,
   updatePaymentIntentStatusTx,
   getOldestUnreconciledIntentAgeByNetwork,

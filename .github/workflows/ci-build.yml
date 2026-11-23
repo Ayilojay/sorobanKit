@@ -6,8 +6,123 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  changes:
+    name: Detect changed workspaces
+    runs-on: ubuntu-latest
+    outputs:
+      dashboard: ${{ steps.filter.outputs.dashboard }}
+      full_suite: ${{ steps.filter.outputs.full_suite }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changes
+        id: filter
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Determine the base and head refs for the diff.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+            HEAD="${{ github.sha }}"
+          fi
+
+          # Fall back to a full suite when we cannot compute a reliable diff
+          # (e.g. new branch, force push, missing base commit).
+          if [ -z "${BASE}" ] || [ -z "${HEAD}" ] || \
+             [ "${BASE}" = "0000000000000000000000000000000000000000" ] || \
+             ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            echo "Unable to determine a reliable diff base; running full suite."
+            echo "dashboard=true" >> "$GITHUB_OUTPUT"
+            echo "full_suite=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CHANGED="$(git diff --name-only "${BASE}" "${HEAD}" || true)"
+          echo "Changed files:"
+          echo "${CHANGED}"
+
+          dashboard=false
+          full_suite=false
+
+          while IFS= read -r file; do
+            [ -z "${file}" ] && continue
+            case "${file}" in
+              # Shared schemas, bindings, root configuration, and lockfiles
+              # fan out to every workspace.
+              package.json|package-lock.json|npm-shrinkwrap.json|yarn.lock|pnpm-lock.yaml|pnpm-workspace.yaml|lerna.json|nx.json|turbo.json|tsconfig*.json|.nvmrc|.node-version)
+                full_suite=true
+                ;;
+              schemas/*|bindings/*|shared/*|packages/shared/*|packages/schemas/*|packages/bindings/*)
+                full_suite=true
+                ;;
+              .github/workflows/*|.github/actions/*)
+                full_suite=true
+                ;;
+              payment-dashboard/*)
+                dashboard=true
+                ;;
+              *)
+                # Unknown paths are treated as uncertain and trigger the
+                # full-suite fallback.
+                full_suite=true
+                ;;
+            esac
+          done <<< "${CHANGED}"
+
+          if [ "${full_suite}" = "true" ]; then
+            dashboard=true
+          fi
+
+          echo "dashboard=${dashboard}" >> "$GITHUB_OUTPUT"
+          echo "full_suite=${full_suite}" >> "$GITHUB_OUTPUT"
+
   build:
+    name: Build payment-dashboard
+    needs: changes
+    if: needs.changes.outputs.dashboard == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: payment-dashboard/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          cd payment-dashboard
+          npm install --legacy-peer-deps
+
+      - name: Typecheck
+        run: |
+          cd payment-dashboard
+          npm run typecheck
+
+      - name: Build
+        run: |
+          cd payment-dashboard
+          npm run build
+
+  full-suite:
+    name: Full suite fallback
+    needs: changes
+    if: needs.changes.outputs.full_suite == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -18,11 +133,12 @@ jobs:
         with:
           node-version: '20'
           cache: 'npm'
+          cache-dependency-path: payment-dashboard/package-lock.json
 
       - name: Install dependencies
         run: |
           cd payment-dashboard
-          npm install --legacy-peer-deps
+          npm ci --legacy-peer-deps
 
       - name: Typecheck
         run: |

@@ -9,6 +9,10 @@ const {
 const { poolGet, poolRun, poolAll, etagCache } = require("../../db");
 const { logger } = require("../../logger");
 const { transferAccount } = require("../../services/registrationService");
+const {
+  assignPrimaryUsername,
+  isPrimaryUniqueViolation,
+} = require("../../services/primaryUsernameService");
 const { lookupCached, invalidateFederationCache } = require("../../cache");
 const federationCache = require("../../federationCache");
 const {
@@ -33,6 +37,8 @@ const { ApiError } = require("../../errors");
 const { requireJson } = require("../../middleware/requireJson");
 const {
   authenticateUsernameOwner,
+  assertUsernameOwnership,
+  resolvePrincipal,
 } = require("../../services/ownershipService");
 const {
   ACTIVITY_ACTIONS,
@@ -276,14 +282,31 @@ router.post(
         }
       }
 
-      await prisma.user.create({
-        data: {
-          username: normalizedUsername,
-          address,
-          isPrimary,
-          ...(memoType && { memoType, memo }),
-        },
-      });
+      // #386 — at most one active primary username per address is enforced by
+      // a partial unique index on (address) WHERE is_primary AND deleted_at IS
+      // NULL. When the address has no active primary yet, claim the slot via
+      // the helper inside a transaction so a concurrent registration for the
+      // same address loses cleanly with a 409 instead of creating a second
+      // primary. Soft-deleting a primary clears is_primary (see DELETE below),
+      // which frees the slot for the next registration.
+      if (isPrimary) {
+        await withTransaction(async (tx) => {
+          await assignPrimaryUsername(tx, {
+            username: normalizedUsername,
+            address,
+            ...(memoType && { memoType, memo }),
+          });
+        });
+      } else {
+        await prisma.user.create({
+          data: {
+            username: normalizedUsername,
+            address,
+            isPrimary: false,
+            ...(memoType && { memoType, memo }),
+          },
+        });
+      }
 
       await recordActivity(prisma, {
         username: normalizedUsername,
@@ -314,6 +337,17 @@ router.post(
         ...(memoType && { memo_type: memoType, memo }),
       });
     } catch (error) {
+      // #386 — losing the race for the primary slot surfaces as a unique
+      // violation on the partial index; report it as a conflict.
+      if (isPrimaryUniqueViolation(error)) {
+        return next(
+          new ApiError(
+            "CONFLICT",
+            "This address already has a primary federation username.",
+          ),
+        );
+      }
+
       if (
         error.code === "SQLITE_CONSTRAINT" ||
         error.code === "P2002" ||
@@ -366,9 +400,34 @@ router.post("/users/:username/transfer", async (req, res, next) => {
   try {
     const normalizedUsername =
       typeof username === "string" ? username.toLowerCase().trim() : "";
+
+    // #383 — the caller-supplied oldAddress must not be trusted on its own.
+    // Resolve the authenticated principal from the presented signature and
+    // require it to own the username being transferred.
+    const principal = await resolvePrincipal(req, {
+      operationType: "transfer",
+      signature: oldSignature,
+      signerAddress: req.body?.signerAddress,
+    });
+
+    await assertUsernameOwnership(principal, normalizedUsername);
+
+    if (
+      principal.address &&
+      oldAddress &&
+      principal.address !== oldAddress
+    ) {
+      return next(
+        new ApiError(
+          "FORBIDDEN",
+          "Authenticated principal does not match the transfer source address.",
+        ),
+      );
+    }
+
     const updatedUser = await transferAccount(
       normalizedUsername,
-      oldAddress,
+      principal.address || oldAddress,
       newAddress,
       oldSignature,
       newSignature,
@@ -440,10 +499,21 @@ router.delete(
         return next(notFoundError);
       }
 
+      // #383 — only the authenticated owner may unregister a username.
+      const principal = await resolvePrincipal(req, {
+        operationType: "unregister",
+        signature: req.get("X-Stellar-Signature") || req.body?.signature,
+        signerAddress: req.get("X-Stellar-Signer") || req.body?.signerAddress,
+      });
+      await assertUsernameOwnership(principal, username);
+
       await withTransaction(async (tx) => {
         await tx.user.update({
           where: { username },
-          data: { deletedAt: new Date() },
+          data: {
+            deletedAt: new Date(),
+            ...(existing.isPrimary && { isPrimary: false }),
+          },
         });
       });
 
@@ -461,6 +531,9 @@ router.delete(
         );
       }
       invalidateFederationCache(username, existing.address);
+      // #386 — the address's primary slot may now be free; drop any cached
+      // reverse-lookup entry so the next registration is reflected promptly.
+      invalidateFederationCache(null, existing.address);
 
       await recordActivity(prisma, {
         username,
@@ -524,50 +597,15 @@ router.get(
       );
     }
 
-    let signers;
-    try {
-      signers = await fetchAccountSigners(owner.address);
-    } catch (error) {
-      logger.error("Failed to fetch account signers:", error.message);
-      return next(
-        new ApiError(
-          "UNAUTHENTICATED",
-          "Unable to verify ownership: account signers unavailable.",
-        ),
-      );
-    }
-
-    const signerKeys = (signers || [])
-      .map((signer) => signer.key || signer.publicKey || signer)
-      .filter((key) => typeof key === "string" && key.length > 0);
-
-    if (!signerKeys.includes(signerAddress)) {
-      return next(
-        new ApiError(
-          "UNAUTHENTICATED",
-          "Signer is not authorized for this account.",
-        ),
-      );
-    }
-
-    const verification = await verifyMultiSignerThreshold(
-      owner.address,
-      signerKeys,
-      {
-        operationType: "activity",
-        providedSignatures: [signature],
-        signerAddress,
-      },
-    );
-
-    if (!verification.success) {
-      return next(
-        new ApiError(
-          "UNAUTHENTICATED",
-          verification.errorMessage || "Signature verification failed.",
-        ),
-      );
-    }
+    // #383 — ownership is decided by the authenticated principal, not by the
+    // username in the path. The principal is derived from the presented
+    // signature and must own the requested username.
+    const principal = await resolvePrincipal(req, {
+      operationType: "activity",
+      signature,
+      signerAddress,
+    });
+    await assertUsernameOwnership(principal, owner.username);
 
     const { range, error: dateError } = parseDateRange(req.query);
     if (dateError) {
@@ -576,7 +614,7 @@ router.get(
 
     const { page, limit } = req.query;
     const { rows, total } = await listActivity(prisma, {
-      username: owner.username,
+      username: principal.username || owner.username,
       page,
       limit,
       range,

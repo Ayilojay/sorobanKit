@@ -13,6 +13,11 @@ const { prisma } = require('../prismaClient');
 const { HORIZON_BASE } = require('../src/services/stellarService');
 const healthRoutes = require('../src/routes/v1/healthRoutes');
 const { buildErrorHandler } = require('../src/middleware/errorHandler');
+const {
+  beginShutdown,
+  resetShutdownState,
+  isShuttingDown,
+} = require('../src/lifecycle/shutdownState');
 
 const buildApp = (redisClient = null) => {
   const app = express();
@@ -25,6 +30,7 @@ let redisClient;
 
 beforeEach(() => {
   jest.clearAllMocks();
+  resetShutdownState();
   prisma.$queryRaw.mockResolvedValue([{ 1: 1 }]);
   redisClient = { ping: jest.fn().mockResolvedValue('PONG') };
   global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 });
@@ -32,6 +38,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  resetShutdownState();
   delete process.env.HEALTH_HORIZON_TIMEOUT_MS;
 });
 

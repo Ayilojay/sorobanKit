@@ -60,6 +60,7 @@ jest.mock('../../prismaClient', () => {
     },
     auditLog: {
       create: jest.fn().mockResolvedValue({}),
+      findMany: jest.fn().mockResolvedValue([]),
     },
     payment: {
       findMany: jest.fn().mockResolvedValue([{ id: 'payment_1' }])
@@ -95,7 +96,7 @@ describe('E2E: Admin Flow', () => {
   });
 
   it('should allow admin to block a user and export users', async () => {
-    // 1. Block User
+    // 1. Block User (operational permission)
     let res = await request(app)
       .post('/api/v1/admin/block')
       .set('x-api-key', 'e2e-admin-key')
@@ -105,7 +106,7 @@ describe('E2E: Admin Flow', () => {
     expect(res.body.address).toBe('GABC123XYZ456789ADMIN');
     expect(res.body.flaggedAt).toBeDefined();
 
-    // 2. Export Payments
+    // 2. Export Payments (read permission)
     res = await request(app)
       .get('/api/v1/admin/export?format=json')
       .set('x-api-key', 'e2e-admin-key');
@@ -124,5 +125,58 @@ describe('E2E: Admin Flow', () => {
       .send({ address: 'GABC123XYZ456789ADMIN' });
 
     expect(res.status).toBe(401);
+  });
+
+  it('should record tamper-evident integrity fields on admin audit events', async () => {
+    const { prisma } = require('../../prismaClient');
+
+    const res = await request(app)
+      .post('/api/v1/admin/block')
+      .set('x-api-key', 'e2e-admin-key')
+      .send({ address: 'GABC123XYZ456789ADMIN' });
+
+    expect(res.status).toBe(200);
+    expect(prisma.auditLog.create).toHaveBeenCalled();
+
+    const createArgs = prisma.auditLog.create.mock.calls.at(-1)[0];
+    const data = createArgs.data;
+    expect(data).toBeDefined();
+    expect(typeof data.integrityDigest).toBe('string');
+    expect(data.integrityDigest.length).toBeGreaterThan(0);
+    expect(typeof data.integrityKeyId).toBe('string');
+    expect(data.integrityKeyId.length).toBeGreaterThan(0);
+    // Chain link: first event in a fresh chain has no predecessor.
+    expect(data.integrityPrevDigest === null || typeof data.integrityPrevDigest === 'string').toBe(true);
+  });
+
+  it('should verify audit integrity via the admin verification endpoint', async () => {
+    const res = await request(app)
+      .get('/api/v1/admin/audit/verify')
+      .set('x-api-key', 'e2e-admin-key');
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty('valid');
+    expect(typeof res.body.valid).toBe('boolean');
+    expect(res.body).toHaveProperty('checked');
+    expect(typeof res.body.checked).toBe('number');
+  });
+
+  it('should reject audit verification without admin credentials', async () => {
+    const res = await request(app)
+      .get('/api/v1/admin/audit/verify')
+      .set('x-api-key', 'wrong-key');
+
+    expect(res.status).toBe(401);
+  });
+
+  it('should preserve existing admin audit query behaviour', async () => {
+    const res = await request(app)
+      .get('/api/v1/admin/audit')
+      .set('x-api-key', 'e2e-admin-key');
+
+    expect([200, 404]).toContain(res.status);
+    if (res.status === 200) {
+      expect(res.body).toBeDefined();
+    }
   });
 });

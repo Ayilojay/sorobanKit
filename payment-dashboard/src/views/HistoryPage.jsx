@@ -1,8 +1,13 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
 import NetworkBadge from '../NetworkBadge';
 import ScrollToTop from '../ScrollToTop';
-import LoadingSpinner from '../LoadingSpinner';
 import MobileNav from './MobileNav';
+import {
+  EmptyState,
+  ErrorState,
+  LoadingState,
+  PartialDataNotice,
+} from '../states';
 import { NAV_STORAGE_KEY, formatShortAddress, useNavState, useWalletMenu } from './shared';
 import { useFocusAnnouncement } from '../focusAnnouncement';
 import { getApiErrorMessage } from '../apiErrorCatalog';
@@ -115,6 +120,26 @@ function formatFreshness(value) {
  */
 
 /**
+ * Format a raw decimal amount string for display using token precision.
+ * Keeps the canonical value as a string and only applies precision at the
+ * UI boundary, avoiding floating-point round-trip loss.
+ *
+ * @param {string | undefined | null} rawAmount
+ * @param {string} asset
+ * @returns {string}
+ */
+function formatDisplayAmount(rawAmount, asset) {
+  if (rawAmount === undefined || rawAmount === null || rawAmount === "") {
+    return "-";
+  }
+  const parsed = parseAmount(rawAmount);
+  if (parsed === null) {
+    return `${rawAmount} ${asset}`;
+  }
+  return `${formatAmount(parsed, asset)} ${asset}`;
+}
+
+/**
  * @param {HistoryPageProps} props
  */
 function HistoryPage({
@@ -197,8 +222,6 @@ function HistoryPage({
 
       await Promise.resolve();
       setIsLoading(true);
-      setHistory([]);
-      setHasMore(false);
       setHistoryError("");
       setIsFromCache(false);
       try {
@@ -246,7 +269,7 @@ function HistoryPage({
                   change.from === userPublicKey ? "Sent" : "Received";
                 const counterparty =
                   change.from === userPublicKey ? change.to : change.from;
-                const amount = `${change.amount} XLM`;
+                const amount = formatDisplayAmount(change.amount, "XLM");
                 const status =
                   record.transaction_successful === false
                     ? "Failed"
@@ -290,7 +313,7 @@ function HistoryPage({
                 ? "XLM"
                 : record.asset_code || "Asset";
             const rawAmount = record.amount || record.starting_balance || "";
-            const amount = rawAmount ? `${rawAmount} ${asset}` : "-";
+            const amount = formatDisplayAmount(rawAmount, asset);
             const status =
               record.transaction_successful === false ? "Failed" : "Success";
             const explorerLink = record.transaction_hash
@@ -559,10 +582,8 @@ function HistoryPage({
               </button>
             </div>
           )}
-          {userPublicKey && isLoading && (
-            <div className="wallet-status" aria-live="polite">
-              <LoadingSpinner label="Loading transactions..." />
-            </div>
+          {userPublicKey && isLoading && history.length === 0 && (
+            <LoadingState label="Loading transactions..." />
           )}
           {userPublicKey && historyError && (
             <div className="wallet-status" data-testid="history-error">
@@ -578,7 +599,6 @@ function HistoryPage({
               </div>
             )}
           {userPublicKey &&
-            !isLoading &&
             !historyError &&
             history.length > 0 && (
               <table className="history-table" data-testid="history-table">

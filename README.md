@@ -157,6 +157,63 @@ authenticated before rate limiting and must have `read` for GET/HEAD routes,
 401; authenticated keys missing the required scope return 403. The legacy
 `ADMIN_API_KEY` remains an admin-scoped credential.
 
+#### API key rotation
+
+Keys are rotated with a bounded overlap so clients can switch over without a
+window of failed requests:
+
+1. Create the replacement key. The response is the **only** time the raw key
+   material is returned; it is stored hashed and every later read (list,
+   detail, audit log) shows a redacted form such as `sk_live_…4f2a`.
+2. Both the predecessor and the successor authenticate during the overlap
+   window. Each key carries `predecessorId` / `successorId` metadata so an
+   operator can see which key replaced which.
+3. Revoking the predecessor is immediate: the next request presenting it is
+   rejected with 401, regardless of the overlap window. Revocation is recorded
+   in the audit trail with the acting credential, timestamp, and reason.
+
+The overlap window is bounded — once it expires the predecessor stops
+authenticating even if it was never explicitly revoked. Rotate before the
+window closes, or issue a new successor.
+
+#### Administrative roles
+
+`/admin/*` routes no longer share one broad capability. Each route declares the
+permission it needs, and credentials are granted one or more roles:
+
+| Role | Grants |
+| --- | --- |
+| `admin:read` | Read-only admin endpoints (stats, audit logs, exports) |
+| `admin:operate` | Operational actions (retries, queue drains, revocations) |
+| `admin:configure` | Configuration-changing actions (treasury, limits, upgrades) |
+
+A request to an admin route without the declared permission returns 403 with
+the missing permission named in the error details. Sensitive decisions
+(role changes, revocations, configuration changes) are written to the audit
+trail with the acting credential, the permission that authorized the action,
+and the request payload hash.
+
+#### Step-up verification
+
+High-impact administrative actions require a second, short-lived confirmation
+bound to the action and the payload:
+
+- **Covered actions:** contract upgrades, treasury changes, and bulk exports.
+- **How it works:** request a step-up challenge for the action, then repeat the
+  request with the returned single-use token. The token is bound to the action
+  name and a hash of the request payload, so it cannot be replayed against a
+  different action or a modified body.
+- **Expiry:** tokens are short-lived (minutes, not hours) and single-use. An
+  expired or already-consumed token fails with 401 and the request is not
+  performed.
+- **Mismatch:** a token presented with a different action or payload hash fails
+  with 403 and is not consumed, so the operator can retry with the correct
+  payload.
+- **Audit evidence:** successful step-ups record the challenge ID, the action,
+  the payload hash, and the acting credential in the audit trail; failures are
+  recorded with the failure reason.
+=======
+
 ### Server
 
 The server uses **PostgreSQL** as its database, accessed through the
@@ -758,14 +815,124 @@ Streams transaction records from the database as a CSV or NDJSON download for ex
   - `limit` (optional) – positive integer row limit. When omitted, only the server cap applies.
   - `startDate` (optional) – `YYYY-MM-DD` inclusive lower bound on `createdAt`.
   - `endDate` (optional) – `YYYY-MM-DD` inclusive upper bound on `createdAt`.
-- **Headers:** `x-api-key` (required) – must match `ADMIN_API_KEY`.
+- **Headers:** `x-api-key` (required) – must hold the `admin:read` permission.
 - **Returns:** `text/csv` or `application/x-ndjson` with a `Content-Disposition: attachment` header.
 - **Status Codes:**
   - `200 OK`: Stream started.
   - `400 Bad Request`: Invalid date format or `startDate` after `endDate`.
   - `401 Unauthorized`: Missing or invalid API key.
+  - `403 Forbidden`: The key lacks `admin:read`, or a required step-up token is
+    missing, expired, already used, or bound to a different action/payload.
+
+Bulk exports are a high-impact action: they require a step-up token bound to
+the export's action and payload hash (see
+[Step-up verification](#step-up-verification)).
 
 Records are fetched at most 500 at a time and written directly to the response. The export stops at the lower of `limit` and `ADMIN_EXPORT_MAX_ROWS` (default `1000000`). Configure the cap as a positive integer no greater than `2147483647`; invalid configuration fails closed with HTTP 500. Invalid limits return HTTP 400. A bounded one-row probe checks for additional matching records before streaming starts, so truncated downloads include `X-Truncated: true`; exports ending exactly at the boundary omit that header. JSON output remains newline-delimited (one object per line).
+
+Large exports can also be run as durable background jobs — see
+[Background admin export jobs](#background-admin-export-jobs) below.
+
+### Background admin export jobs
+
+Exports that would take longer than a request should live are run as durable
+background jobs. A job is created, persisted, and processed by a bounded worker
+pool; the caller polls for progress, can cancel it, and downloads the finished
+artifact from a short-lived link.
+
+#### Creating a job
+
+```bash
+curl -X POST "http://localhost:5000/admin/export/jobs" \
+  -H "x-api-key: $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"format":"csv","startDate":"2026-01-01","endDate":"2026-01-31"}'
+```
+
+The body accepts the same `format`, `limit`, `startDate` and `endDate` fields as
+`GET /admin/export`. The response is `202 Accepted` with the job record:
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": "c1f0…",
+    "status": "queued",
+    "format": "csv",
+    "progress": { "rowsWritten": 0, "percent": 0 },
+    "createdAt": "2026-01-31T12:00:00.000Z",
+    "expiresAt": null
+  }
+}
+```
+
+Jobs are owned by the credential that created them. Polling, cancelling or
+downloading a job with a different credential returns `404 Not Found` rather
+than `403`, so job IDs cannot be probed for existence.
+
+#### Polling progress
+
+```bash
+curl "http://localhost:5000/admin/export/jobs/c1f0…" -H "x-api-key: $ADMIN_API_KEY"
+```
+
+`status` moves `queued` → `running` → `succeeded` | `failed` | `cancelled`.
+While running, `progress.rowsWritten` and `progress.percent` are updated as rows
+are written. A failed job carries `error.code` and `error.message`; the stack
+stays in the server log under the job's reference ID.
+
+#### Cancelling
+
+```bash
+curl -X DELETE "http://localhost:5000/admin/export/jobs/c1f0…" -H "x-api-key: $ADMIN_API_KEY"
+```
+
+Cancellation is cooperative: a queued job is cancelled immediately, and a
+running job stops at the next chunk boundary, discards its partial artifact and
+settles as `cancelled`. Cancelling a job that already finished returns `409
+Conflict`.
+
+#### Downloading
+
+```bash
+curl -L "http://localhost:5000/admin/export/jobs/c1f0…/download" -H "x-api-key: $ADMIN_API_KEY"
+```
+
+The download endpoint streams the artifact from disk with the same content type
+and `Content-Disposition` as the synchronous export. Artifacts expire
+`EXPORT_ARTIFACT_TTL` seconds after the job succeeds; after that the endpoint
+returns `410 Gone` and the file is deleted by the cleanup sweep. Re-running the
+export means creating a new job.
+
+#### Storage and worker configuration
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `EXPORT_ARTIFACT_DIR` | `stellar-payment-platform/var/exports` | Directory where finished artifacts are written. Must be writable by the server process and shared by every instance that may serve downloads. |
+| `EXPORT_ARTIFACT_TTL` | `86400` (24h) | Seconds a finished artifact stays downloadable before it is deleted. |
+| `EXPORT_WORKER_CONCURRENCY` | `2` | Maximum number of export jobs processed at once per instance. Queued jobs wait until a slot frees. |
+
+Workers stream rows straight to the artifact file, so memory use stays flat
+regardless of export size — the same bounded paging as the synchronous export,
+with no full result set or full CSV held in memory. Because jobs are persisted,
+a restart resumes `queued` jobs and marks `running` jobs `failed` so they can be
+retried; artifacts already on disk survive restarts until their TTL elapses.
+
+#### Monitoring
+
+Background exports add these metrics to `GET /metrics`:
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `export_jobs_queued` | gauge | Jobs waiting for a worker slot |
+| `export_jobs_running` | gauge | Jobs currently being processed |
+| `export_jobs_completed_total` | counter | Jobs finished, by `status` (`succeeded`, `failed`, `cancelled`) |
+| `export_job_duration_seconds` | histogram | Time from job start to terminal status |
+| `export_job_rows_written_total` | counter | Rows written across finished jobs |
+
+Alert on a sustained `export_jobs_queued` above `EXPORT_WORKER_CONCURRENCY` (the
+queue is not draining) and on any rise in `export_jobs_completed_total{status="failed"}`.
+=======
 
 ### `GET /admin/stats/routing`
 Returns historical payment routing statistics and aggregated volumes, fees, and transaction counts grouped by day, week, or month.
@@ -776,12 +943,13 @@ Returns historical payment routing statistics and aggregated volumes, fees, and 
   - `interval` (optional) – Alias for `groupBy`.
   - `weekStart` (optional) – Only meaningful with `groupBy=week`. `'monday'` (default) or `'sunday'`.
   - `assetCode` (optional) – Filter transactions by asset code (e.g., `XLM`, `USDC`).
-- **Headers:** `x-api-key` (required) – must match `ADMIN_API_KEY` (or pass `api_key` in query params).
+- **Headers:** `x-api-key` (required) – must hold the `admin:read` permission (or pass `api_key` in query params).
 - **Returns:** JSON object containing `interval`, `startDate`, `endDate`, `summary` (`total_volume`, `total_fees`, `total_count`), and `data` array of periodic records (`[{ period, volume, fees, count }]`).
 - **Status Codes:**
   - `200 OK`: Statistics retrieved successfully.
   - `400 Bad Request`: Invalid date format, `startDate` after `endDate`, invalid `groupBy`, or invalid `weekStart`.
   - `401 Unauthorized`: Missing or invalid API key.
+  - `403 Forbidden`: The key lacks `admin:read`.
 
 **Week boundaries:** with `groupBy=week`, periods are ISO weeks starting on
 Monday by default. Pass `weekStart=sunday` to group into Sunday-based weeks
@@ -792,13 +960,14 @@ weeks under each convention (e.g. a Sunday) will appear in different periods.
 Retrieves recent immutable audit trail records for mutating admin actions (`POST`, `PUT`, `DELETE`, `PATCH`).
 - **Query Parameters:**
   - `limit` (optional) – Maximum number of records to return (1-100, default 50).
-- **Headers:** `x-api-key` (required) – must match `ADMIN_API_KEY` (or pass `api_key` in query params).
+- **Headers:** `x-api-key` (required) – must hold the `admin:read` permission (or pass `api_key` in query params).
 - **Returns:** JSON object with `success: true`, `count`, and `data` array of audit records containing `action`, `method`, `path`, `userId`, `ipAddress`, `userAgent`, `statusCode`, `payload` (sensitive data redacted), and `createdAt`.
 - **Status Codes:**
   - `200 OK`: Audit logs retrieved successfully.
   - `401 Unauthorized`: Missing or invalid API key.
+  - `403 Forbidden`: The key lacks `admin:read`.
 
-Mutating admin requests are intercepted by `auditLogMiddleware` and recorded asynchronously upon response completion. Sensitive keys (`password`, `secret`, `apiKey`, `token`, `signature`, `privateKey`, `seed`) are deeply redacted before persistence.
+Mutating admin requests are intercepted by `auditLogMiddleware` and recorded asynchronously upon response completion. Sensitive keys (`password`, `secret`, `apiKey`, `token`, `signature`, `privateKey`, `seed`) are deeply redacted before persistence. Raw API key material is never persisted or returned after issuance; audit records for key rotation and revocation carry the redacted key identifier, the acting credential, and the reason. Step-up decisions record the challenge ID, action, payload hash, and outcome.
 
 ### `GET /metrics`
 

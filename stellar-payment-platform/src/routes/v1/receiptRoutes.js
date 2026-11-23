@@ -8,6 +8,7 @@ const {
   fetchTransaction,
   fetchPaymentsForTransaction,
 } = require('../../services/stellarService');
+const { requirePrincipal, assertOwnsAccount } = require('../../services/ownershipService');
 
 const router = express.Router();
 
@@ -32,6 +33,10 @@ router.get('/receipts/:txHash', asyncHandler(async (req, res, next) => {
     return next(new ApiError('INVALID_INPUT', 'Invalid transaction hash format'));
   }
 
+  // Ownership is derived exclusively from the authenticated principal; any
+  // caller-supplied username/address is ignored for authorization purposes.
+  const principal = requirePrincipal(req);
+
   let tx;
   let paymentOps;
 
@@ -51,6 +56,9 @@ router.get('/receipts/:txHash', asyncHandler(async (req, res, next) => {
       new ApiError('UPSTREAM_ERROR', 'Failed to fetch transaction from Horizon', { cause: err }),
     );
   }
+
+  // Only the owner of the underlying account/transaction may obtain a receipt.
+  assertOwnsAccount(principal, tx.source_account);
 
   const timestamp = tx.created_at
     ? new Date(tx.created_at).toUTCString()

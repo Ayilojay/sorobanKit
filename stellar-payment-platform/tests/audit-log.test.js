@@ -68,6 +68,12 @@ const {
   createAuditLogMiddleware,
   SENSITIVE_KEYS,
 } = require('../src/middleware/auditLog');
+const {
+  canonicalize,
+  computeDigest,
+  verifyChain,
+  AuditIntegrityChain,
+} = require('../src/audit/integrity');
 
 describe('Admin Audit Logging System', () => {
   beforeEach(() => {
@@ -299,6 +305,136 @@ describe('Admin Audit Logging System', () => {
           userId: 'custom-user',
         }),
       });
+    });
+  });
+
+  describe('Audit integrity: canonicalization', () => {
+    it('produces identical canonical output regardless of key ordering', () => {
+      const a = { b: 2, a: 1, nested: { z: 'last', y: 'first' } };
+      const b = { nested: { y: 'first', z: 'last' }, a: 1, b: 2 };
+      expect(canonicalize(a)).toBe(canonicalize(b));
+    });
+
+    it('preserves array order while canonicalizing nested objects', () => {
+      const a = { list: [{ b: 1, a: 2 }, { d: 4, c: 3 }] };
+      const b = { list: [{ a: 2, b: 1 }, { c: 3, d: 4 }] };
+      expect(canonicalize(a)).toBe(canonicalize(b));
+      expect(canonicalize({ list: [1, 2] })).not.toBe(canonicalize({ list: [2, 1] }));
+    });
+
+    it('produces a stable keyed digest for equivalent events', () => {
+      const key = 'test-integrity-key';
+      const eventA = { action: 'POST /admin/block', userId: 'admin', payload: { b: 1, a: 2 } };
+      const eventB = { payload: { a: 2, b: 1 }, userId: 'admin', action: 'POST /admin/block' };
+      expect(computeDigest(eventA, key)).toBe(computeDigest(eventB, key));
+    });
+
+    it('produces different digests for different keys or different content', () => {
+      const event = { action: 'POST /admin/block', userId: 'admin' };
+      expect(computeDigest(event, 'key-1')).not.toBe(computeDigest(event, 'key-2'));
+      expect(computeDigest(event, 'key-1')).not.toBe(
+        computeDigest({ ...event, userId: 'other' }, 'key-1')
+      );
+    });
+  });
+
+  describe('Audit integrity: chain verification', () => {
+    const key = 'chain-key';
+
+    function buildChain(events) {
+      const chain = new AuditIntegrityChain({ keys: [key] });
+      return events.map((event) => chain.append(event));
+    }
+
+    it('verifies an untampered chain successfully', () => {
+      const records = buildChain([
+        { action: 'a', userId: 'u1' },
+        { action: 'b', userId: 'u2' },
+        { action: 'c', userId: 'u3' },
+      ]);
+      const result = verifyChain(records, { keys: [key] });
+      expect(result.valid).toBe(true);
+      expect(result.brokenAt).toBeNull();
+    });
+
+    it('detects tampering when a record is modified', () => {
+      const records = buildChain([
+        { action: 'a', userId: 'u1' },
+        { action: 'b', userId: 'u2' },
+        { action: 'c', userId: 'u3' },
+      ]);
+      records[1] = { ...records[1], event: { ...records[1].event, userId: 'attacker' } };
+      const result = verifyChain(records, { keys: [key] });
+      expect(result.valid).toBe(false);
+      expect(result.brokenAt).toBe(1);
+    });
+
+    it('detects tampering when a record is deleted from the middle', () => {
+      const records = buildChain([
+        { action: 'a', userId: 'u1' },
+        { action: 'b', userId: 'u2' },
+        { action: 'c', userId: 'u3' },
+      ]);
+      const tampered = [records[0], records[2]];
+      const result = verifyChain(tampered, { keys: [key] });
+      expect(result.valid).toBe(false);
+      expect(result.brokenAt).toBe(1);
+    });
+
+    it('detects tampering when the head record is deleted', () => {
+      const records = buildChain([
+        { action: 'a', userId: 'u1' },
+        { action: 'b', userId: 'u2' },
+      ]);
+      const result = verifyChain([records[1]], { keys: [key] });
+      expect(result.valid).toBe(false);
+    });
+  });
+
+  describe('Audit integrity: key rotation', () => {
+    it('verifies records written under previous and current keys', () => {
+      const oldKey = 'old-key';
+      const newKey = 'new-key';
+
+      const oldChain = new AuditIntegrityChain({ keys: [oldKey] });
+      const r1 = oldChain.append({ action: 'a', userId: 'u1' });
+      const r2 = oldChain.append({ action: 'b', userId: 'u2' });
+
+      const rotatedChain = new AuditIntegrityChain({
+        keys: [newKey, oldKey],
+        previous: r2,
+      });
+      const r3 = rotatedChain.append({ action: 'c', userId: 'u3' });
+
+      const result = verifyChain([r1, r2, r3], { keys: [newKey, oldKey] });
+      expect(result.valid).toBe(true);
+    });
+
+    it('fails verification when the key used to sign is not available', () => {
+      const chain = new AuditIntegrityChain({ keys: ['retired-key'] });
+      const records = [chain.append({ action: 'a', userId: 'u1' })];
+      const result = verifyChain(records, { keys: ['new-key'] });
+      expect(result.valid).toBe(false);
+    });
+  });
+
+  describe('Audit integrity: concurrent writes', () => {
+    it('serializes concurrent appends into a valid chain', async () => {
+      const key = 'concurrent-key';
+      const chain = new AuditIntegrityChain({ keys: [key] });
+
+      const records = await Promise.all(
+        Array.from({ length: 25 }, (_, i) =>
+          chain.append({ action: `action-${i}`, userId: `u-${i}` })
+        )
+      );
+
+      expect(records).toHaveLength(25);
+      const result = verifyChain(records, { keys: [key] });
+      expect(result.valid).toBe(true);
+      // Sequence numbers must be unique and contiguous.
+      const seqs = records.map((r) => r.sequence).sort((a, b) => a - b);
+      expect(seqs).toEqual(Array.from({ length: 25 }, (_, i) => i));
     });
   });
 

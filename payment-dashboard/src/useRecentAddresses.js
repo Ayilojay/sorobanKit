@@ -1,24 +1,24 @@
 import { useCallback, useState } from 'react';
+import {
+  readDraft,
+  writeDraft,
+  clearDraft,
+  DRAFT_KINDS,
+} from './draftPersistence';
 
 const STORAGE_KEY = 'recent_transactions';
 const MAX_ENTRIES = 5;
 
 /**
  * Reads the recent address list from localStorage.
- * Returns an empty array if nothing is stored or the data is malformed.
+ * Returns an empty array if nothing is stored, the data is malformed,
+ * or the stored draft is expired / bound to a different account or network.
  * @returns {string[]}
  */
 function readFromStorage() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return [];
-    /** @type {unknown} */
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter((entry) => typeof entry === 'string');
-  } catch {
-    return [];
-  }
+  const stored = readDraft(STORAGE_KEY, DRAFT_KINDS.RECENT_ADDRESSES);
+  if (!stored) return [];
+  return stored.filter((entry) => typeof entry === 'string');
 }
 
 /**
@@ -54,22 +54,16 @@ export function useRecentAddresses() {
       // Remove existing occurrence to avoid duplicates, then prepend.
       const deduped = prev.filter((entry) => entry !== trimmed);
       const updated = [trimmed, ...deduped].slice(0, MAX_ENTRIES);
-      try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
-      } catch {
-        // Quota exceeded or private browsing — silently skip persistence.
-      }
+      // Only non-secret address/username strings are persisted; the draft
+      // module binds them to the active account/network and applies expiry.
+      writeDraft(STORAGE_KEY, DRAFT_KINDS.RECENT_ADDRESSES, updated);
       return updated;
     });
   }, []);
 
   /** Wipes the stored list from both state and localStorage. */
   const clearAddresses = useCallback(() => {
-    try {
-      localStorage.removeItem(STORAGE_KEY);
-    } catch {
-      // Ignore storage errors.
-    }
+    clearDraft(STORAGE_KEY);
     setRecentAddresses([]);
   }, []);
 

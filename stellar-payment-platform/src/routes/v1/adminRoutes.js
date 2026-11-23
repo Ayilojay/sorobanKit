@@ -10,6 +10,8 @@
  *  POST /admin/block          – flag (soft-block) an address
  *  GET  /admin/export         – stream transaction records as CSV or JSON
  *  GET  /admin/stats/routing  – fetch historical payment routing statistics
+ *  GET  /admin/audit-logs     – list recent admin audit logs (with integrity fields)
+ *  GET  /admin/audit-logs/verify – walk the audit chain and report breaks
  */
 const express = require('express');
 const registerAdminExport = require('./adminExport');
@@ -29,7 +31,51 @@ const { idempotencyMiddleware } = require('../../../middleware/idempotency');
 const { ACTIVITY_ACTIONS, recordActivity } = require('../../services/activityService');
 const { PRIMARY_USERNAME_ORDER } = require('../../utils');
 const { ApiError } = require('../../errors');
+const {
+  PERMISSIONS,
+  requirePermission,
+  auditPermissionDecision,
+} = require('../../middleware/adminPermission');
+const {
+  requireStepUp,
+  issueStepUpChallenge,
+} = require('../../middleware/stepUp');
 
+// Integrity fields that are safe to expose alongside audit records. These are
+// derived from the canonicalized event and do not reveal redacted payloads.
+const AUDIT_INTEGRITY_FIELDS = ['digest', 'prevDigest', 'keyId'];
+
+/**
+ * Projects an audit log row onto the public response shape, preserving the
+ * existing redaction behavior while surfacing the integrity-link fields.
+ */
+const projectAuditLog = (log) => {
+  const projected = { ...log };
+  for (const field of AUDIT_INTEGRITY_FIELDS) {
+    projected[field] = log[field] ?? null;
+  }
+  return projected;
+};
+
+/**
+ * Walks the audit chain in ascending order and verifies each link.
+ *
+ * Returns a report describing the total number of records checked, whether the
+ * chain is intact, and the first break (if any) with its reason.
+ *
+ * The actual digest recomputation is delegated to the audit integrity service
+ * so that key rotation and canonicalization rules live in one place.
+ */
+const verifyAuditChain = async (prisma, { limit } = {}) => {
+  const { verifyAuditLogChain } = require('../../services/auditIntegrityService');
+
+  const logs = await prisma.auditLog.findMany({
+    orderBy: { createdAt: 'asc' },
+    ...(limit ? { take: limit } : {}),
+  });
+
+  return verifyAuditLogChain(logs);
+};
 
 module.exports = (redisClient) => {
 
@@ -46,16 +92,58 @@ module.exports = (redisClient) => {
     return require('../../../prismaClient');
   };
 
-  const adminAuth = (req, _res, next) => {
-    if (req.apiKeyRecord?.scopes?.includes('admin')) return next();
-    const apiKey = req.headers['x-api-key'] || req.query.api_key;
-    if (!apiKey || apiKey !== process.env.ADMIN_API_KEY) {
-      return next(new ApiError('UNAUTHENTICATED', 'Invalid or missing API key'));
-    }
-    next();
-  };
+  // ── Centralized policy-based authorization ───────────────────────────────
+  //
+  // Every admin route declares the permission it needs. `requirePermission`
+  // resolves the caller's roles/scopes to a permission set, keeps the legacy
+  // ADMIN_API_KEY path working as a compatibility fallback (treated as the
+  // full administrative role), and records an audit entry for each decision.
+  const adminAuth = requirePermission(PERMISSIONS.READ);
 
-  registerAdminExport(router, adminAuth, getPrisma);
+  // ── Step-up challenge issuance ───────────────────────────────────────────
+  //
+  // High-impact actions (contract upgrades, treasury changes, bulk exports)
+  // require a short-lived, single-use confirmation bound to the action and a
+  // hash of the request payload. Clients obtain the challenge here, then
+  // replay the action with the returned token in the `x-step-up-token` header.
+  router.post(
+    '/admin/step-up/challenge',
+    requirePermission(PERMISSIONS.OPERATIONAL),
+    asyncHandler(async (req, res) => {
+      const { action, payload } = req.body || {};
+      if (!action || typeof action !== 'string') {
+        throw new ApiError('INVALID_INPUT', 'Missing or invalid action');
+      }
+
+      const challenge = await issueStepUpChallenge({
+        redisClient,
+        req,
+        action,
+        payload,
+      });
+
+      auditPermissionDecision(req, {
+        permission: PERMISSIONS.OPERATIONAL,
+        outcome: 'granted',
+        action: 'step_up_challenge_issued',
+        metadata: { stepUpAction: action },
+      });
+
+      return res.status(201).json({
+        success: true,
+        ...challenge,
+      });
+    }),
+  );
+
+  // Bulk exports are high-impact: they require the read permission plus a
+  // step-up confirmation bound to the export parameters.
+  registerAdminExport(
+    router,
+    requirePermission(PERMISSIONS.READ),
+    getPrisma,
+    { stepUp: requireStepUp('admin.export') },
+  );
 
 /**
  * @openapi
@@ -68,7 +156,10 @@ module.exports = (redisClient) => {
  *       200:
  *         description: Success
  */
-router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
+router.post(
+  '/admin/block',
+  requirePermission(PERMISSIONS.OPERATIONAL),
+  asyncHandler(async (req, res, next) => {
     const { prisma, withTransaction } = getPrisma();
     const { address } = req.body;
 
@@ -120,7 +211,11 @@ router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
     }
   }));
 
-  registerAdminDlqRoutes(router, adminAuth, getPrisma);
+  registerAdminDlqRoutes(
+    router,
+    requirePermission(PERMISSIONS.OPERATIONAL),
+    getPrisma,
+  );
 
   // ── GET /admin/stats/routing ─────────────────────────────────────────────
 
@@ -137,7 +232,7 @@ router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
    */
   router.get(
     '/admin/stats/routing',
-    adminAuth,
+    requirePermission(PERMISSIONS.READ),
     validateSchema({ query: adminRoutingStatsQuerySchema }),
     asyncHandler(async (req, res) => {
       const { startDate, endDate, groupBy, interval, assetCode } = req.query;
@@ -172,7 +267,11 @@ router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
     }),
   );
 
-  registerAdminUserRoutes(router, adminAuth, getPrisma);
+  registerAdminUserRoutes(
+    router,
+    requirePermission(PERMISSIONS.CONFIGURATION),
+    getPrisma,
+  );
 
   // ── GET /admin/audit-logs ────────────────────────────────────────────────
 
@@ -181,6 +280,10 @@ router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
    *
    * Query parameters:
    *  - limit (optional) integer between 1 and 100, default 50
+   *
+   * Each record includes its integrity-link fields (digest, prevDigest, keyId)
+   * so callers can independently verify the chain. Redaction of sensitive
+   * payload fields is unchanged.
    */
   
 /**
@@ -196,7 +299,7 @@ router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
  */
 router.get(
     '/admin/audit-logs',
-    adminAuth,
+    requirePermission(PERMISSIONS.READ),
     validateSchema({ query: adminAuditLogsQuerySchema }),
     asyncHandler(async (req, res) => {
       const { prisma } = getPrisma();
@@ -209,10 +312,59 @@ router.get(
       return res.status(200).json({
         success: true,
         count: logs.length,
-        data: logs,
+        data: logs.map(projectAuditLog),
+      });
+    }),
+  );
+
+  // ── GET /admin/audit-logs/verify ─────────────────────────────────────────
+
+  /**
+   * Walks the audit chain and reports any integrity breaks.
+   *
+   * Query parameters:
+   *  - limit (optional) integer between 1 and 100, default 50 — caps the number
+   *    of records walked (oldest-first) for bounded verification.
+   *
+   * Response:
+   *  - success: true when the chain is intact, false when a break is detected
+   *  - checked: number of records walked
+   *  - intact: boolean
+   *  - break: { index, id, reason } | null — first detected break
+   */
+  
+/**
+ * @openapi
+ * /admin/audit-logs/verify:
+ *   get:
+ *     tags:
+ *       - v1
+ *     description: GET /admin/audit-logs/verify
+ *     responses:
+ *       200:
+ *         description: Success
+ */
+router.get(
+    '/admin/audit-logs/verify',
+    adminAuth,
+    validateSchema({ query: adminAuditLogsQuerySchema }),
+    asyncHandler(async (req, res) => {
+      const { prisma } = getPrisma();
+      const limit = req.query.limit;
+
+      const report = await verifyAuditChain(prisma, { limit });
+
+      return res.status(200).json({
+        success: report.intact,
+        checked: report.checked,
+        intact: report.intact,
+        break: report.break ?? null,
       });
     }),
   );
 
   return router;
 };
+</｜｜DSML｜｜ parameter>
+</｜｜DSML｜｜ invoke>
+</｜｜DSML｜｜ calls>

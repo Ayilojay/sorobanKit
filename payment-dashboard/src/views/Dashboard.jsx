@@ -13,6 +13,18 @@ import { useRecentAddresses } from '../useRecentAddresses';
 import { getFederation, getLookup } from '../api/client';
 import { useConnectivity } from '../useConnectivity';
 import {
+  EmptyState,
+  ErrorState,
+  LoadingState,
+  PartialDataNotice,
+} from '../components/StateViews';
+import {
+  clearPaymentDraft,
+  isDraftCompatible,
+  loadPaymentDraft,
+  savePaymentDraft,
+} from '../paymentDraft';
+import {
   API_BASE,
   NAV_STORAGE_KEY,
   TOKEN_ADDRESS,
@@ -33,6 +45,8 @@ import {
   isPaymentCoordinationStale,
   createPaymentOperationId,
 } from '../paymentCoordination';
+
+const ACTIVE_NETWORK = networks.testnet.networkPassphrase;
 
 /**
  * @typedef {Object} DashboardProps
@@ -95,6 +109,9 @@ function Dashboard({
   const [isProcessing, setIsProcessing] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isReceiving, setIsReceiving] = useState(false)
+  const [receiveError, setReceiveError] = useState('')
+  const [draftRestored, setDraftRestored] = useState(false)
+  const [draftExpired, setDraftExpired] = useState(false)
   const [activeBalancePanel, setActiveBalancePanel] = useState('')
   const [showBalance, setShowBalance] = useState(true)
   const [receiveAddress, setReceiveAddress] = useState('')
@@ -109,6 +126,7 @@ function Dashboard({
     color: "#1F2937",
     bgColor: "#F3F4F6",
   });
+  const [isConfirmOpen, setIsConfirmOpen] = useState(false);
 
   // Centralized focus + live-region announcements. Background refreshes pass
   // `{ background: true }` so they never steal focus from the user.
@@ -132,14 +150,8 @@ function Dashboard({
     if (balance === null || balance === undefined || balance === '') {
       return '--';
     }
-    const numericBalance = Number(balance);
-    if (Number.isNaN(numericBalance)) {
-      return String(balance);
-    }
-    return numericBalance.toLocaleString(undefined, {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 7,
-    });
+    const formatted = formatAmount(balance);
+    return formatted === null ? String(balance) : formatted;
   }, [balance]);
 
   // Derived state: whether the wallet is currently connected.
@@ -157,15 +169,12 @@ function Dashboard({
     [nameTag],
   );
 
-  // Derived state: parsed numeric amount, recomputed only when amount changes.
-  const parsedAmount = useMemo(() => {
-    const value = parseFloat(amount);
-    return Number.isNaN(value) ? 0 : value;
-  }, [amount]);
+  // Derived state: parsed decimal-safe amount, recomputed only when amount changes.
+  const parsedAmount = useMemo(() => parseAmount(amount), [amount]);
 
   // Derived state: whether the entered amount is valid for submission.
   const hasValidAmount = useMemo(
-    () => parsedAmount > 0,
+    () => parsedAmount !== null && parsedAmount > 0n,
     [parsedAmount],
   );
 
@@ -186,6 +195,37 @@ function Dashboard({
     () => recentAddresses.length > 0,
     [recentAddresses],
   );
+
+  // Derived state: whether there is a draft worth surfacing a control for.
+  const hasDraft = useMemo(
+    () => Boolean(nameTag.trim() || amount.trim()),
+    [nameTag, amount],
+  );
+
+  /**
+   * Discard any persisted draft that is not bound to the current account and
+   * network. Drafts are only ever restored for an exact account/network match.
+   */
+  const discardIncompatibleDraft = useCallback(() => {
+    if (!userPublicKey) {
+      clearPaymentDraft();
+      return;
+    }
+    const draft = loadPaymentDraft();
+    if (draft && !isDraftCompatible(draft, userPublicKey, ACTIVE_NETWORK)) {
+      clearPaymentDraft();
+    }
+  }, [userPublicKey]);
+
+  const handleClearDraft = useCallback(() => {
+    clearPaymentDraft();
+    setNameTag('');
+    setAmount('');
+    setDraftRestored(false);
+    setDraftExpired(false);
+    displayMessage('Draft cleared.', '#1F2937', '#F3F4F6');
+    recipientRef.current?.focus();
+  }, []);
 
   /**
    * @param {string} text
@@ -211,8 +251,11 @@ function Dashboard({
       return;
     }
 
+    let cancelled = false;
+
     const loadReceiveDetails = async () => {
       setIsReceiving(true);
+      setReceiveError('');
       displayReceiveMessage(
         "Loading your receive details...",
         "#1F2937",
@@ -221,6 +264,8 @@ function Dashboard({
 
       try {
         const { response, data } = await getLookup(userPublicKey);
+
+        if (cancelled) return;
 
         if (response.ok && data) {
           setReceiveAddress(data.address);
@@ -249,8 +294,13 @@ function Dashboard({
 
         throw new Error(apiErrorMessage(data, `Backend error (${response.status}).`))
       } catch (error){
+        if (cancelled) return;
+        // Keep the raw wallet address usable even when the lookup fails.
         setReceiveAddress(userPublicKey)
         setReceiveTag('')
+        setReceiveError(
+          error instanceof Error ? error.message : 'Unable to load receive details.',
+        )
         displayReceiveMessage(
           error instanceof Error ? error.message : 'Unable to load receive details.',
           '#DC2626',
@@ -258,11 +308,15 @@ function Dashboard({
         )
         onRegistrationStateChange('unknown')
       } finally {
-        setIsReceiving(false);
+        if (!cancelled) setIsReceiving(false);
       }
     };
 
     loadReceiveDetails();
+
+    return () => {
+      cancelled = true;
+    };
   }, [userPublicKey, onRegistrationStateChange]);
 
   // Focus the page heading on mount / route entry instead of the recipient
@@ -349,7 +403,20 @@ function Dashboard({
     displayMessage("Wallet connected.", "#059669", "#D1FAE5");
   };
 
-  const handleLookup = async () => {
+  const handleLookup = () => {
+    if (isSubmitting) return;
+
+    const amountValue = parseAmount(amount);
+
+    if (amountValue === null || amountValue <= 0n) {
+      toast.error("Please enter a valid amount greater than zero.");
+      return;
+    }
+
+    setIsConfirmOpen(true);
+  };
+
+  const handleConfirmPayment = async () => {
     if (isSubmitting) return;
     if (!isOnline) {
       toast.error("You are offline. Payments are disabled until you reconnect.");
@@ -358,9 +425,9 @@ function Dashboard({
     setIsSubmitting(true);
 
     const recipientInput = nameTag.trim();
-    const amountValue = parseFloat(amount);
+    const amountValue = parseAmount(amount);
 
-    if (!amountValue || Number.isNaN(amountValue) || amountValue <= 0) {
+    if (amountValue === null || amountValue <= 0n) {
       toast.error("Please enter a valid amount greater than zero.");
       announce("Please enter a valid amount greater than zero.", 'assertive');
       setIsSubmitting(false);
@@ -407,7 +474,7 @@ function Dashboard({
       }
 
       toast.loading("Simulating smart contract execution...", { id: toastId });
-      const amountStroops = BigInt(Math.floor(amountValue * 10000000));
+      const amountStroops = toStroops(amountValue);
 
       // Build and simulate the payment through the type-safe client generated
       // from the contract ABI (packages/types).
@@ -461,6 +528,7 @@ function Dashboard({
     } finally {
       setIsProcessing(false);
       setIsSubmitting(false);
+      setIsConfirmOpen(false);
     }
   };
 
@@ -531,7 +599,17 @@ function Dashboard({
         <div className="balance-value" data-testid="dashboard-balance-value">
           {showBalance ? formattedBalance : "••••••"}
         </div>
-        {balanceError && <p className="balance-error">{balanceError}</p>}
+        {isRefreshing && !balanceError && (
+          <LoadingState label="Refreshing balance..." />
+        )}
+        {balanceError && (
+          <ErrorState
+            title="Balance unavailable"
+            message={balanceError}
+            onRetry={onRefreshBalance}
+            retryLabel="Retry balance"
+          />
+        )}
         <button
           type="button"
           onClick={onRefreshBalance}
@@ -573,7 +651,36 @@ function Dashboard({
           onChange={(event) => setAmount(event.target.value)}
           placeholder="0.00"
           inputMode="decimal"
+          aria-describedby="amount-hint"
+          aria-invalid={amount.trim().length > 0 && !hasValidAmount}
         />
+        <p id="amount-hint" className="field-hint">
+          Enter an amount with up to 7 decimal places.
+        </p>
+
+        {draftRestored && (
+          <PartialDataNotice
+            message="Restored a saved draft for this account and network."
+            actionLabel="Clear draft"
+            onAction={handleClearDraft}
+          />
+        )}
+        {draftExpired && (
+          <PartialDataNotice
+            message="Your saved draft expired and was discarded."
+            actionLabel="Dismiss"
+            onAction={() => setDraftExpired(false)}
+          />
+        )}
+        {hasDraft && !draftRestored && (
+          <button
+            type="button"
+            className="draft-clear"
+            onClick={handleClearDraft}
+          >
+            Clear draft
+          </button>
+        )}
 
         <button
           type="button"
@@ -586,6 +693,24 @@ function Dashboard({
         >
           {isProcessing ? "Processing..." : "Send Payment"}
         </button>
+
+        <Dialog
+          isOpen={isConfirmOpen}
+          onClose={() => setIsConfirmOpen(false)}
+          title="Confirm payment"
+          description="Review the details below before submitting."
+          confirmLabel="Confirm and send"
+          cancelLabel="Cancel"
+          onConfirm={handleConfirmPayment}
+          isBusy={isProcessing}
+        >
+          <dl className="confirm-details">
+            <dt>Recipient</dt>
+            <dd>{nameTag.trim()}</dd>
+            <dt>Amount</dt>
+            <dd>{formatAmount(amount) ?? amount}</dd>
+          </dl>
+        </Dialog>
 
         {status.text && (
           <p
@@ -600,10 +725,25 @@ function Dashboard({
       <section className="receive-panel" data-testid="dashboard-receive-panel">
         <h2>Receive</h2>
         {isReceiving ? (
-          <p>Loading...</p>
+          <LoadingState label="Loading your receive details..." />
         ) : (
           <>
-            <p>{receiveTag ? formatUsername(receiveTag) : receiveAddress}</p>
+            {receiveAddress ? (
+              <p>{receiveTag ? formatUsername(receiveTag) : receiveAddress}</p>
+            ) : (
+              <EmptyState
+                title="No receive details yet"
+                message="Connect your wallet to load your username or address."
+              />
+            )}
+            {receiveError && (
+              <ErrorState
+                title="Could not load your username"
+                message={receiveError}
+                onRetry={() => onRegistrationStateChange('unknown')}
+                retryLabel="Retry lookup"
+              />
+            )}
             {receiveStatus.text && (
               <p
                 className="status-message"

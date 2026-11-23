@@ -966,6 +966,304 @@ function flushLogs() {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Migration SQL lint (expand / contract guard)
+// ---------------------------------------------------------------------------
+// Enforces the expand-contract migration discipline so rolling deploys stay
+// zero-downtime:
+//
+//   expand    -> additive, backwards-compatible changes (add nullable column,
+//                add index, backfill UPDATE). Always allowed.
+//   contract  -> destructive changes (DROP COLUMN, DROP TABLE, narrowing a
+//                column type, ADD COLUMN ... NOT NULL without a DEFAULT).
+//                Rejected unless explicitly allowed, because old instances
+//                still running during a rolling deploy would break.
+//
+// The lint is intentionally a lightweight SQL scanner, not a full parser: it
+// strips comments and string literals, then matches the handful of statement
+// shapes that matter for compatibility. It errs on the side of flagging.
+// ---------------------------------------------------------------------------
+
+/** Types considered "narrower" than their common predecessors. */
+const NARROWING_TYPES = new Set([
+  'smallint',
+  'int2',
+  'integer',
+  'int',
+  'int4',
+  'bigint',
+  'int8',
+  'varchar',
+  'character varying',
+  'char',
+  'character',
+  'text',
+  'date',
+  'timestamp',
+  'timestamptz',
+  'timestamp with time zone',
+  'timestamp without time zone',
+  'real',
+  'float4',
+  'double precision',
+  'float8',
+  'numeric',
+  'decimal',
+  'boolean',
+  'bool',
+  'uuid',
+]);
+
+/**
+ * Removes SQL line comments (`-- ...`), block comments (`/* ... *\/`) and
+ * single-quoted string literals so keyword matching is not fooled by content
+ * inside them. String literals are replaced with a placeholder.
+ * @param {string} sql
+ * @returns {string}
+ */
+function stripSqlNoise(sql) {
+  let out = '';
+  let i = 0;
+  const len = sql.length;
+  while (i < len) {
+    const ch = sql[i];
+    const next = sql[i + 1];
+    if (ch === '-' && next === '-') {
+      while (i < len && sql[i] !== '\n') i += 1;
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      i += 2;
+      while (i < len && !(sql[i] === '*' && sql[i + 1] === '/')) i += 1;
+      i += 2;
+      continue;
+    }
+    if (ch === "'") {
+      i += 1;
+      while (i < len) {
+        if (sql[i] === "'" && sql[i + 1] === "'") {
+          i += 2;
+          continue;
+        }
+        if (sql[i] === "'") {
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      out += "''";
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+  return out;
+}
+
+/**
+ * Splits a SQL script into individual statements on top-level semicolons.
+ * @param {string} sql
+ * @returns {string[]}
+ */
+function splitStatements(sql) {
+  return stripSqlNoise(sql)
+    .split(';')
+    .map((stmt) => stmt.trim())
+    .filter((stmt) => stmt.length > 0);
+}
+
+/**
+ * Normalises a SQL type expression for comparison.
+ * @param {string} raw
+ * @returns {string}
+ */
+function normalizeType(raw) {
+  return (raw || '')
+    .toLowerCase()
+    .replace(/\([^)]*\)/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Lints a single migration SQL statement.
+ * @param {string} statement
+ * @param {{ allowDestructive?: boolean }} [options]
+ * @returns {Array<{ rule: string, message: string, statement: string }>}
+ */
+function lintStatement(statement, options = {}) {
+  const allowDestructive = Boolean(options.allowDestructive);
+  const findings = [];
+  const normalized = statement.replace(/\s+/g, ' ').trim();
+  const lower = normalized.toLowerCase();
+
+  const add = (rule, message) => {
+    if (allowDestructive) return;
+    findings.push({ rule, message, statement: normalized });
+  };
+
+  // DROP TABLE
+  if (/^drop\s+table\b/.test(lower)) {
+    add(
+      'drop-table',
+      'DROP TABLE is destructive; use the contract phase after all code stops reading the table.'
+    );
+    return findings;
+  }
+
+  // DROP COLUMN (also covers ALTER TABLE ... DROP COLUMN)
+  if (/\bdrop\s+column\b/.test(lower)) {
+    add(
+      'drop-column',
+      'DROP COLUMN is destructive; move it to the contract phase once no code references the column.'
+    );
+    return findings;
+  }
+
+  // ALTER COLUMN ... TYPE <narrower>
+  const alterType = lower.match(
+    /\balter\s+column\s+\S+\s+(?:set\s+data\s+)?type\s+([a-z0-9_ ]+?)(?:\s+using\b|$|\s+(?:not|null|default)\b)/
+  );
+  if (alterType) {
+    const target = normalizeType(alterType[1]);
+    if (NARROWING_TYPES.has(target)) {
+      add(
+        'narrowing-type',
+        `ALTER COLUMN ... TYPE ${target} may narrow the column and break old readers; add a new column and backfill instead.`
+      );
+    }
+  }
+
+  // ADD COLUMN ... NOT NULL without DEFAULT
+  const addColumn = lower.match(/\badd\s+column\s+(?:if\s+not\s+exists\s+)?\S+/);
+  if (addColumn) {
+    const hasNotNull = /\bnot\s+null\b/.test(lower);
+    const hasDefault = /\bdefault\b/.test(lower);
+    if (hasNotNull && !hasDefault) {
+      add(
+        'add-not-null-without-default',
+        'ADD COLUMN ... NOT NULL without DEFAULT fails on non-empty tables and breaks old writers; add it nullable, backfill, then enforce NOT NULL in the contract phase.'
+      );
+    }
+  }
+
+  return findings;
+}
+
+/**
+ * Lints a migration SQL script.
+ *
+ * @param {string} sql Raw migration SQL.
+ * @param {{ allowDestructive?: boolean }} [options]
+ * @returns {{ ok: boolean, findings: Array<{ rule: string, message: string, statement: string }> }}
+ */
+function lintMigrationSql(sql, options = {}) {
+  const findings = [];
+  for (const statement of splitStatements(sql || '')) {
+    findings.push(...lintStatement(statement, options));
+  }
+  return { ok: findings.length === 0, findings };
+}
+
+/**
+ * Lints every `*.sql` file in a directory (non-recursive).
+ * @param {string} dir
+ * @param {{ allowDestructive?: boolean }} [options]
+ * @returns {{ ok: boolean, findings: Array<{ file: string, rule: string, message: string, statement: string }> }}
+ */
+function lintMigrationDir(dir, options = {}) {
+  const findings = [];
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (err) {
+    return {
+      ok: false,
+      findings: [
+        {
+          file: dir,
+          rule: 'read-error',
+          message: `Could not read migration directory: ${err.message}`,
+          statement: '',
+        },
+      ],
+    };
+  }
+
+  const files = entries
+    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith('.sql'))
+    .map((entry) => entry.name)
+    .sort();
+
+  for (const name of files) {
+    const fullPath = path.join(dir, name);
+    let sql;
+    try {
+      sql = fs.readFileSync(fullPath, 'utf8');
+    } catch (err) {
+      findings.push({
+        file: name,
+        rule: 'read-error',
+        message: `Could not read migration file: ${err.message}`,
+        statement: '',
+      });
+      continue;
+    }
+    const result = lintMigrationSql(sql, options);
+    for (const finding of result.findings) {
+      findings.push({ file: name, ...finding });
+    }
+  }
+
+  return { ok: findings.length === 0, findings };
+}
+
+/**
+ * CLI entry point for the migration lint.
+ *
+ * Usage:
+ *   node src/migrate-check.js --lint <dir> [--allow-destructive]
+ *
+ * Exits 0 when clean, 1 when violations are found, 2 on usage errors.
+ * @param {string[]} argv
+ * @returns {number} process exit code
+ */
+function runLintCli(argv) {
+  const args = argv.slice();
+  const lintIndex = args.indexOf('--lint');
+  if (lintIndex === -1) {
+    process.stderr.write('Usage: node src/migrate-check.js --lint <dir> [--allow-destructive]\n');
+    return 2;
+  }
+
+  const allowDestructive = args.includes('--allow-destructive');
+  const dir = args[lintIndex + 1];
+  if (!dir || dir.startsWith('--')) {
+    process.stderr.write('Error: --lint requires a migration directory argument.\n');
+    return 2;
+  }
+
+  const result = lintMigrationDir(dir, { allowDestructive });
+  if (result.ok) {
+    process.stdout.write(`[migrate-lint] ${dir}: no destructive changes detected.\n`);
+    return 0;
+  }
+
+  process.stderr.write(
+    `[migrate-lint] ${result.findings.length} destructive change(s) detected in ${dir}:\n`
+  );
+  for (const finding of result.findings) {
+    process.stderr.write(`  - ${finding.file} [${finding.rule}] ${finding.message}\n`);
+    if (finding.statement) {
+      process.stderr.write(`      ${finding.statement}\n`);
+    }
+  }
+  process.stderr.write(
+    '\nSplit destructive changes into a separate contract-phase migration and re-run with --allow-destructive.\n'
+  );
+  return 1;
+}
+
 module.exports = {
   checkMigrations,
   enforceMigrationPolicy,
@@ -973,12 +1271,9 @@ module.exports = {
   classifyStatus,
   runMigrateStatus,
   flushLogs,
-  sha256,
-  computeMigrationChecksums,
-  loadManifest,
-  saveManifest,
-  compareManifest,
-  getSchemaReport,
+  lintMigrationSql,
+  lintMigrationDir,
+  runLintCli,
   PRISMA_BIN,
   // Compatibility preflight (issue #469)
   parseMigrationStatements,

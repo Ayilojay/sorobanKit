@@ -181,6 +181,16 @@ describe('POST /api/v1/register — is_primary field (issue #76)', () => {
       .set('Content-Type', 'application/json')
       .send(makeRegisterPayload({ username: 'alice123' }));
 
+    // Primary assignment is derived from the count of active (non-deleted)
+    // usernames for the address inside the registration transaction.
+    expect(mockCount).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          address: VALID_ADDRESS,
+          deletedAt: null,
+        }),
+      }),
+    );
     expect(mockCreate).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({ isPrimary: true }),
@@ -261,6 +271,102 @@ describe('POST /api/v1/register — is_primary field (issue #76)', () => {
 
     expect(res.status).toBe(409);
     expect(mockCreate).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/v1/register — single active primary invariant (issue #386)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockCount.mockResolvedValue(0);
+    mockFindFirst.mockResolvedValue(null);
+    mockCreate.mockResolvedValue({
+      username: 'alice123',
+      address: VALID_ADDRESS,
+      isPrimary: true,
+    });
+  });
+
+  it('returns 409 CONFLICT when a second primary is attempted for the same address', async () => {
+    // Simulate the partial unique index rejecting a second active primary.
+    const uniqueErr = new Error(
+      'Unique constraint failed on the fields: (`address`)',
+    );
+    uniqueErr.code = 'P2002';
+    uniqueErr.meta = { target: ['address'] };
+    mockCreate.mockRejectedValue(uniqueErr);
+
+    const res = await request(app)
+      .post('/api/v1/register')
+      .set('Content-Type', 'application/json')
+      .send(makeRegisterPayload({ username: 'alicepay' }));
+
+    expect(res.status).toBe(409);
+    expect(res.body.ok).toBe(false);
+    expect(res.body.error.code).toBe('CONFLICT');
+  });
+
+  it('allows a new primary after the previous primary is soft-deleted', async () => {
+    // Soft-deleted rows are excluded from the active count, so the new
+    // registration is treated as the first active username for the address.
+    mockCount.mockResolvedValue(0);
+    mockCreate.mockResolvedValue({
+      username: 'alicenew',
+      address: VALID_ADDRESS,
+      isPrimary: true,
+    });
+
+    const res = await request(app)
+      .post('/api/v1/register')
+      .set('Content-Type', 'application/json')
+      .send(makeRegisterPayload({ username: 'alicenew' }));
+
+    expect(res.status).toBe(201);
+    expect(res.body.is_primary).toBe(true);
+    expect(mockCount).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          address: VALID_ADDRESS,
+          deletedAt: null,
+        }),
+      }),
+    );
+  });
+
+  it('results in exactly one primary under concurrent registrations for the same address', async () => {
+    // First request wins the primary slot; the second hits the unique index.
+    const uniqueErr = new Error(
+      'Unique constraint failed on the fields: (`address`)',
+    );
+    uniqueErr.code = 'P2002';
+    uniqueErr.meta = { target: ['address'] };
+
+    mockCount.mockResolvedValue(0);
+    mockCreate
+      .mockResolvedValueOnce({
+        username: 'aliceone',
+        address: VALID_ADDRESS,
+        isPrimary: true,
+      })
+      .mockRejectedValueOnce(uniqueErr);
+
+    const [first, second] = await Promise.all([
+      request(app)
+        .post('/api/v1/register')
+        .set('Content-Type', 'application/json')
+        .send(makeRegisterPayload({ username: 'aliceone' })),
+      request(app)
+        .post('/api/v1/register')
+        .set('Content-Type', 'application/json')
+        .send(makeRegisterPayload({ username: 'alicetwo' })),
+    ]);
+
+    const statuses = [first.status, second.status].sort();
+    expect(statuses).toEqual([201, 409]);
+
+    const winner = first.status === 201 ? first : second;
+    const loser = first.status === 201 ? second : first;
+    expect(winner.body.is_primary).toBe(true);
+    expect(loser.body.error.code).toBe('CONFLICT');
   });
 });
 

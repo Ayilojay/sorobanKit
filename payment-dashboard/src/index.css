@@ -1193,3 +1193,59 @@ button.disconnect-button:hover:not(:disabled) {
     font-size: 22px;
   }
 }
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  /* Remove nonessential entrance and hover motion. */
+  .reveal {
+    animation: none !important;
+    opacity: 1;
+    transform: none;
+  }
+
+  .sidebar,
+  .main,
+  .sidebar-scrim,
+  .nav button,
+  .disconnect-button,
+  .connect-pill,
+  .balance-tabs button,
+  .refresh-button,
+  .privacy-toggle,
+  button,
+  .ghost-button,
+  .details-button {
+    transition: none !important;
+  }
+
+  button:hover:not(:disabled),
+  .nav button:hover,
+  .disconnect-button:hover,
+  .connect-pill:hover,
+  .refresh-button:hover:not(:disabled),
+  .ghost-button:hover:not(:disabled),
+  .details-button:hover:not(:disabled),
+  .wallet-dropdown button:hover:not(:disabled) {
+    transform: none !important;
+  }
+
+  /* Preserve functional feedback: keep the loading spinner visible. */
+  .refresh-button.is-loading svg {
+    animation: spin 0.8s linear infinite !important;
+    animation-duration: 0.8s !important;
+    animation-iteration-count: infinite !important;
+  }
+
+  /* Preserve visible focus indicators. */
+  input:focus {
+    box-shadow: 0 0 0 3px var(--ring) !important;
+  }
+}

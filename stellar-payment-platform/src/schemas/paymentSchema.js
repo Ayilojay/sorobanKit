@@ -2,6 +2,7 @@
 
 const { z } = require('zod');
 const { sanitized } = require('./index');
+const { parseAmount, AmountError } = require('../lib/amount');
 
 const MAX_METADATA_BYTES = 2 * 1024;
 
@@ -42,11 +43,32 @@ const paymentIntentSchema = z.object({
   metadata: metadataSchema.optional(),
 });
 
-const bulkPaymentSchema = z.array(paymentIntentSchema).min(1).max(1000);
+/**
+ * Bulk item schema: a payment intent plus a stable per-item external
+ * identifier and an explicit ordering index used to preserve request order.
+ */
+const bulkPaymentItemSchema = paymentIntentSchema.extend({
+  external_id: sanitized(z.string().trim()).min(1, { message: 'external_id is required for bulk items' }),
+  index: z.number({ error: 'index is required' }).int().nonnegative(),
+});
+
+const bulkPaymentSchema = z.array(bulkPaymentItemSchema).min(1).max(1000);
+
+/**
+ * Bulk request envelope: carries a stable batch identifier so retries with
+ * the same batch_id are idempotent, plus the ordered items.
+ */
+const bulkPaymentRequestSchema = z.object({
+  batch_id: sanitized(z.string().trim()).min(1, { message: 'batch_id is required' }),
+  items: bulkPaymentSchema,
+});
 
 module.exports = {
   paymentIntentSchema,
+  bulkPaymentItemSchema,
   bulkPaymentSchema,
+  bulkPaymentRequestSchema,
+  amountSchema,
   metadataSchema,
   amountSchema,
   MAX_METADATA_BYTES,

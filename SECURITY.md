@@ -111,6 +111,50 @@ We do **not** currently operate a paid bug bounty programme. We are grateful for
 responsible disclosures and will publicly credit reporters (with permission),
 but we cannot offer monetary rewards at this time.
 
+## Administrative Security Model
+
+Administrative operations are protected by three layered controls. Reports that
+show a bypass of any of these controls are treated as high severity.
+
+### API-key rotation and revocation
+
+- Replacement API keys are issued with a bounded overlap window. During the
+  overlap, both the predecessor and successor key are valid; after the window
+  closes, the predecessor is rejected immediately.
+- Each key carries predecessor/successor metadata so operators can trace the
+  rotation chain.
+- Raw key material is displayed exactly once at issuance. It is redacted from
+  all subsequent API responses, logs, and audit records.
+- Revocation takes effect immediately and is recorded as an auditable event
+  (who revoked, when, and which key). Revoked keys cannot be reinstated.
+
+### Policy-based administrative roles
+
+- Administrative capability is split into centralized read, operational, and
+  configuration-changing permissions rather than a single broad admin flag.
+- Every administrative route declares the permission it requires, and requests
+  are authorized against that declaration.
+- Sensitive administrative decisions are audited with the acting identity, the
+  permission exercised, the target, and the outcome.
+
+### Step-up verification for high-impact actions
+
+- Contract upgrades, treasury changes, and bulk exports require a short-lived,
+  single-use second confirmation bound to both the action and a hash of the
+  request payload.
+- Step-up confirmations expire quickly, cannot be replayed, and fail closed if
+  the payload hash does not match the action being performed.
+- Audit evidence for step-up decisions (challenge issuance, success, expiry, and
+  failure) is retained so that sensitive actions can be reconstructed after the
+  fact.
+
+### Reporting notes for these controls
+
+When reporting an issue in this area, please include the affected route or
+operation, the role or key involved, and any step-up challenge identifiers or
+timestamps you observed. Do not include raw API key material or other live
+secrets in your report; redacted identifiers are sufficient.
+
 ## Scope
 
 This policy applies to the Stellar Tags repository, including the frontend,

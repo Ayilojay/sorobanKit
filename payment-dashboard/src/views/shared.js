@@ -13,6 +13,200 @@ import {
 } from '../api/errorCatalog';
 
 export { API_BASE } from '../api/baseUrl';
+export {
+  formatAssetAmount,
+  parseAssetAmount,
+  formatAmountInput,
+  normalizeAmountString,
+} from '../utils/amounts';
+export { Dialog } from '../components/Dialog';
+export { usePrefersReducedMotion } from '../hooks/usePrefersReducedMotion';
+
+/**
+ * Shared, accessible state components.
+ *
+ * These cover the four cross-cutting UI states: empty results, loading,
+ * retryable errors, and partial data (when a secondary request fails but the
+ * primary content is still usable). Each component exposes a slot for
+ * page-specific recovery actions so pages keep their own affordances while
+ * sharing markup, ARIA semantics, and styling hooks.
+ */
+
+/**
+ * @typedef {{
+ *   title?: import('react').ReactNode,
+ *   description?: import('react').ReactNode,
+ *   action?: import('react').ReactNode,
+ *   icon?: import('react').ReactNode,
+ *   className?: string,
+ *   testId?: string
+ * }} EmptyStateProps
+ */
+
+/**
+ * Renders the "no results" state. This is intentionally distinct from an
+ * error: it uses `role="status"` (polite) rather than `role="alert"`.
+ *
+ * @param {EmptyStateProps} props
+ */
+export const EmptyState = ({
+  title = 'Nothing here yet',
+  description,
+  action,
+  icon,
+  className,
+  testId = 'empty-state',
+}) => (
+  <div
+    className={['state-panel', 'state-panel--empty', className].filter(Boolean).join(' ')}
+    role="status"
+    aria-live="polite"
+    data-testid={testId}
+  >
+    {icon ? (
+      <div className="state-panel__icon" aria-hidden="true">
+        {icon}
+      </div>
+    ) : null}
+    <p className="state-panel__title">{title}</p>
+    {description ? <p className="state-panel__description">{description}</p> : null}
+    {action ? <div className="state-panel__actions">{action}</div> : null}
+  </div>
+);
+
+/**
+ * @typedef {{
+ *   label?: string,
+ *   description?: import('react').ReactNode,
+ *   className?: string,
+ *   testId?: string
+ * }} LoadingStateProps
+ */
+
+/**
+ * Renders a loading indicator. The visible label is announced politely via a
+ * live region; the spinner itself is decorative.
+ *
+ * @param {LoadingStateProps} props
+ */
+export const LoadingState = ({
+  label = 'Loading…',
+  description,
+  className,
+  testId = 'loading-state',
+}) => (
+  <div
+    className={['state-panel', 'state-panel--loading', className].filter(Boolean).join(' ')}
+    role="status"
+    aria-live="polite"
+    aria-busy="true"
+    data-testid={testId}
+  >
+    <span className="state-panel__spinner" aria-hidden="true" />
+    <p className="state-panel__title">{label}</p>
+    {description ? <p className="state-panel__description">{description}</p> : null}
+  </div>
+);
+
+/**
+ * @typedef {{
+ *   title?: import('react').ReactNode,
+ *   description?: import('react').ReactNode,
+ *   onRetry?: () => void,
+ *   retryLabel?: string,
+ *   action?: import('react').ReactNode,
+ *   className?: string,
+ *   testId?: string
+ * }} RetryStateProps
+ */
+
+/**
+ * Renders a recoverable error. Uses `role="alert"` so assistive technology is
+ * notified immediately. `onRetry` renders a default retry button; `action`
+ * lets a page supply a bespoke recovery control instead (or in addition).
+ *
+ * @param {RetryStateProps} props
+ */
+export const RetryState = ({
+  title = 'Something went wrong',
+  description,
+  onRetry,
+  retryLabel = 'Try again',
+  action,
+  className,
+  testId = 'retry-state',
+}) => (
+  <div
+    className={['state-panel', 'state-panel--error', className].filter(Boolean).join(' ')}
+    role="alert"
+    aria-live="assertive"
+    data-testid={testId}
+  >
+    <p className="state-panel__title">{title}</p>
+    {description ? <p className="state-panel__description">{description}</p> : null}
+    {onRetry || action ? (
+      <div className="state-panel__actions">
+        {onRetry ? (
+          <button type="button" className="state-panel__retry" onClick={onRetry}>
+            {retryLabel}
+          </button>
+        ) : null}
+        {action}
+      </div>
+    ) : null}
+  </div>
+);
+
+/**
+ * @typedef {{
+ *   message?: import('react').ReactNode,
+ *   action?: import('react').ReactNode,
+ *   onDismiss?: () => void,
+ *   dismissLabel?: string,
+ *   className?: string,
+ *   testId?: string
+ * }} PartialDataBannerProps
+ */
+
+/**
+ * Non-blocking banner shown when a secondary request fails but the primary
+ * content remains usable. Announced politely so it does not interrupt the
+ * user's current task.
+ *
+ * @param {PartialDataBannerProps} props
+ */
+export const PartialDataBanner = ({
+  message = 'Some information could not be loaded. Showing what is available.',
+  action,
+  onDismiss,
+  dismissLabel = 'Dismiss',
+  className,
+  testId = 'partial-data-banner',
+}) => (
+  <div
+    className={['state-banner', 'state-banner--partial', className].filter(Boolean).join(' ')}
+    role="status"
+    aria-live="polite"
+    data-testid={testId}
+  >
+    <p className="state-banner__message">{message}</p>
+    {action || onDismiss ? (
+      <div className="state-banner__actions">
+        {action}
+        {onDismiss ? (
+          <button
+            type="button"
+            className="state-banner__dismiss"
+            onClick={onDismiss}
+            aria-label={dismissLabel}
+          >
+            {dismissLabel}
+          </button>
+        ) : null}
+      </div>
+    ) : null}
+  </div>
+);
 
 export const CONTRACT_ID = 'CDNQ7OMHIFOLZHOKWQLOGDW7CF3DRMKXJC6OULNGNBWF4O4NO2NEIGER';
 export const TREASURY_ADDRESS = 'GAAFWEZKDYPXLTQGKQ3F23TXWYQUDAYTDW7P7VUQSVJFW2GWC4Y6LWST';

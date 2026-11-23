@@ -6,7 +6,7 @@ const { parsePagination, paginatedResponse, parseCursorQuery, paginateByKeyset, 
 
 module.exports = (router, adminAuth, getPrisma) => {
   // ── GET /admin/users/blocked ─────────────────────────────────────────────
-  router.get('/admin/users/blocked', adminAuth, asyncHandler(async (req, res, next) => {
+  router.get('/admin/users/blocked', adminAuth('read'), asyncHandler(async (req, res, next) => {
     const { prisma } = getPrisma();
     const { search, cursor, page } = req.query;
 
