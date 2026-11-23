@@ -36,9 +36,27 @@ supported state versions, keep the following in mind:
   boundaries, expected failures (including unsupported layouts), and
   recovery or concurrency behavior where relevant.
 
+## SBOMs for releasable artifacts
+
+Every releasable software artifact must ship with a software bill of materials
+(SPDX or CycloneDX) that is tied to the source revision and the artifact
+digest. When you change dependencies or build outputs, regenerate and validate
+the manifests locally before opening a pull request:
+
+- Run `npm run sbom:node` to regenerate the Node manifest.
+- Run `npm run sbom:validate` to check the generated manifests (schema,
+  source revision, and artifact digest linkage).
+- Ensure the CI SBOM checks pass; a failing SBOM check blocks the release.
+
+If you add a new releasable artifact (for example a new Rust binary or
+container image), wire SBOM generation into its release workflow so the
+manifest is produced, validated, and attached to the release alongside the
+artifact.
+
 ## Pull requests
 
 - Keep changes scoped to the issue being addressed.
+=======
 - Update operational, API, contract, migration, or contributor documentation
   and generated artifacts where your change affects them.
 - Describe the validation you performed, including exact commands and results.

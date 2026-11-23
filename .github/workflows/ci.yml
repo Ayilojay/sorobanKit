@@ -18,6 +18,35 @@ jobs:
       - run: npm run build
       - run: npm run lint
       - run: npm run typecheck
+      - name: Install SBOM tooling
+        run: npm install --no-save @cyclonedx/cyclonedx-npm
+      - name: Resolve artifact digest
+        id: digest
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ]; then
+            DIGEST="$(sha256sum package-lock.json | awk '{print $1}')"
+          else
+            DIGEST="$(sha256sum package.json | awk '{print $1}')"
+          fi
+          echo "digest=sha256:${DIGEST}" >> "$GITHUB_OUTPUT"
+      - name: Generate Node SBOM
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          ARTIFACT_DIGEST: ${{ steps.digest.outputs.digest }}
+        run: npm run sbom:node -- --source-revision "$GITHUB_SHA" --artifact-digest "$ARTIFACT_DIGEST"
+      - name: Validate SBOM
+        run: npm run sbom:validate
+      - name: Upload SBOM artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-node
+          path: |
+            sbom/**
+            .sbom/**
+          if-no-files-found: error
+          retention-days: 30
 
   abi-compat:
     runs-on: ubuntu-latest

@@ -18,9 +18,13 @@
     "contract:build": "node scripts/deploy.js build",
     "contract:deploy": "node scripts/deploy.js deploy",
     "contract:upgrade": "node scripts/deploy.js upgrade",
-    "deploy:verify-hash": "node scripts/deploy.js verify-hash"
+    "deploy:verify-hash": "node scripts/deploy.js verify-hash",
+    "sbom:node": "bash scripts/generate-sbom.sh node",
+    "sbom:validate": "node scripts/validate-sbom.js",
+    "test:sbom": "jest --config jest.sbom.config.js"
   },
   "devDependencies": {
+    "@cyclonedx/cyclonedx-npm": "^1.19.0",
     "@types/jest": "^29.5.14",
     "eslint": "^8.57.1",
     "jest": "^29.7.0",
