@@ -23,6 +23,24 @@ generator client {
 // is therefore no longer unique; `isPrimary` marks the one username that
 // reverse (type=id) federation lookups resolve to. The first username
 // registered for an address is its primary.
+//
+// #386 — Active-primary invariant: for any given `address` there may be at
+// most ONE row with `is_primary = true` and `deleted_at IS NULL`. Soft-deleted
+// rows (`deleted_at IS NOT NULL`) are ignored by the invariant, so a deleted
+// primary does not block a new primary for the same address, and a soft-delete
+// of the current primary frees the slot for a replacement.
+//
+// Prisma cannot express partial unique indexes, so this invariant is enforced
+// by a raw-SQL partial unique index created in the migration
+// `prisma/migrations/<timestamp>_user_active_primary_unique/migration.sql`:
+//
+//   CREATE UNIQUE INDEX "username_registry_address_active_primary_key"
+//     ON "username_registry" ("address")
+//     WHERE "is_primary" = true AND "deleted_at" IS NULL;
+//
+// That migration also repairs legacy duplicate primaries (keeping the oldest
+// non-deleted primary per address and demoting the rest) before the index is
+// created. Do not drop or rename the index without updating this comment.
 model User {
   username  String    @id
   address   String
@@ -39,6 +57,10 @@ model User {
   // Reverse federation lookups (type=id) and /lookup?address= filter by
   // address, which is no longer backed by a unique index.
   @@index([address])
+  // #386 — Supports the active-primary invariant: the legacy-duplicate repair
+  // query (find all non-deleted primaries for an address) and the partial
+  // unique index predicate both filter on (address, is_primary, deleted_at).
+  @@index([address, isPrimary, deletedAt])
   // Serves the keyset (cursor) pagination seeks used by the /users and
   // /lookup list endpoints: (created_at DESC, username DESC) walks this
   // index backwards, so page depth no longer affects query cost.

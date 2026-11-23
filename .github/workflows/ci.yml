@@ -19,6 +19,26 @@ jobs:
       - run: npm run lint
       - run: npm run typecheck
 
+  # Expand-contract migration policy:
+  # Schema changes must follow the expand -> dual-read/write -> backfill -> contract
+  # phases so rolling deploys stay zero-downtime. This guard fails the build on
+  # destructive changes (dropped/renamed columns, narrowed types, etc.) that skip
+  # the contract phase. See CONTRIBUTING.md ("Database migrations") for the policy
+  # and the end-to-end example with rollback steps.
+  migration-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Lint migrations for destructive changes
+        run: npm run lint:migrations
+      - name: Run migration guard tests
+        run: npm run test:migrations
+
   abi-compat:
     runs-on: ubuntu-latest
     steps:

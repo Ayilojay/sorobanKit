@@ -126,6 +126,59 @@ describe('E2E: Registration Flow', () => {
     expect(conflictRes.body.error.code).toBe('CONFLICT');
   });
 
+  it('enforces at most one active primary username per address across soft-delete and concurrency', async () => {
+    const address = 'GPRIMARYINVARIANT11111111111111111111111111111111111111111';
+
+    // 1. Register the initial primary username for the address.
+    let res = await request(app)
+      .post('/api/v1/register')
+      .send({ username: `${TEST_PREFIX}primary1`, address });
+
+    expect(res.status).toBe(201);
+    expect(res.body.ok).toBe(true);
+    expect(res.body.is_primary).toBe(true);
+
+    // 2. A second primary for the same address must be rejected.
+    res = await request(app)
+      .post('/api/v1/register')
+      .send({ username: `${TEST_PREFIX}primary2`, address });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBeDefined();
+    expect(res.body.error.code).toBe('CONFLICT');
+
+    // 3. Soft-delete the active primary.
+    const primaryRow = mockDb.get(address);
+    expect(primaryRow).toBeDefined();
+    primaryRow.deletedAt = new Date();
+
+    // 4. A new primary for the same address is now allowed.
+    res = await request(app)
+      .post('/api/v1/register')
+      .send({ username: `${TEST_PREFIX}primary3`, address });
+
+    expect(res.status).toBe(201);
+    expect(res.body.ok).toBe(true);
+    expect(res.body.is_primary).toBe(true);
+
+    // 5. Concurrent primary registrations for a fresh address: exactly one wins.
+    const raceAddress = 'GPRIMARYRACE111111111111111111111111111111111111111111111';
+    const [res1, res2] = await Promise.all([
+      request(app)
+        .post('/api/v1/register')
+        .send({ username: `${TEST_PREFIX}raceprimary1`, address: raceAddress }),
+      request(app)
+        .post('/api/v1/register')
+        .send({ username: `${TEST_PREFIX}raceprimary2`, address: raceAddress }),
+    ]);
+
+    const statuses = [res1.status, res2.status].sort();
+    expect(statuses).toEqual([201, 409]);
+
+    const conflictRes = res1.status === 409 ? res1 : res2;
+    expect(conflictRes.body.error.code).toBe('CONFLICT');
+  });
+
   it('should successfully register a new user and handle duplicate registration gracefully', async () => {
     // 1. Successful Registration
     const validUser = {

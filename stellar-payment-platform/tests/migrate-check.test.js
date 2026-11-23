@@ -303,6 +303,159 @@ describe('enforceMigrationPolicy', () => {
     expect(mockLogger.warn).toHaveBeenCalledWith(expect.stringContaining('Could not determine'));
   });
 });
+describe('lintMigrationSql', () => {
+  let lintMigrationSql;
+
+  beforeAll(() => {
+    ({ lintMigrationSql } = require('../src/migrate-check'));
+  });
+
+  const lint = (sql, options) => lintMigrationSql(sql, options);
+
+  it('accepts an expand-phase migration (nullable column + index + backfill)', () => {
+    const sql = [
+      '-- Expand phase: add a nullable column, index it, then backfill.',
+      'ALTER TABLE "Payment" ADD COLUMN "memo" TEXT;',
+      'CREATE INDEX "Payment_memo_idx" ON "Payment"("memo");',
+      'UPDATE "Payment" SET "memo" = \'\' WHERE "memo" IS NULL;',
+    ].join('\n');
+
+    const result = lint(sql);
+    expect(result.ok).toBe(true);
+    expect(result.violations).toEqual([]);
+  });
+
+  it('rejects DROP COLUMN', () => {
+    const result = lint('ALTER TABLE "Payment" DROP COLUMN "memo";');
+    expect(result.ok).toBe(false);
+    expect(result.violations.map((v) => v.rule)).toContain('drop-column');
+  });
+
+  it('rejects DROP TABLE', () => {
+    const result = lint('DROP TABLE "LegacyPayment";');
+    expect(result.ok).toBe(false);
+    expect(result.violations.map((v) => v.rule)).toContain('drop-table');
+  });
+
+  it('rejects type narrowing (e.g. TEXT -> VARCHAR(8))', () => {
+    const sql = 'ALTER TABLE "Payment" ALTER COLUMN "memo" TYPE VARCHAR(8);';
+    const result = lint(sql);
+    expect(result.ok).toBe(false);
+    expect(result.violations.map((v) => v.rule)).toContain('type-narrowing');
+  });
+
+  it('allows type widening (e.g. VARCHAR(8) -> TEXT)', () => {
+    const sql = 'ALTER TABLE "Payment" ALTER COLUMN "memo" TYPE TEXT;';
+    const result = lint(sql);
+    expect(result.ok).toBe(true);
+  });
+
+  it('rejects ADD COLUMN ... NOT NULL without a default', () => {
+    const sql = 'ALTER TABLE "Payment" ADD COLUMN "status" TEXT NOT NULL;';
+    const result = lint(sql);
+    expect(result.ok).toBe(false);
+    expect(result.violations.map((v) => v.rule)).toContain('add-not-null-without-default');
+  });
+
+  it('accepts ADD COLUMN ... NOT NULL when a default is supplied', () => {
+    const sql = 'ALTER TABLE "Payment" ADD COLUMN "status" TEXT NOT NULL DEFAULT \'pending\';';
+    const result = lint(sql);
+    expect(result.ok).toBe(true);
+  });
+
+  it('accepts destructive statements when allowDestructive is set', () => {
+    const sql = [
+      'ALTER TABLE "Payment" DROP COLUMN "memo";',
+      'DROP TABLE "LegacyPayment";',
+      'ALTER TABLE "Payment" ALTER COLUMN "memo" TYPE VARCHAR(8);',
+      'ALTER TABLE "Payment" ADD COLUMN "status" TEXT NOT NULL;',
+    ].join('\n');
+
+    const result = lint(sql, { allowDestructive: true });
+    expect(result.ok).toBe(true);
+    expect(result.violations).toEqual([]);
+  });
+
+  it('ignores destructive keywords that only appear in comments', () => {
+    const sql = [
+      '-- Contract phase (run only after all instances stop reading the column):',
+      '-- ALTER TABLE "Payment" DROP COLUMN "memo";',
+      'SELECT 1;',
+    ].join('\n');
+
+    const result = lint(sql);
+    expect(result.ok).toBe(true);
+  });
+});
+
+describe('migration lint CLI', () => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const { spawnSync } = require('child_process');
+
+  const cliPath = path.resolve(__dirname, '..', 'scripts', 'migrate-lint.js');
+
+  const makeTempDir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'migrate-lint-'));
+
+  const writeMigration = (dir, name, sql) => {
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, sql, 'utf8');
+    return file;
+  };
+
+  const runCli = (args) =>
+    spawnSync(process.execPath, [cliPath, ...args], { encoding: 'utf8' });
+
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = makeTempDir();
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('exits 0 for an expand-phase migration', () => {
+    writeMigration(
+      tmpDir,
+      '20260101000000_expand_add_memo',
+      [
+        'ALTER TABLE "Payment" ADD COLUMN "memo" TEXT;',
+        'CREATE INDEX "Payment_memo_idx" ON "Payment"("memo");',
+        'UPDATE "Payment" SET "memo" = \'\' WHERE "memo" IS NULL;',
+      ].join('\n'),
+    );
+
+    const result = runCli([tmpDir]);
+    expect(result.status).toBe(0);
+  });
+
+  it('exits non-zero for a destructive migration', () => {
+    writeMigration(
+      tmpDir,
+      '20260101000001_contract_drop_memo',
+      'ALTER TABLE "Payment" DROP COLUMN "memo";',
+    );
+
+    const result = runCli([tmpDir]);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr + result.stdout).toContain('drop-column');
+  });
+
+  it('exits 0 for a destructive migration when --allow-destructive is passed', () => {
+    writeMigration(
+      tmpDir,
+      '20260101000001_contract_drop_memo',
+      'ALTER TABLE "Payment" DROP COLUMN "memo";',
+    );
+
+    const result = runCli([tmpDir, '--allow-destructive']);
+    expect(result.status).toBe(0);
+  });
+});
+
 describe('strict-mode process.exit integration', () => {
   let checkMigrations;
   let enforceMigrationPolicy;

@@ -109,4 +109,44 @@ describe('E2E: Federation Flow', () => {
 
     expect(res.status).toBe(404);
   });
+
+  it('resolves type=id to the active primary and never to a stale alias', async () => {
+    const address = 'GPRIMARYALIAS123456789FEDERATION';
+    const primary = {
+      username: `${TEST_USER}primary*localhost`,
+      address,
+      isPrimary: true,
+      deletedAt: null,
+    };
+    const alias = {
+      username: `${TEST_USER}alias*localhost`,
+      address,
+      isPrimary: false,
+      deletedAt: null,
+    };
+    mockDb.set(primary.username, primary);
+    mockDb.set(alias.username, alias);
+
+    // Reverse lookup resolves to the primary username, not the alias.
+    let res = await request(app)
+      .get(`/api/v1/federation?q=${address}&type=id`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.stellar_address).toBe(primary.username);
+    expect(res.body.stellar_address).not.toBe(alias.username);
+
+    // Soft-delete the primary; the alias must not be served as a stale primary.
+    primary.deletedAt = new Date();
+
+    res = await request(app)
+      .get(`/api/v1/federation?q=${address}&type=id`);
+
+    // Either no active primary remains (404) or a promoted primary is returned,
+    // but never the stale alias.
+    if (res.status === 200) {
+      expect(res.body.stellar_address).not.toBe(alias.username);
+    } else {
+      expect(res.status).toBe(404);
+    }
+  });
 });

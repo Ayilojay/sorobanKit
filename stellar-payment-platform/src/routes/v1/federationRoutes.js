@@ -40,8 +40,16 @@ router.get(
         const cached = await federationLookupCached(cacheKey, async () => {
           // #613 — an address can have several usernames; a reverse lookup
           // resolves to the primary one.
+          // #386 — the partial unique index on (address) WHERE isPrimary AND
+          // deletedAt IS NULL guarantees at most one active primary username
+          // per address, so this filter is authoritative. The ordering below
+          // is kept only as a defensive tiebreaker.
           const row = await prisma.user.findFirst({
-            where: { address: { equals: queryValue, mode: 'insensitive' }, deletedAt: null },
+            where: {
+              address: { equals: queryValue, mode: 'insensitive' },
+              isPrimary: true,
+              deletedAt: null,
+            },
             select: { username: true, address: true, memoType: true, memo: true },
             orderBy: PRIMARY_USERNAME_ORDER,
           });

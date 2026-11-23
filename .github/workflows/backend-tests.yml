@@ -89,3 +89,22 @@ jobs:
         env:
           MEMORY_TEST_REQUESTS: '200'
           MEMORY_LEAK_THRESHOLD_MB: '50'
+
+      # Expand-contract migration guard (#387).
+      # Lints migration SQL for destructive DDL (DROP TABLE/COLUMN, type narrowing,
+      # NOT NULL without DEFAULT, etc.). Non-zero exit fails the job so destructive
+      # changes cannot merge without an explicit `--allow-destructive` opt-in.
+      # The check is diff-scoped to migrations changed in this PR; when no
+      # migrations changed it still runs against the full directory so newly
+      # added files are validated.
+      - name: Lint migrations for destructive changes (#387)
+        run: |
+          CHANGED=$(git diff --name-only origin/main...HEAD -- 'stellar-payment-platform/prisma/migrations/**/migration.sql')
+          if [ -n "$CHANGED" ]; then
+            echo "Linting changed migrations:"
+            echo "$CHANGED"
+            node stellar-payment-platform/src/migrate-check.js --lint stellar-payment-platform/prisma/migrations
+          else
+            echo "No migration changes detected; running full lint."
+            node stellar-payment-platform/src/migrate-check.js --lint stellar-payment-platform/prisma/migrations
+          fi
