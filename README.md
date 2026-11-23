@@ -260,6 +260,68 @@ Use the active one as `X-Api-Key`; the revoked one is there to exercise the
 rejection path. The script refuses to run against a non-local `DATABASE_URL`
 unless `SEED_ALLOW_REMOTE=1` is set.
 
+### Preview environments
+
+Every pull request can be deployed to an isolated, ephemeral environment
+containing the API and the dashboard. Previews are for review and manual
+testing only; they are never a staging or production substitute.
+
+- **Isolation.** Each preview gets its own database and its own Redis instance
+  (or key prefix). Nothing is shared with `dev`, `test`, staging, or
+  production, so a destructive test in a preview cannot touch real data.
+- **Synthetic data only.** Previews are seeded with the deterministic fixture
+  set from `npm run db:seed` (see [Seed data](#seed-data)). No production dump
+  is ever restored into a preview.
+- **No production credentials.** Preview services receive only preview-scoped
+  secrets (their own `DATABASE_URL`, `REDIS_URL`, and a throwaway
+  `ADMIN_API_KEY`). Production keys, treasury keys, and mainnet signing
+  credentials are never injected; previews run against testnet.
+- **TTL.** A preview is torn down automatically after its TTL expires (default
+  72 hours, refreshed on new pushes) even if the PR stays open, so abandoned
+  environments cannot accumulate cost.
+- **Auditable cleanup.** Closing or merging the PR triggers teardown. Each
+  teardown deletes the environment's database, Redis namespace, and deployed
+  services, and writes an audit record (environment id, PR number, actor,
+  reason, timestamp) so cleanup can be verified after the fact. Teardown is
+  idempotent: re-running it on an already-removed environment is a no-op that
+  still records the attempt.
+
+Preview URLs are posted as a comment on the PR. If a preview fails to become
+ready, the comment reports the failing probe (see
+[Health probes](#health-probes)) instead of a URL.
+
+### Health probes
+
+The server exposes three probes with deliberately different semantics. Point
+each orchestrator check at the matching endpoint — using one probe for another
+purpose causes either premature restarts or traffic to unready instances.
+
+| Endpoint | Question it answers | Failing response |
+| --- | --- | --- |
+| `GET /health/startup` | Has initialization finished? | `503` until startup completes |
+| `GET /health/live` | Is the process alive and not deadlocked? | `503` when the event loop is stalled |
+| `GET /health/ready` | Should this instance receive traffic? | `503` when a routing dependency is down |
+
+- **Startup** covers one-time initialization: database connectivity, applying
+  or verifying migrations, and warming caches. It returns `503` until that work
+  completes and `200` afterwards. Configure the startup probe with a generous
+  `failureThreshold` and `periodSeconds` so a slow-but-progressing boot is not
+  killed; the startup probe is what protects slow starts, not liveness.
+- **Liveness** answers only "is this process wedged?". It does **not** check
+  the database, Redis, or Horizon: a dependency outage must not restart healthy
+  processes. It fails when the event loop is blocked past a threshold (a
+  deadlock), which is the one condition a restart can fix.
+- **Readiness** gates routing. It checks the dependencies a request actually
+  needs — PostgreSQL and Redis — and returns `503` while any is unavailable or
+  while startup is still in progress, so the load balancer stops sending
+  traffic. Horizon is reported but does not affect readiness, because most
+  routes serve from the database and a Horizon outage should degrade specific
+  endpoints rather than remove every instance from rotation.
+
+`GET /health` remains the aggregate, human-facing view of all dependencies
+(see [`GET /health`](#get-health)); the three probes above are the
+machine-facing contract.
+
 ### Render deployment
 
 The repository includes a [render.yaml](render.yaml) blueprint for the backend API and its PostgreSQL database. When you deploy from Render, import the blueprint or create the service from the repo so `DATABASE_URL` is injected automatically from the managed database.
@@ -442,6 +504,8 @@ For Render deployments, make sure the web service has `DATABASE_URL` set in its 
 
 ### CI / GitHub Actions Secrets
 - `TESTNET_API_URL` - **(Required for `deploy-testnet.yml`)** Base URL of the deployed testnet API service (e.g., `https://api.example.com`). Used by the post-deploy health check step (`${TESTNET_API_URL}/health`) to verify an HTTP `200` response and `status: "up"` before marking the deployment workflow green.
+- `PREVIEW_TTL_HOURS` - (Optional) Lifetime of a pull-request preview environment before automatic teardown. Defaults to `72`.
+- `PREVIEW_SEED` - (Optional) Seed used for a preview's synthetic data. Defaults to the fixed seed used by `npm run db:seed`, so previews are reproducible.
 
 ## Logging
 
@@ -922,3 +986,12 @@ See [LICENSE](LICENSE).
 
 <!-- handsoff-issue-414 -->
 - #414: Verify refund liabilities remain fully backed by token balances
+
+<!-- handsoff-issue-472 -->
+- #472: Preview environment teardown audit records are written to the application log only; a durable audit store is still pending
+
+<!-- handsoff-issue-473 -->
+- #473: Liveness deadlock detection threshold is not yet configurable per environment
+
+<!-- handsoff-issue-474 -->
+- #474: SLO definitions for registration, federation lookup, and payment flows are documented but not yet wired to alerting
