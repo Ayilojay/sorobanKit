@@ -148,4 +148,78 @@ describe('soft-delete-purge-cron', () => {
       await scheduledCallback();
     });
   });
+
+  describe('shutdown', () => {
+    function buildPrismaMock() {
+      const prisma = {
+        user: {
+          findMany: jest.fn().mockResolvedValue([{ id: 'user-1' }]),
+          deleteMany: jest.fn().mockResolvedValue({ count: 1 }),
+        },
+        activityLog: { deleteMany: jest.fn().mockResolvedValue({ count: 1 }) },
+        $transaction: jest.fn(async (fn) => fn(prisma)),
+      };
+      return prisma;
+    }
+
+    it('stops scheduling new runs and awaits an in-flight purge', async () => {
+      let scheduledCallback;
+      const task = { stop: jest.fn() };
+      cron.schedule.mockImplementation((expr, cb) => {
+        scheduledCallback = cb;
+        return task;
+      });
+
+      const prisma = buildPrismaMock();
+      let releasePurge;
+      const purgeGate = new Promise((resolve) => {
+        releasePurge = resolve;
+      });
+      prisma.user.findMany.mockImplementation(async () => {
+        await purgeGate;
+        return [{ id: 'user-1' }];
+      });
+
+      const job = scheduleSoftDeletePurgeJob(prisma);
+      const runPromise = scheduledCallback();
+
+      const stopPromise = job.stop();
+      expect(task.stop).toHaveBeenCalledTimes(1);
+
+      // A second invocation while a purge is in flight must not start another run.
+      await scheduledCallback();
+      expect(prisma.user.findMany).toHaveBeenCalledTimes(1);
+
+      let stopped = false;
+      stopPromise.then(() => {
+        stopped = true;
+      });
+      await Promise.resolve();
+      expect(stopped).toBe(false);
+
+      releasePurge();
+      await runPromise;
+      await stopPromise;
+      expect(stopped).toBe(true);
+      expect(prisma.user.deleteMany).toHaveBeenCalledTimes(1);
+    });
+
+    it('treats a second stop call as a no-op', async () => {
+      let scheduledCallback;
+      const task = { stop: jest.fn() };
+      cron.schedule.mockImplementation((expr, cb) => {
+        scheduledCallback = cb;
+        return task;
+      });
+
+      const prisma = buildPrismaMock();
+      const job = scheduleSoftDeletePurgeJob(prisma);
+
+      await job.stop();
+      await job.stop();
+
+      expect(task.stop).toHaveBeenCalledTimes(1);
+      expect(prisma.user.findMany).not.toHaveBeenCalled();
+    });
+  });
 });

@@ -206,6 +206,14 @@ model PaymentIntent {
 }
 
 // AuditLog model for tracking all mutating admin actions and security events.
+//
+// #381 — Audit records are tamper-evident: each row carries a keyed digest
+// over its canonicalized content plus the digest of the previous record in
+// the chain (`prevDigest`), forming a hash chain. `keyId` records which
+// signing key produced the digest so keys can be rotated without breaking
+// verification of older records. The first record in a chain has a null
+// `prevDigest`. Verification tooling recomputes digests in `createdAt, id`
+// order and reports the first mismatch.
 model AuditLog {
   id         String   @id @default(uuid())
   action     String
@@ -216,12 +224,38 @@ model AuditLog {
   userAgent  String?  @map("user_agent")
   statusCode Int?     @map("status_code")
   payload    String?
+  // Keyed digest (HMAC) over the canonicalized record content.
+  digest     String?
+  // Digest of the immediately preceding audit record; null for the chain head.
+  prevDigest String?  @map("prev_digest")
+  // Identifier of the signing key used to compute `digest` (supports rotation).
+  keyId      String?  @map("key_id")
   createdAt  DateTime @default(now()) @map("created_at")
 
   @@index([createdAt])
   @@index([userId])
   @@index([action])
+  // Chain verification walks records in (created_at, id) order.
+  @@index([createdAt, id])
+  @@index([prevDigest])
+  @@index([keyId])
   @@map("audit_logs")
+}
+
+// #382 — Per-network Horizon stream cursors. The ingestion worker persists the
+// last fully processed page cursor atomically after each page so restarts and
+// failovers resume from the last committed point instead of replaying from the
+// beginning. `(network, stream)` is unique so cursors are upserted atomically.
+model StreamCursor {
+  id        String   @id @default(uuid())
+  network   String
+  stream    String
+  cursor    String
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([network, stream])
+  @@index([network])
+  @@map("stream_cursors")
 }
 
 // WebhookEvent tracks every individual webhook delivery attempt end-to-end,

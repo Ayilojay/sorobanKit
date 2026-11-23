@@ -475,6 +475,12 @@ const authenticateUsernameOwner = async ({
 module.exports = {
   authenticateUsernameOwner,
   verifyFreighterSignedMessage,
+  assertOwnership,
+  canAccess,
+  isOwner,
+  isAuthenticated,
+  normalizePrincipal,
+  FORBIDDEN_CODE,
   getCachedAccountSigners,
   setSignerRedisClient,
   clearSignerCache,

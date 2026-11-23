@@ -79,17 +79,32 @@ function federationEtag({ isPublic }) {
 module.exports = (redisClient) => {
   const router = express.Router();
 
-  
 /**
  * @openapi
  * /federation:
  *   get:
  *     tags:
  *       - v1
- *     description: GET /federation
+ *     description: >-
+ *       Public federation lookup. This endpoint is intentionally unauthenticated
+ *       and does not require a request principal: federation addresses are
+ *       public directory data, so no ownership context is applied here.
+ *     parameters:
+ *       - in: query
+ *         name: q
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - in: query
+ *         name: type
+ *         schema:
+ *           type: string
+ *           enum: [id, name]
  *     responses:
  *       200:
  *         description: Success
+ *       404:
+ *         description: Address or name tag not found
  */
 router.get(
   '/federation',
@@ -100,6 +115,7 @@ router.get(
   federationEtag({ isPublic: (req) => !req.headers.authorization }),
   validateSchema({ query: federationQuerySchema }),
   asyncHandler(async (req, res, next) => {
+    // NOTE: Public read — no principal/ownership check by design (#383).
     const { q: queryValue, type } = req.query;
     const startedAt = process.hrtime.bigint();
     const operation = type === 'id' ? 'federation_lookup_id' : 'federation_lookup_name';

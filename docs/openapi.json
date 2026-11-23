@@ -40,7 +40,19 @@
               }
             }
           },
-          "503": { "$ref": "#/components/responses/ApiErrorResponse" }
+          "503": {
+            "description": "A dependency is unhealthy, or the server is draining during graceful shutdown",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    { "$ref": "#/components/schemas/HealthStatus" },
+                    { "$ref": "#/components/schemas/Error" }
+                  ]
+                }
+              }
+            }
+          }
         }
       }
     },
@@ -355,6 +367,7 @@
           },
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" }
         }
       },
@@ -369,6 +382,7 @@
         "responses": {
           "204": { "description": "Tag soft-deleted" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" },
           "409": { "$ref": "#/components/responses/Conflict" }
         }
@@ -1074,11 +1088,11 @@
         "type": "object",
         "required": ["status", "timestamp", "database", "redis", "horizon"],
         "properties": {
-          "status": { "type": "string", "enum": ["UP"] },
+          "status": { "type": "string", "enum": ["UP", "DRAINING"] },
           "timestamp": { "type": "string", "format": "date-time" },
-          "database": { "type": "string", "enum": ["up"] },
-          "redis": { "type": "string", "enum": ["up", "not configured"] },
-          "horizon": { "type": "string", "enum": ["up"] }
+          "database": { "type": "string", "enum": ["up", "draining", "down"] },
+          "redis": { "type": "string", "enum": ["up", "draining", "down", "not configured"] },
+          "horizon": { "type": "string", "enum": ["up", "draining", "down"] }
         }
       },
       "StartupHealthStatus": {
