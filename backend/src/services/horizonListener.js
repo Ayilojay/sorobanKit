@@ -82,6 +82,81 @@ const WEBHOOK_STATUS_ALIASES = Object.freeze({
   exhausted: WEBHOOK_STATUS.DEAD,
 });
 
+// Time-based partitioning for high-volume history tables. Partitions are
+// monthly, half-open ranges [start, end) on the event timestamp column. The
+// partition key is derived from the same timestamp used by Prisma queries so
+// existing read/write paths are unaffected; unique identities (id) remain
+// globally unique across partitions.
+const PARTITION_INTERVAL = 'month';
+const PARTITIONED_TABLES = Object.freeze(['payment_history', 'webhook_history']);
+
+function pad2(n) {
+  return String(n).padStart(2, '0');
+}
+
+// Compute the monthly partition boundary that contains the given timestamp.
+// Returns { name, start, end } where start/end are ISO strings and the range
+// is half-open [start, end). Throws on invalid input so callers fail loudly
+// rather than writing to an unpartitioned fallback.
+function getPartitionBoundary(timestamp) {
+  const date = timestamp instanceof Date ? timestamp : new Date(timestamp);
+  if (Number.isNaN(date.getTime())) {
+    throw new Error(`Invalid partition timestamp: ${timestamp}`);
+  }
+
+  const year = date.getUTCFullYear();
+  const month = date.getUTCMonth();
+  const start = new Date(Date.UTC(year, month, 1, 0, 0, 0, 0));
+  const end = new Date(Date.UTC(year, month + 1, 1, 0, 0, 0, 0));
+  const name = `${PARTITIONED_TABLES[0]}_${year}_${pad2(month + 1)}`;
+
+  return {
+    name,
+    start: start.toISOString(),
+    end: end.toISOString(),
+  };
+}
+
+// Resolve the partition name for a given table and timestamp. Validates the
+// table is a known partitioned history table.
+function getPartitionName(table, timestamp) {
+  if (!PARTITIONED_TABLES.includes(table)) {
+    throw new Error(`Table is not time-partitioned: ${table}`);
+  }
+  const boundary = getPartitionBoundary(timestamp);
+  const year = boundary.start.slice(0, 4);
+  const month = boundary.start.slice(5, 7);
+  return `${table}_${year}_${month}`;
+}
+
+// Determine whether a timestamp falls within a partition's half-open range.
+// Used by boundary tests and retention maintenance.
+function isWithinPartition(partition, timestamp) {
+  if (!partition || !partition.start || !partition.end) {
+    throw new Error('Partition boundary requires start and end');
+  }
+  const ts = timestamp instanceof Date ? timestamp.getTime() : new Date(timestamp).getTime();
+  if (Number.isNaN(ts)) {
+    throw new Error(`Invalid partition timestamp: ${timestamp}`);
+  }
+  const start = new Date(partition.start).getTime();
+  const end = new Date(partition.end).getTime();
+  return ts >= start && ts < end;
+}
+
+// Retention maintenance: list partitions older than the retention cutoff so
+// they can be detached/dropped without touching active partitions.
+function getExpiredPartitions(partitions, retentionCutoff) {
+  const cutoff = retentionCutoff instanceof Date ? retentionCutoff.getTime() : new Date(retentionCutoff).getTime();
+  if (Number.isNaN(cutoff)) {
+    throw new Error(`Invalid retention cutoff: ${retentionCutoff}`);
+  }
+  return (partitions || []).filter((partition) => {
+    const end = new Date(partition.end).getTime();
+    return !Number.isNaN(end) && end <= cutoff;
+  });
+}
+
 function getExpectedPassphrase(network) {
   const key = String(network || '').toLowerCase();
   return NETWORK_PASSPHRASES[key] || null;
@@ -239,100 +314,7 @@ function assertWebhookTransition(from, to) {
   return next;
 }
 
-async function startHorizonListener(config) {
-  const server = new Horizon.Server(config.horizonUrl);
-
-  await verifyNetwork(server, config.horizonNetwork);
-
-  logger.info(`Horizon listener connected to ${config.horizonUrl} (${config.horizonNetwork})`);
-
-  const closeStream = server
-    .payments()
-    .cursor('now')
-    .stream({
-      onmessage: (payment) => {
-        try {
-          handlePayment(payment, config);
-        } catch (err) {
-          logger.error(`Error handling payment event: ${err.message}`);
-        }
-      },
-      onerror: (err) => {
-        logger.error(`Horizon stream error: ${err.message}`);
-      },
-    });
-
-  return closeStream;
-}
-
-function handlePayment(payment, config) {
-  logger.info(`Received payment event ${payment.id} of type ${payment.type}`);
-
-  // Persistence boundary: stamp and validate schema metadata before handing
-  // the event to downstream persistence.
-  let event;
-  try {
-    event = validateEventPayload(payment);
-  } catch (err) {
-    logger.error(`Rejected payment event ${payment && payment.id}: ${err.message}`);
-    return;
-  }
-
-  // Constrain the persisted lifecycle value to a canonical status. Unknown
-  // statuses are rejected rather than written through.
-  if (event.status !== undefined && event.status !== null) {
-    try {
-      event = { ...event, status: normalizePaymentStatus(event.status) };
-    } catch (err) {
-      logger.error(`Rejected payment event ${payment && payment.id}: ${err.message}`);
-      return;
-    }
-  }
-
-  if (typeof config.onPayment === 'function') {
-    config.onPayment(event);
-  }
-  // Reporting is decoupled from the payment write path: the read model is
-  // refreshed asynchronously and never blocks payment ingestion.
-  if (typeof config.onReportingWatermark === 'function') {
-    try {
-      config.onReportingWatermark({
-        source: 'horizon',
-        cursor: payment.paging_token || payment.id,
-        ledger: payment.ledger,
-        observedAt: new Date().toISOString(),
-      });
-    } catch (err) {
-      logger.error(`Error recording reporting watermark: ${err.message}`);
-    }
-  }
-}
-
-// Emit exactly one receipt for a successful routed payment and none on failure.
-// Returns the receipt on success, or null when the payment did not succeed.
-function emitReceipt(payment, config) {
-  if (!payment || payment.successful === false) {
-    return null;
-  }
-  const receipt = buildReceipt(payment);
-  if (config && typeof config.onReceipt === 'function') {
-    config.onReceipt(receipt);
-  }
-  return receipt;
-}
-
 module.exports = {
-  startHorizonListener,
-  verifyNetwork,
-  getExpectedPassphrase,
-  normalizeEventMetadata,
-  validateEventPayload,
-  adaptUnversionedEvent,
-  normalizePaymentStatus,
-  normalizeWebhookStatus,
-  assertPaymentTransition,
-  assertWebhookTransition,
-  NETWORK_PASSPHRASES,
   EVENT_SCHEMA_ID,
   EVENT_SCHEMA_VERSION,
   SUPPORTED_EVENT_SCHEMA_VERSIONS,
@@ -344,4 +326,20 @@ module.exports = {
   WEBHOOK_STATUSES,
   WEBHOOK_TRANSITIONS,
   WEBHOOK_STATUS_ALIASES,
+  PARTITION_INTERVAL,
+  PARTITIONED_TABLES,
+  getPartitionBoundary,
+  getPartitionName,
+  isWithinPartition,
+  getExpiredPartitions,
+  getExpectedPassphrase,
+  verifyNetwork,
+  fetchRoot,
+  adaptUnversionedEvent,
+  normalizeEventMetadata,
+  validateEventPayload,
+  normalizePaymentStatus,
+  normalizeWebhookStatus,
+  assertPaymentTransition,
+  assertWebhookTransition,
 };
