@@ -12,6 +12,7 @@ const { validateSchema } = require('../../middleware/validateSchema');
 const { ApiError } = require('../../errors');
 const { federationQuerySchema } = require('../../schemas');
 const { asyncHandler } = require('../../middleware/asyncHandler');
+const { observeSli, statusClassFromStatusCode } = require('../../metrics/sloMetrics');
 
 /**
  * Canonical JSON serialization: object keys are sorted recursively so the
@@ -100,6 +101,16 @@ router.get(
   validateSchema({ query: federationQuerySchema }),
   asyncHandler(async (req, res, next) => {
     const { q: queryValue, type } = req.query;
+    const startedAt = process.hrtime.bigint();
+    const operation = type === 'id' ? 'federation_lookup_id' : 'federation_lookup_name';
+
+    const recordOutcome = (statusCode) => {
+      observeSli({
+        operation,
+        statusClass: statusClassFromStatusCode(statusCode),
+        durationSeconds: Number(process.hrtime.bigint() - startedAt) / 1e9,
+      });
+    };
 
     try {
       if (type === 'id') {
@@ -129,13 +140,13 @@ router.get(
         });
 
         if (!cached) {
+          recordOutcome(404);
           const notFoundError = new Error('Address not found');
           notFoundError.statusCode = 404;
           return next(notFoundError);
         }
 
-        // Invalidate cached federation data whenever the resolved user row
-        // changes (mutation hooks call this via the shared cache module).
+        recordOutcome(200);
         return res.json(cached);
       } else if (type === 'name' || !type) {
         const nameTag = normalizeNameTag(queryValue);
@@ -163,19 +174,23 @@ router.get(
         });
 
         if (!cached) {
+          recordOutcome(404);
           const notFoundError = new Error('Name tag not found');
           notFoundError.statusCode = 404;
           return next(notFoundError);
         }
 
+        recordOutcome(200);
         return res.json(cached);
       } else {
+        recordOutcome(400);
         return next(
           new ApiError('INVALID_INPUT', "Unsupported query type. Supported types: 'id', 'name'"),
         );
       }
     } catch (error) {
       console.log("FEDERATION LOOKUP ERROR:", error);
+      recordOutcome(500);
       const dbError = new Error('Database lookup failed', { cause: error });
       dbError.statusCode = 500;
       return next(dbError);

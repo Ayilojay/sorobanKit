@@ -78,17 +78,37 @@ model ApprovedOrigin {
 }
 
 // Payment records for routing, statistics, and auditing.
+// #384 — Monetary values are stored as exact integer "units" (the smallest
+// indivisible unit of the asset) rather than floating point. `amountUnits`
+// and `feeUnits` are the canonical values; `assetPrecision` records how many
+// decimal places the asset uses (7 for XLM and most Stellar assets) so the
+// units can be converted back to a human-readable decimal without loss.
+// Rounding policy: values are rounded half-up to `assetPrecision` decimal
+// places before being converted to units; anything finer than one unit is
+// rejected at the API boundary rather than silently truncated.
+//
+// #385 — `network` identifies the Stellar network a transaction belongs to
+// (e.g. "testnet", "pubnet"). The same transaction hash can legitimately
+// exist on distinct networks, so uniqueness is enforced on the composite
+// (network, transactionHash) pair instead of the hash alone.
 model Payment {
   id              String   @id @default(uuid())
   createdAt       DateTime @default(now()) @map("created_at")
   fromAddress     String   @map("from_address")
   toAddress       String   @map("to_address")
-  amount          Float
-  fee             Float    @default(0)
+  amountUnits     BigInt   @map("amount_units")
+  feeUnits        BigInt   @default(0) @map("fee_units")
+  assetPrecision  Int      @default(7) @map("asset_precision")
   assetCode       String?  @map("asset_code")
   transactionHash String?  @map("transaction_hash")
+  // Backfill policy: existing rows are assigned the default network
+  // ("testnet") by the expand/backfill migration, since all pre-existing
+  // records were ingested from the testnet deployment.
+  network         String   @default("testnet")
   status          String   @default("completed")
 
+  @@unique([network, transactionHash])
+  @@index([network])
   @@index([createdAt])
   @@index([fromAddress])
   @@index([toAddress])

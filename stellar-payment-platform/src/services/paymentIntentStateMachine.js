@@ -19,211 +19,25 @@ const VALID_TRANSITIONS = Object.freeze({
 const ALL_STATUSES = Object.freeze(Object.keys(VALID_TRANSITIONS));
 
 /**
- * Default maximum number of concurrent SSE subscribers.
+ * Statuses that represent an intent which has been submitted but not yet
+ * reconciled (i.e. not in a terminal state).
  */
-const DEFAULT_MAX_SSE_CONNECTIONS = 100;
+const UNRECONCILED_STATUSES = Object.freeze(['PENDING', 'PROCESSING']);
 
 /**
- * Default heartbeat interval (ms) for SSE connections.
+ * Statuses that represent a terminal (final) outcome.
  */
-const DEFAULT_SSE_HEARTBEAT_MS = 15000;
+const TERMINAL_STATUSES = Object.freeze(['COMPLETED', 'FAILED', 'CANCELLED']);
 
 /**
- * Bounded registry of server-sent-event subscribers for payment intent status
- * updates.
+ * Returns true if `status` is a terminal state.
  *
- * Each subscriber receives versioned events (`{ version, ... }`) so clients can
- * resume from a reconnect cursor. The registry enforces a hard connection limit
- * and guarantees that every subscriber is removed on disconnect so slow or
- * abandoned clients cannot leak resources.
+ * @param {string} status
+ * @returns {boolean}
  */
-class PaymentIntentEventStream extends EventEmitter {
-  /**
-   * @param {object} [options]
-   * @param {number} [options.maxConnections]
-   * @param {number} [options.heartbeatMs]
-   */
-  constructor(options = {}) {
-    super();
-    this.setMaxListeners(0);
-    this.maxConnections =
-      Number.isInteger(options.maxConnections) && options.maxConnections > 0
-        ? options.maxConnections
-        : DEFAULT_MAX_SSE_CONNECTIONS;
-    this.heartbeatMs =
-      Number.isInteger(options.heartbeatMs) && options.heartbeatMs > 0
-        ? options.heartbeatMs
-        : DEFAULT_SSE_HEARTBEAT_MS;
-    this.version = 0;
-    this._subscribers = new Map();
-    this._nextSubscriberId = 1;
-  }
-
-  /**
-   * Number of currently connected subscribers.
-   * @returns {number}
-   */
-  get size() {
-    return this._subscribers.size;
-  }
-
-  /**
-   * Registers a subscriber.
-   *
-   * @param {object} params
-   * @param {string} [params.paymentIntentId] - Optional filter; when set the
-   *   subscriber only receives events for that payment intent.
-   * @param {number} [params.lastEventId] - Reconnect cursor; the subscriber is
-   *   told the current version so it can detect gaps.
-   * @param {function} params.send - Called with each event payload.
-   * @param {function} [params.onHeartbeat] - Called on each heartbeat tick.
-   * @returns {{ id: number, version: number, close: function }}
-   * @throws {ApiError} TOO_MANY_REQUESTS when the connection limit is reached.
-   */
-  subscribe({ paymentIntentId, lastEventId, send, onHeartbeat } = {}) {
-    if (typeof send !== 'function') {
-      throw new ApiError('BAD_REQUEST', 'SSE subscriber requires a send function');
-    }
-    if (this._subscribers.size >= this.maxConnections) {
-      throw new ApiError(
-        'TOO_MANY_REQUESTS',
-        `SSE connection limit reached (${this.maxConnections})`
-      );
-    }
-
-    const id = this._nextSubscriberId++;
-    const subscriber = {
-      id,
-      paymentIntentId: paymentIntentId || null,
-      send,
-      onHeartbeat: typeof onHeartbeat === 'function' ? onHeartbeat : null,
-      timer: null,
-      closed: false,
-    };
-
-    if (this.heartbeatMs > 0 && subscriber.onHeartbeat) {
-      subscriber.timer = setInterval(() => {
-        if (subscriber.closed) {
-          return;
-        }
-        try {
-          subscriber.onHeartbeat();
-        } catch (_err) {
-          // A failing heartbeat means the client is gone; drop it.
-          this.unsubscribe(id);
-        }
-      }, this.heartbeatMs);
-      if (typeof subscriber.timer.unref === 'function') {
-        subscriber.timer.unref();
-      }
-    }
-
-    this._subscribers.set(id, subscriber);
-
-    const cursor = Number.isInteger(lastEventId) ? lastEventId : 0;
-    if (cursor > 0 && cursor < this.version) {
-      // Client missed events while disconnected; tell it to resync.
-      this._safeSend(subscriber, {
-        type: 'resync',
-        version: this.version,
-        lastEventId: cursor,
-      });
-    }
-
-    return {
-      id,
-      version: this.version,
-      close: () => this.unsubscribe(id),
-    };
-  }
-
-  /**
-   * Removes a subscriber and clears its heartbeat timer. Safe to call twice.
-   *
-   * @param {number} id
-   * @returns {boolean} true if a subscriber was removed
-   */
-  unsubscribe(id) {
-    const subscriber = this._subscribers.get(id);
-    if (!subscriber) {
-      return false;
-    }
-    subscriber.closed = true;
-    if (subscriber.timer) {
-      clearInterval(subscriber.timer);
-      subscriber.timer = null;
-    }
-    this._subscribers.delete(id);
-    return true;
-  }
-
-  /**
-   * Removes all subscribers. Used on shutdown.
-   */
-  closeAll() {
-    for (const id of Array.from(this._subscribers.keys())) {
-      this.unsubscribe(id);
-    }
-  }
-
-  /**
-   * Publishes a versioned status event to matching subscribers.
-   *
-   * @param {object} params
-   * @param {string} params.paymentIntentId
-   * @param {string} params.status
-   * @param {string} [params.previousStatus]
-   * @param {object} [params.data]
-   * @returns {{ version: number, delivered: number }}
-   */
-  publish({ paymentIntentId, status, previousStatus, data } = {}) {
-    this.version += 1;
-    const event = {
-      type: 'payment_intent.status',
-      version: this.version,
-      paymentIntentId,
-      status,
-      previousStatus: previousStatus || null,
-      data: data || null,
-      timestamp: new Date().toISOString(),
-    };
-
-    let delivered = 0;
-    for (const subscriber of Array.from(this._subscribers.values())) {
-      if (subscriber.paymentIntentId && subscriber.paymentIntentId !== paymentIntentId) {
-        continue;
-      }
-      if (this._safeSend(subscriber, event)) {
-        delivered += 1;
-      }
-    }
-
-    this.emit('event', event);
-    return { version: event.version, delivered };
-  }
-
-  /**
-   * @private
-   */
-  _safeSend(subscriber, payload) {
-    if (subscriber.closed) {
-      return false;
-    }
-    try {
-      subscriber.send(payload);
-      return true;
-    } catch (_err) {
-      // Slow or disconnected client: drop it so resources are released.
-      this.unsubscribe(subscriber.id);
-      return false;
-    }
-  }
+function isTerminalStatus(status) {
+  return TERMINAL_STATUSES.includes(status);
 }
-
-/**
- * Process-wide default event stream used by the state machine helpers.
- */
-const defaultEventStream = new PaymentIntentEventStream();
 
 /**
  * Returns true if transitioning from `from` to `to` is allowed.
@@ -393,17 +207,86 @@ async function updatePaymentIntentStatusTx(prisma, { id, to, data = {}, eventStr
   return updated;
 }
 
+/**
+ * Computes the age (in milliseconds) of the oldest unreconciled payment intent
+ * per network. Only PENDING/PROCESSING intents are considered. The returned
+ * map is keyed by network and contains no user identifiers.
+ *
+ * @param {object} prisma - Prisma client
+ * @param {object} [options]
+ * @param {Date} [options.now] - Reference time (defaults to `new Date()`)
+ * @returns {Promise<Object<string, {oldestIntentId: string, oldestSubmittedAt: Date, ageMs: number}>>}
+ */
+async function getOldestUnreconciledIntentAgeByNetwork(prisma, { now = new Date() } = {}) {
+  const intents = await prisma.paymentIntent.findMany({
+    where: { status: { in: UNRECONCILED_STATUSES } },
+    select: { id: true, network: true, submittedAt: true, createdAt: true },
+  });
+
+  const result = {};
+  for (const intent of intents) {
+    const submittedAt = intent.submittedAt || intent.createdAt;
+    if (!submittedAt) {
+      continue;
+    }
+    const submittedMs = new Date(submittedAt).getTime();
+    if (Number.isNaN(submittedMs)) {
+      continue;
+    }
+    const existing = result[intent.network];
+    if (!existing || submittedMs < existing.oldestSubmittedAt.getTime()) {
+      result[intent.network] = {
+        oldestIntentId: intent.id,
+        oldestSubmittedAt: new Date(submittedMs),
+        ageMs: Math.max(0, now.getTime() - submittedMs),
+      };
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Records the submission-to-finality duration for an intent that has just
+ * reached a terminal state. Labels are limited to `network` and `outcome`.
+ *
+ * @param {object} metrics - Metrics sink exposing `observeFinalityDuration(labels, ms)`
+ * @param {object} params
+ * @param {string} params.network
+ * @param {string} params.outcome - Terminal status (COMPLETED/FAILED/CANCELLED)
+ * @param {Date|string} params.submittedAt
+ * @param {Date} [params.finalizedAt]
+ * @returns {number|null} The recorded duration in ms, or null if not recordable
+ */
+function recordFinalityDuration(metrics, { network, outcome, submittedAt, finalizedAt = new Date() }) {
+  if (!metrics || typeof metrics.observeFinalityDuration !== 'function') {
+    return null;
+  }
+  if (!isTerminalStatus(outcome) || !submittedAt) {
+    return null;
+  }
+  const submittedMs = new Date(submittedAt).getTime();
+  const finalizedMs = new Date(finalizedAt).getTime();
+  if (Number.isNaN(submittedMs) || Number.isNaN(finalizedMs)) {
+    return null;
+  }
+  const durationMs = Math.max(0, finalizedMs - submittedMs);
+  metrics.observeFinalityDuration({ network, outcome }, durationMs);
+  return durationMs;
+}
+
 module.exports = {
   VALID_TRANSITIONS,
   ALL_STATUSES,
-  DEFAULT_MAX_SSE_CONNECTIONS,
-  DEFAULT_SSE_HEARTBEAT_MS,
-  PaymentIntentEventStream,
-  defaultEventStream,
+  UNRECONCILED_STATUSES,
+  TERMINAL_STATUSES,
   isValidTransition,
+  isTerminalStatus,
   assertValidTransition,
   buildGuardedWhere,
   publishStatusEvent,
   updatePaymentIntentStatus,
   updatePaymentIntentStatusTx,
+  getOldestUnreconciledIntentAgeByNetwork,
+  recordFinalityDuration,
 };

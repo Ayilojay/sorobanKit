@@ -9,45 +9,18 @@ const { StrKey } = require('@stellar/stellar-sdk');
 const { logger } = require('../../logger');
 const { idempotencyMiddleware } = require('../../../middleware/idempotency');
 const { updatePaymentIntentStatus } = require('../../services/paymentIntentStateMachine');
-const { randomUUID } = require('crypto');
-const { EventEmitter } = require('events');
-
-// ── SSE configuration ────────────────────────────────────────────────────────
-const SSE_HEARTBEAT_MS = Number(process.env.SSE_HEARTBEAT_MS || 15000);
-const SSE_MAX_CONNECTIONS_PER_USER = Number(process.env.SSE_MAX_CONNECTIONS_PER_USER || 5);
-const SSE_MAX_CONNECTIONS_GLOBAL = Number(process.env.SSE_MAX_CONNECTIONS_GLOBAL || 500);
-const SSE_MAX_LIFETIME_MS = Number(process.env.SSE_MAX_LIFETIME_MS || 30 * 60 * 1000);
-
-// In-process event bus for payment status updates. Exposed so other modules
-// (e.g. the state machine) can publish updates via `paymentEvents`.
-const paymentEvents = new EventEmitter();
-paymentEvents.setMaxListeners(0);
-
-// Global connection accounting.
-let globalConnections = 0;
-const connectionsByUser = new Map();
-
-function acquireConnection(userId) {
-  if (globalConnections >= SSE_MAX_CONNECTIONS_GLOBAL) return false;
-  const current = connectionsByUser.get(userId) || 0;
-  if (current >= SSE_MAX_CONNECTIONS_PER_USER) return false;
-  globalConnections += 1;
-  connectionsByUser.set(userId, current + 1);
-  return true;
-}
-
-function releaseConnection(userId) {
-  globalConnections = Math.max(0, globalConnections - 1);
-  const current = connectionsByUser.get(userId) || 0;
-  if (current <= 1) connectionsByUser.delete(userId);
-  else connectionsByUser.set(userId, current - 1);
-}
+const {
+  observeSubmissionToFinality,
+  refreshOldestUnreconciledIntentAge,
+} = require('../../services/ledgerLagMetrics');
 
 module.exports = (redisClient) => {
   const router = express.Router();
-
+  
   // ── Idempotency protection for payment intent creation (POST /payments/bulk).
-  // Duplicate submissions within 24h return the originally created intents. ──
+  // Duplicate submissions within 24h (including from other browser tabs) return
+  // the originally created intents. Registered once so the Idempotency-Key
+  // header is honored exactly once per request. ──
   router.use(idempotencyMiddleware(redisClient));
 
   // POST /payments/bulk
@@ -66,40 +39,59 @@ module.exports = (redisClient) => {
   router.post('/payments/bulk', requireJson, validateSchema({ body: bulkPaymentSchema }), asyncHandler(async (req, res, next) => {
     const intents = req.body;
 
-    // ── Phase 1: validate every item before touching the database
-    // (all-or-nothing semantics). ──
-    const validationErrors = [];
-    for (let idx = 0; idx < intents.length; idx += 1) {
-      const intent = intents[idx];
-      if (!StrKey.isValidEd25519PublicKey(intent.from)) {
-        validationErrors.push({ index: idx, field: 'from', message: 'Invalid Stellar public key' });
-      }
-      if (!StrKey.isValidEd25519PublicKey(intent.to)) {
-        validationErrors.push({ index: idx, field: 'to', message: 'Invalid Stellar public key' });
-      }
+  // Additional per-item validation that requires runtime logic
+  const normalizedIntents = [];
+  for (const idx in intents) {
+    const intent = intents[idx];
+    if (!StrKey.isValidEd25519PublicKey(intent.from)) {
+      const err = new Error(`Invalid Stellar public key for 'from' at index ${idx}`);
+      err.statusCode = 400;
+      err.code = 'INVALID_INPUT';
+      throw err;
     }
     if (validationErrors.length > 0) {
       const err = new Error('Bulk payment validation failed');
       err.statusCode = 400;
-      err.details = validationErrors;
+      err.code = 'INVALID_INPUT';
       throw err;
     }
 
-    // ── Phase 2: assign stable identifiers. The batchId is generated once per
-    // request; itemIds are deterministic per (batchId, index) so retries with
-    // the same external IDs resolve to the same records. ──
-    const batchId = randomUUID();
-    const items = intents.map((intent, index) => ({
-      index,
-      itemId: `${batchId}:${index}`,
-      externalId: intent.external_id,
-      from: intent.from,
-      to: intent.to,
-      amount: intent.amount,
-      asset: intent.asset,
-      memoType: intent.memo_type,
-      memo: intent.memo,
-      metadata: intent.metadata,
+    // Amounts are stored as exact decimal strings at asset precision. Values
+    // with more fractional digits than the asset supports are rejected rather
+    // than silently rounded.
+    let amount;
+    try {
+      amount = normalizeAmount(intent.amount, { precision: STELLAR_ASSET_PRECISION });
+    } catch (amountError) {
+      if (amountError instanceof AmountError) {
+        const err = new Error(`Invalid amount at index ${idx}: ${amountError.message}`);
+        err.statusCode = 400;
+        err.code = 'INVALID_INPUT';
+        throw err;
+      }
+      throw amountError;
+    }
+
+    normalizedIntents.push({
+      ...intent,
+      amount,
+      network: resolveNetwork(intent),
+    });
+  }
+
+  try {
+    const createOps = normalizedIntents.map((intent) => prisma.paymentIntent.create({
+      data: {
+        externalId: intent.external_id,
+        from: intent.from,
+        to: intent.to,
+        amount: intent.amount,
+        asset: intent.asset,
+        network: intent.network,
+        memoType: intent.memo_type,
+        memo: intent.memo,
+        metadata: intent.metadata,
+      },
     }));
 
     try {
@@ -211,43 +203,59 @@ module.exports = (redisClient) => {
       res.write(`data: ${JSON.stringify(body)}\n\n`);
     };
 
-    // Initial snapshot so clients can render immediately.
-    writeEvent('snapshot', { status: intent.status, amount: intent.amount, asset: intent.asset });
-
-    const onUpdate = (update) => {
-      if (!update || update.paymentId !== paymentId) return;
-      writeEvent('status', { status: update.status, previous_status: update.previousStatus });
-    };
-    paymentEvents.on('payment.status', onUpdate);
-
-    const heartbeat = setInterval(() => {
-      res.write(': heartbeat\n\n');
-    }, SSE_HEARTBEAT_MS);
-    if (typeof heartbeat.unref === 'function') heartbeat.unref();
-
-    const lifetime = setTimeout(() => {
-      cleanup();
-      res.end();
-    }, SSE_MAX_LIFETIME_MS);
-    if (typeof lifetime.unref === 'function') lifetime.unref();
-
-    let cleanedUp = false;
-    function cleanup() {
-      if (cleanedUp) return;
-      cleanedUp = true;
-      clearInterval(heartbeat);
-      clearTimeout(lifetime);
-      paymentEvents.removeListener('payment.status', onUpdate);
-      releaseConnection(userId);
+    // Refresh the oldest-unreconciled-intent gauge per network after new
+    // intents are registered. Labels are limited to network/operation/status.
+    const networks = new Set(created.map((c) => c.network || 'unknown'));
+    for (const network of networks) {
+      await refreshOldestUnreconciledIntentAge(prisma, network);
     }
 
-    req.on('close', cleanup);
-    req.on('aborted', cleanup);
-    res.on('close', cleanup);
-    res.on('error', (err) => {
-      logger.warn('SSE stream error:', err && err.message);
-      cleanup();
-    });
+    return res.status(201).json({ ok: true, count: created.length, data: created.map((c) => ({ id: c.id, external_id: c.externalId })) });
+  } catch (error) {
+    logger.error('Bulk payment registration failed:', error);
+    const dbErr = new Error('Failed to register payment intents');
+    dbErr.statusCode = 500;
+    return next(dbErr);
+  }
+}));
+
+  // POST /payments/intents/:id/status
+  // Transitions a payment intent and records submission-to-finality latency
+  // when the intent reaches a terminal (finality) state.
+  router.post('/payments/intents/:id/status', requireJson, asyncHandler(async (req, res, next) => {
+    const { id } = req.params;
+    const { status } = req.body || {};
+
+    if (!status || typeof status !== 'string') {
+      const err = new Error('Missing required field: status');
+      err.statusCode = 400;
+      throw err;
+    }
+
+    try {
+      const updated = await updatePaymentIntentStatus(prisma, id, status);
+
+      if (updated && updated.submittedAt && updated.finalizedAt) {
+        observeSubmissionToFinality({
+          network: updated.network || 'unknown',
+          operation: 'payment_intent',
+          status: updated.status,
+          submittedAt: updated.submittedAt,
+          finalizedAt: updated.finalizedAt,
+        });
+      }
+
+      if (updated) {
+        await refreshOldestUnreconciledIntentAge(prisma, updated.network || 'unknown');
+      }
+
+      return res.status(200).json({ ok: true, data: { id: updated.id, status: updated.status } });
+    } catch (error) {
+      logger.error('Payment intent status transition failed:', error);
+      const dbErr = new Error('Failed to update payment intent status');
+      dbErr.statusCode = error.statusCode || 500;
+      return next(dbErr);
+    }
   }));
 
   return router;

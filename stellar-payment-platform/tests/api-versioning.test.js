@@ -133,3 +133,149 @@ describe('API versioning — mounted routers', () => {
     expect(res.status).toBe(404);
   });
 });
+
+describe('API versioning — published client contracts', () => {
+  const fs = require('fs');
+  const path = require('path');
+  const { SUPPORTED_VERSIONS, DEPRECATIONS, getDeprecation } = require('../src/config/deprecations');
+
+  const CONTRACTS_ROOT = path.join(__dirname, 'contracts', 'clients');
+
+  const loadFixtures = (version) => {
+    const dir = path.join(CONTRACTS_ROOT, version);
+    if (!fs.existsSync(dir)) return [];
+    return fs
+      .readdirSync(dir)
+      .filter((f) => f.endsWith('.json'))
+      .sort()
+      .map((f) => JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')));
+  };
+
+  const pick = (obj, keys) => {
+    if (!obj) return obj;
+    return keys.reduce((acc, k) => {
+      if (Object.prototype.hasOwnProperty.call(obj, k)) acc[k] = obj[k];
+      return acc;
+    }, {});
+  };
+
+  const diff = (expected, actual, at = '$') => {
+    const out = [];
+    if (expected === actual) return out;
+    const bothObjects =
+      expected && actual && typeof expected === 'object' && typeof actual === 'object';
+    if (!bothObjects) {
+      out.push(`${at}: expected ${JSON.stringify(expected)} but got ${JSON.stringify(actual)}`);
+      return out;
+    }
+    const keys = new Set([...Object.keys(expected), ...Object.keys(actual)]);
+    for (const key of keys) {
+      const next = `${at}.${key}`;
+      if (!(key in expected)) {
+        out.push(`${next}: unexpected field ${JSON.stringify(actual[key])}`);
+      } else if (!(key in actual)) {
+        out.push(`${next}: missing field (expected ${JSON.stringify(expected[key])})`);
+      } else {
+        out.push(...diff(expected[key], actual[key], next));
+      }
+    }
+    return out;
+  };
+
+  const replay = async (fixture) => {
+    let req = request(app)[fixture.request.method.toLowerCase()](fixture.request.path);
+    if (fixture.request.query) req = req.query(fixture.request.query);
+    for (const [k, v] of Object.entries(fixture.request.headers || {})) {
+      req = req.set(k, v);
+    }
+    return req;
+  };
+
+  test('every supported version has at least one published contract', () => {
+    for (const version of SUPPORTED_VERSIONS) {
+      expect(loadFixtures(version).length).toBeGreaterThan(0);
+    }
+  });
+
+  for (const version of SUPPORTED_VERSIONS) {
+    describe(`${version} client contracts`, () => {
+      const fixtures = loadFixtures(version);
+
+      for (const fixture of fixtures) {
+        test(`${fixture.name}`, async () => {
+          const res = await replay(fixture);
+
+          expect(res.status).toBe(fixture.expect.status);
+
+          if (fixture.expect.headers) {
+            const actualHeaders = pick(res.headers, Object.keys(fixture.expect.headers));
+            const headerDiff = diff(fixture.expect.headers, actualHeaders, '$headers');
+            if (headerDiff.length) {
+              throw new Error(`Header contract mismatch:\n${headerDiff.join('\n')}`);
+            }
+          }
+
+          if (fixture.expect.body !== undefined) {
+            const bodyDiff = diff(fixture.expect.body, res.body, '$body');
+            if (bodyDiff.length) {
+              throw new Error(`Body contract mismatch:\n${bodyDiff.join('\n')}`);
+            }
+          }
+        });
+      }
+    });
+  }
+
+  test('unknown version (v9) is rejected with 404 and no contract leak', async () => {
+    const res = await request(app).get('/api/v9/federation').query({ q: 'client*localhost' });
+    expect(res.status).toBe(404);
+    expect(res.body).not.toHaveProperty('apiVersion', 'v9');
+  });
+
+  test('URI version takes precedence over a contradicting header', async () => {
+    const res = await request(app)
+      .get('/api/v1/federation')
+      .set('API-Version', 'v2')
+      .query({ q: 'client*localhost' });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(
+      (await request(app).get('/api/v1/federation').query({ q: 'client*localhost' })).body
+    );
+  });
+
+  test('header-only version is honoured when URI is unversioned', async () => {
+    const viaHeader = await request(app)
+      .get('/federation')
+      .set('Accept-Version', 'v2')
+      .query({ q: 'client*localhost' });
+    const viaUri = await request(app)
+      .get('/api/v2/federation')
+      .query({ q: 'client*localhost' });
+    expect(viaHeader.status).toBe(viaUri.status);
+    expect(viaHeader.body).toEqual(viaUri.body);
+  });
+
+  test('deprecation config exposes a sunset window for every deprecated version', () => {
+    for (const [version, entry] of Object.entries(DEPRECATIONS)) {
+      expect(SUPPORTED_VERSIONS).toContain(version);
+      expect(entry.sunset).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+      expect(new Date(entry.sunset).getTime()).toBeGreaterThan(Date.now());
+      expect(getDeprecation(version)).toEqual(entry);
+    }
+  });
+
+  test('deprecated versions emit Deprecation and Sunset headers', async () => {
+    const deprecated = Object.keys(DEPRECATIONS);
+    if (deprecated.length === 0) return;
+    for (const version of deprecated) {
+      const res = await request(app)
+        .get(`/api/${version}/federation`)
+        .query({ q: 'client*localhost' });
+      expect(res.headers.deprecation).toBeDefined();
+      expect(res.headers.sunset).toBeDefined();
+      expect(new Date(res.headers.sunset).getTime()).toBe(
+        new Date(DEPRECATIONS[version].sunset).getTime()
+      );
+    }
+  });
+});

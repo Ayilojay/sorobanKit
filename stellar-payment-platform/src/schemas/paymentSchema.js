@@ -6,6 +6,10 @@ const { parseAmount, AmountError } = require('../lib/amount');
 
 const MAX_METADATA_BYTES = 2 * 1024;
 
+// Stellar amounts support at most 7 fractional digits (stroop precision).
+const MAX_AMOUNT_DECIMALS = 7;
+const AMOUNT_PATTERN = /^\d+(\.\d{1,7})?$/;
+
 const metadataSchema = z
   .record(z.string(), z.json())
   .refine(
@@ -13,28 +17,16 @@ const metadataSchema = z
     { message: 'metadata must not exceed 2KB' },
   );
 
-/**
- * Validate a Stellar amount string using the shared decimal-safe parser.
- * Rejects unsupported notation (exponents, signs, separators), overflow,
- * and precision beyond the asset's smallest unit.
- */
-function refineAmount(value, ctx, asset) {
-  try {
-    parseAmount(value, { asset });
-  } catch (err) {
-    if (err instanceof AmountError) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, message: err.message });
-      return;
-    }
-    throw err;
-  }
-}
-
 const amountSchema = z
   .string({ error: 'amount is required' })
   .trim()
   .min(1)
-  .superRefine((value, ctx) => refineAmount(value, ctx));
+  .regex(AMOUNT_PATTERN, {
+    message: `amount must be a decimal string with at most ${MAX_AMOUNT_DECIMALS} fractional digits`,
+  })
+  .refine((value) => Number(value) > 0, {
+    message: 'amount must be greater than zero',
+  });
 
 const paymentIntentSchema = z.object({
   // Free-text identifier supplied by the caller — sanitize before storage.
@@ -78,5 +70,8 @@ module.exports = {
   bulkPaymentRequestSchema,
   amountSchema,
   metadataSchema,
+  amountSchema,
   MAX_METADATA_BYTES,
+  MAX_AMOUNT_DECIMALS,
+  AMOUNT_PATTERN,
 };
