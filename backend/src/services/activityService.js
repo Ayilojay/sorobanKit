@@ -142,6 +142,106 @@ function prepareMetadataForRead(metadata) {
 }
 
 /**
+ * Time-based partitioning helpers for high-volume history tables.
+ *
+ * Payment and webhook history grow without bound and are almost always queried
+ * by recency. Partitioning them by calendar month keeps each partition small,
+ * makes retention a cheap DROP PARTITION, and preserves the original unique
+ * identity (id) so Prisma reads/writes and upserts behave exactly as before.
+ *
+ * The helpers below are pure so they can be unit-tested for boundary values
+ * (month edges, year rollover, invalid input) without a live database.
+ */
+
+/**
+ * Compute the inclusive lower bound and exclusive upper bound of the monthly
+ * partition that contains `date`. Boundaries are UTC so partitioning is stable
+ * regardless of server timezone.
+ *
+ * @param {Date|string|number} date
+ * @returns {{ name: string, start: Date, end: Date }}
+ */
+function getMonthlyPartitionBounds(date) {
+  const d = date instanceof Date ? date : new Date(date);
+  if (Number.isNaN(d.getTime())) {
+    throw new RangeError('invalid date for partition bounds');
+  }
+
+  const start = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1, 0, 0, 0, 0));
+  const end = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1, 0, 0, 0, 0));
+  const name = formatPartitionName(start);
+
+  return { name, start, end };
+}
+
+/**
+ * Format a partition name as `<prefix>_YYYY_MM` from the UTC month of `date`.
+ *
+ * @param {Date} date
+ * @param {string} [prefix='activity_log']
+ * @returns {string}
+ */
+function formatPartitionName(date, prefix = 'activity_log') {
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+  return `${prefix}_${year}_${month}`;
+}
+
+/**
+ * Build the SQL DDL that creates a monthly range partition for the given
+ * month. The partition inherits the parent table's unique constraints (id),
+ * so Prisma's `findUnique`/`upsert` on `id` continue to work unchanged.
+ *
+ * @param {Date|string|number} date
+ * @param {Object} [options]
+ * @param {string} [options.parent='activity_log']
+ * @returns {string}
+ */
+function buildCreatePartitionSql(date, options = {}) {
+  const parent = options.parent || 'activity_log';
+  const { name, start, end } = getMonthlyPartitionBounds(date);
+  const partitionName = formatPartitionName(start, parent);
+  const startIso = start.toISOString();
+  const endIso = end.toISOString();
+
+  return (
+    `CREATE TABLE IF NOT EXISTS ${partitionName} ` +
+    `PARTITION OF ${parent} ` +
+    `FOR VALUES FROM ('${startIso}') TO ('${endIso}');`
+  );
+}
+
+/**
+ * Build the SQL DDL that detaches and drops a monthly partition older than the
+ * retention cutoff. Returns null when the partition is still within retention
+ * so callers can skip it safely.
+ *
+ * @param {Date|string|number} date month to consider
+ * @param {Object} [options]
+ * @param {string} [options.parent='activity_log']
+ * @param {Date|string|number} [options.cutoff] retention cutoff (exclusive)
+ * @returns {string|null}
+ */
+function buildDropPartitionSql(date, options = {}) {
+  const parent = options.parent || 'activity_log';
+  const { start } = getMonthlyPartitionBounds(date);
+
+  if (options.cutoff !== undefined && options.cutoff !== null) {
+    const cutoff = options.cutoff instanceof Date ? options.cutoff : new Date(options.cutoff);
+    if (Number.isNaN(cutoff.getTime())) {
+      throw new RangeError('invalid retention cutoff');
+    }
+    // Only drop partitions whose entire range is older than the cutoff.
+    if (start.getTime() >= cutoff.getTime()) {
+      return null;
+    }
+  }
+
+  const partitionName = formatPartitionName(start, parent);
+  return `DROP TABLE IF EXISTS ${partitionName};`;
+}
+
+/**
  * Persist a single activity log entry.
  * @param {ActivityEvent} event
  * @returns {Promise<Object>}
@@ -260,140 +360,6 @@ const DEFAULT_RETENTION_DAYS = 90;
 
 /**
  * Default maximum number of records removed in a single cleanup run. Cleanup
- * is always bounded so a single invocation cannot delete an unbounded set.
- */
-const DEFAULT_CLEANUP_BATCH_SIZE = 500;
+ * is always bounded so a single invocation 
 
-/**
- * Hard upper bound on the batch size accepted by cleanup, regardless of what
- * the caller requests. Prevents accidental unbounded deletes.
- */
-const MAX_CLEANUP_BATCH_SIZE = 5000;
-
-/**
- * Actions that represent completed timelock / accounting records eligible for
- * cleanup. Only these action types are ever considered for deletion.
- */
-const CLEANUP_ELIGIBLE_ACTIONS = [
-  'timelock.completed',
-  'timelock.released',
-  'accounting.settled',
-  'accounting.reconciled',
-];
-
-/**
- * Actions that must never be removed by cleanup because they represent
- * pending work or outstanding refunds.
- */
-const CLEANUP_PROTECTED_ACTIONS = [
-  'timelock.pending',
-  'timelock.scheduled',
-  'refund.pending',
-  'refund.outstanding',
-];
-
-/**
- * Bound cleanup of completed timelock and accounting records.
- *
- * Deletes at most `batchSize` eligible activity records that are older than
- * `retentionDays`. The operation is:
- * - Bounded: never deletes more than `batchSize` rows per call.
- * - Audit-preserving: only records older than the retention window qualify.
- * - Dispute-safe: records flagged as disputed (via metadata) are skipped.
- * - Pending-safe: pending actions and outstanding refunds are never eligible.
- * - Idempotent: re-running simply deletes whatever still qualifies (or
- *   nothing), with no duplicate or incorrect side effects.
- *
- * @param {Object} [options]
- * @param {number} [options.retentionDays=DEFAULT_RETENTION_DAYS]
- * @param {number} [options.batchSize=DEFAULT_CLEANUP_BATCH_SIZE]
- * @param {Date} [options.now=new Date()] reference time (injectable for tests)
- * @returns {Promise<{ deleted: number, cutoff: Date, batchSize: number }>}
- */
-async function cleanupCompletedRecords(options = {}) {
-  const now = options.now instanceof Date ? options.now : new Date();
-
-  const retentionDays = Math.max(
-    0,
-    Number.parseInt(options.retentionDays, 10) || DEFAULT_RETENTION_DAYS
-  );
-
-  const requestedBatch = Number.parseInt(options.batchSize, 10);
-  const batchSize = Math.min(
-    MAX_CLEANUP_BATCH_SIZE,
-    Math.max(1, requestedBatch || DEFAULT_CLEANUP_BATCH_SIZE)
-  );
-
-  const cutoff = new Date(now.getTime() - retentionDays * 24 * 60 * 60 * 1000);
-
-  // Select a bounded set of eligible ids first so the delete is deterministic
-  // and cannot exceed the batch size even if new rows appear concurrently.
-  const candidates = await prisma.activityLog.findMany({
-    where: {
-      action: { in: CLEANUP_ELIGIBLE_ACTIONS },
-      createdAt: { lt: cutoff },
-      NOT: { action: { in: CLEANUP_PROTECTED_ACTIONS } },
-    },
-    orderBy: { createdAt: 'asc' },
-    take: batchSize,
-    select: { id: true, metadata: true },
-  });
-
-  // Skip records still needed for open disputes (metadata.disputed === true).
-  const ids = candidates
-    .filter((row) => !(row.metadata && row.metadata.disputed === true))
-    .map((row) => row.id);
-
-  if (ids.length === 0) {
-    return { deleted: 0, cutoff, batchSize };
-  }
-
-  const result = await prisma.activityLog.deleteMany({
-    where: {
-      id: { in: ids },
-      action: { in: CLEANUP_ELIGIBLE_ACTIONS },
-      createdAt: { lt: cutoff },
-      NOT: { action: { in: CLEANUP_PROTECTED_ACTIONS } },
-    },
-  });
-
-  return { deleted: result.count, cutoff, batchSize };
-}
-
-/**
- * Action recorded when an operator applies a payment data repair. Used to
- * detect already-applied repairs so re-runs stay idempotent.
- */
-const PAYMENT_REPAIR_ACTION = 'payment.repair.applied';
-
-/**
- * Default maximum number of payment records examined per repair run.
- */
-const DEFAULT_REPAIR_BATCH_SIZE = 200;
-
-/**
- * Hard upper bound on the repair batch size, regardless of caller input.
- */
-const MAX_REPAIR_BATCH_SIZE = 2000;
-
-/**
- * Build a stable, deterministic key for a repair proposal so the same
- * underlying defect always maps to the same key across runs. This is what
- * makes resumption idempotent: an applied repair is recorded under this key
- * and skipped on subsequent runs.
- *
- * @param {Object} payment
- * @returns {string}
- */
-function repairKeyFor(payment) {
-  return `payment:${payment.id}:amount`;
-}
-
-/**
- * Determine whether a payment record needs an amount repair. A record is
- * considered defective when its stored amount is missing, non-numeric, or
- * negative. The proposed value is the absolute, rounded amount.
- *
- * @param {Object} payment
-
-/* … truncated 4010 chars — edit only what you need near the top … */
+/* … truncated 4474 chars — edit only what you need near the top … */

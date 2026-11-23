@@ -15,6 +15,20 @@ const DB_MAINTENANCE_STATEMENT_TIMEOUT_MS =
 // Postgres SQLSTATE for query_canceled (statement_timeout / cancel).
 const STATEMENT_TIMEOUT_SQLSTATE = '57014';
 
+// Default per-replica pool sizes and replica counts used for capacity budgeting.
+const DEFAULT_POOL_SIZE = parseInt(process.env.DB_POOL_SIZE, 10) || 10;
+const DEFAULT_REPLICAS = {
+  api: parseInt(process.env.API_REPLICAS, 10) || 1,
+  worker: parseInt(process.env.WORKER_REPLICAS, 10) || 1,
+  migration: parseInt(process.env.MIGRATION_REPLICAS, 10) || 1,
+  monitoring: parseInt(process.env.MONITORING_REPLICAS, 10) || 1,
+};
+// Connections reserved for administration (superuser / ops) so they stay available.
+const DB_ADMIN_RESERVED_CONNECTIONS =
+  parseInt(process.env.DB_ADMIN_RESERVED_CONNECTIONS, 10) || 5;
+// Database connection limit (max_connections). 0/undefined disables validation.
+const DB_MAX_CONNECTIONS = parseInt(process.env.DB_MAX_CONNECTIONS, 10) || 0;
+
 let monitorTimer = null;
 let pool = null;
 
@@ -28,6 +42,64 @@ function collectPoolMetrics() {
     idle: typeof pool.idleCount === 'number' ? pool.idleCount : 0,
     waiting: typeof pool.waitingCount === 'number' ? pool.waitingCount : 0,
   };
+}
+
+// Aggregate the total possible connections across all replica groups.
+// Each group contributes replicas * perReplicaPoolSize.
+function aggregateConnectionCapacity(config) {
+  const cfg = config || {};
+  const replicas = Object.assign({}, DEFAULT_REPLICAS, cfg.replicas || {});
+  const poolSize = typeof cfg.poolSize === 'number' ? cfg.poolSize : DEFAULT_POOL_SIZE;
+
+  const groups = {};
+  let total = 0;
+  Object.keys(replicas).forEach((name) => {
+    const count = Number(replicas[name]) || 0;
+    const groupTotal = count * poolSize;
+    groups[name] = { replicas: count, poolSize, total: groupTotal };
+    total += groupTotal;
+  });
+
+  return { groups, poolSize, total };
+}
+
+// Validate aggregated configured capacity against the database limit, reserving
+// headroom for administration. Returns a structured result; throws on overflow.
+function validateConnectionCapacity(config) {
+  const cfg = config || {};
+  const capacity = aggregateConnectionCapacity(cfg);
+  const maxConnections =
+    typeof cfg.maxConnections === 'number' ? cfg.maxConnections : DB_MAX_CONNECTIONS;
+  const reserved =
+    typeof cfg.reserved === 'number' ? cfg.reserved : DB_ADMIN_RESERVED_CONNECTIONS;
+
+  const result = {
+    total: capacity.total,
+    groups: capacity.groups,
+    poolSize: capacity.poolSize,
+    maxConnections,
+    reserved,
+    available: maxConnections > 0 ? maxConnections - reserved : null,
+    ok: true,
+  };
+
+  // Validation is disabled when no database limit is configured.
+  if (!maxConnections || maxConnections <= 0) {
+    return result;
+  }
+
+  if (capacity.total > result.available) {
+    result.ok = false;
+    const err = new Error(
+      `Configured connection capacity (${capacity.total}) exceeds database limit ` +
+        `(${maxConnections}) minus reserved admin headroom (${reserved}) = ${result.available}`
+    );
+    err.code = 'DB_CAPACITY_EXCEEDED';
+    err.capacity = result;
+    throw err;
+  }
+
+  return result;
 }
 
 function checkWaitQueue() {
@@ -151,7 +223,13 @@ module.exports = {
   DB_INTERACTIVE_STATEMENT_TIMEOUT_MS,
   DB_MAINTENANCE_STATEMENT_TIMEOUT_MS,
   STATEMENT_TIMEOUT_SQLSTATE,
+  DEFAULT_POOL_SIZE,
+  DEFAULT_REPLICAS,
+  DB_ADMIN_RESERVED_CONNECTIONS,
+  DB_MAX_CONNECTIONS,
   collectPoolMetrics,
+  aggregateConnectionCapacity,
+  validateConnectionCapacity,
   checkWaitQueue,
   isStatementTimeout,
   toSafeTimeoutError,

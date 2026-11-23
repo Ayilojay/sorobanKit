@@ -1,6 +1,14 @@
 const { Pool } = require('pg');
 const logger = require('./logger');
-const { startPoolMonitor, checkPoolWaitQueue } = require('./db-pool-monitor');
+const {
+  startPoolMonitor,
+  checkPoolWaitQueue,
+  runInteractiveQuery,
+  runMaintenanceQuery,
+  DEFAULT_INTERACTIVE_TIMEOUT_MS,
+  aggregateConnectionCapacity,
+  validateConnectionCapacity,
+} = require('./db-pool-monitor');
 
 jest.mock('./logger', () => ({
   warn: jest.fn(),
@@ -183,5 +191,97 @@ describe('db-pool-monitor interactive statement timeouts', () => {
     await runInteractiveQuery(pool, 'SELECT 1');
 
     expect(client.release).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('db-pool-monitor aggregate connection capacity', () => {
+  const replicas = {
+    api: { replicas: 4, poolSize: 10 },
+    worker: { replicas: 3, poolSize: 8 },
+    migration: { replicas: 1, poolSize: 5 },
+    monitoring: { replicas: 2, poolSize: 2 },
+  };
+
+  test('aggregates total possible connections across all replica groups', () => {
+    const result = aggregateConnectionCapacity(replicas);
+
+    expect(result.total).toBe(4 * 10 + 3 * 8 + 1 * 5 + 2 * 2);
+    expect(result.breakdown).toEqual({
+      api: 40,
+      worker: 24,
+      migration: 5,
+      monitoring: 4,
+    });
+  });
+
+  test('treats missing replica groups as zero', () => {
+    const result = aggregateConnectionCapacity({ api: { replicas: 2, poolSize: 5 } });
+
+    expect(result.total).toBe(10);
+    expect(result.breakdown.worker).toBe(0);
+    expect(result.breakdown.migration).toBe(0);
+    expect(result.breakdown.monitoring).toBe(0);
+  });
+
+  test('validates configured capacity against the database limit with admin headroom', () => {
+    const result = validateConnectionCapacity(replicas, { dbLimit: 100, adminReserve: 10 });
+
+    expect(result.ok).toBe(true);
+    expect(result.total).toBe(73);
+    expect(result.available).toBe(90);
+    expect(result.headroom).toBe(17);
+  });
+
+  test('fails when configured capacity exactly consumes the available budget', () => {
+    const result = validateConnectionCapacity(
+      { api: { replicas: 9, poolSize: 10 } },
+      { dbLimit: 100, adminReserve: 10 }
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.total).toBe(90);
+    expect(result.headroom).toBe(0);
+  });
+
+  test('fails when scaling exceeds the database limit after reserving admin capacity', () => {
+    const result = validateConnectionCapacity(
+      { api: { replicas: 10, poolSize: 10 } },
+      { dbLimit: 100, adminReserve: 10 }
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.total).toBe(100);
+    expect(result.available).toBe(90);
+    expect(result.headroom).toBe(-10);
+    expect(result.reason).toMatch(/exceeds/i);
+  });
+
+  test('surfaces a clear failure when scaling exceeds the raw database limit', () => {
+    const result = validateConnectionCapacity(
+      { api: { replicas: 20, poolSize: 10 } },
+      { dbLimit: 100, adminReserve: 10 }
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.total).toBe(200);
+    expect(result.reason).toMatch(/exceeds/i);
+  });
+
+  test('rejects invalid replica configuration', () => {
+    expect(() => aggregateConnectionCapacity({ api: { replicas: -1, poolSize: 10 } })).toThrow();
+    expect(() => aggregateConnectionCapacity({ api: { replicas: 1, poolSize: 0 } })).toThrow();
+  });
+
+  test('is deterministic under concurrent validation calls', async () => {
+    const results = await Promise.all(
+      Array.from({ length: 20 }, () =>
+        Promise.resolve().then(() => validateConnectionCapacity(replicas, { dbLimit: 100, adminReserve: 10 }))
+      )
+    );
+
+    results.forEach((result) => {
+      expect(result.ok).toBe(true);
+      expect(result.total).toBe(73);
+    });
   });
 });

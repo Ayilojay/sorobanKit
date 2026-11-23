@@ -81,6 +81,32 @@ The dashboard uid is `stellar-tags-db-pool` and can be accessed directly at
 | `datasource` | Prometheus datasource selector. |
 | `instance` | Filters by scrape target instance (multi-select, defaults to All). |
 
+## Connection Capacity Budgeting
+
+The database connection limit is shared by every replica that opens a pool.
+The server aggregates the configured capacity across all replica types and
+validates it against the database limit before accepting traffic, reserving
+headroom for administrative connections.
+
+### Capacity inputs
+
+| Replica type | Env var | Per-replica pool size |
+| --- | --- | --- |
+| API | `API_REPLICAS` | `DB_POOL_MAX` |
+| Worker | `WORKER_REPLICAS` | `DB_POOL_MAX` |
+| Migration | `MIGRATION_REPLICAS` | `DB_POOL_MAX` |
+| Monitoring | `MONITORING_REPLICAS` | `DB_POOL_MAX` |
+
+Total configured capacity is
+`(API_REPLICAS + WORKER_REPLICAS + MIGRATION_REPLICAS + MONITORING_REPLICAS) * DB_POOL_MAX`.
+
+### Validation
+
+Startup fails with a clear error when the aggregated capacity plus the
+reserved administrative headroom (`DB_ADMIN_RESERVED_CONNECTIONS`, default `5`)
+exceeds `DB_CONNECTION_LIMIT`. Reduce replica counts or `DB_POOL_MAX`, or raise
+the database limit, then restart.
+
 ## Alerting Suggestions
 
 Create Grafana alerts on the following to catch pool exhaustion early:
