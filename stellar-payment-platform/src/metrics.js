@@ -215,6 +215,83 @@ const redisConnectionsActive = new client.Gauge({
   },
 });
 
+// --- Webhook queue health -------------------------------------------------
+// These metrics back the operational dashboard for the webhook delivery queue.
+// They are updated by the webhook worker / admin DLQ route via the helpers
+// below rather than collected at scrape time, so a scrape never triggers a
+// database query. All label values are bounded (status/outcome enums only).
+
+// Gauge: age in seconds of the oldest webhook event still pending delivery.
+// Reported as 0 when the queue is empty so the dashboard shows a flat line
+// instead of a gap.
+const webhookQueueOldestPendingAge = new client.Gauge({
+  name: 'stellar_tags_webhook_queue_oldest_pending_age_seconds',
+  help: 'Age in seconds of the oldest webhook event still pending delivery (0 when empty)',
+});
+
+// Histogram: number of delivery attempts made for an event before it was
+// delivered or moved to the DLQ. Buckets are bounded to a small set of attempt
+// counts so the dashboard can render an attempt distribution without
+// unbounded cardinality.
+const webhookDeliveryAttempts = new client.Histogram({
+  name: 'stellar_tags_webhook_delivery_attempts',
+  help: 'Number of delivery attempts per webhook event',
+  buckets: [1, 2, 3, 5, 8, 13, 21],
+});
+
+// Histogram: end-to-end delivery latency in seconds, from event enqueue to
+// successful delivery. Buckets mirror the HTTP latency SLOs plus a longer tail
+// for retried deliveries.
+const webhookDeliveryLatency = new client.Histogram({
+  name: 'stellar_tags_webhook_delivery_latency_seconds',
+  help: 'Webhook delivery latency in seconds from enqueue to successful delivery',
+  buckets: [0.1, 0.5, 1, 5, 30, 60, 300],
+});
+
+// Gauge: age in seconds of the oldest event sitting in the dead-letter queue.
+// Reported as 0 when the DLQ is empty.
+const webhookDlqOldestAge = new client.Gauge({
+  name: 'stellar_tags_webhook_dlq_oldest_age_seconds',
+  help: 'Age in seconds of the oldest webhook event in the dead-letter queue (0 when empty)',
+});
+
+/**
+ * Records the age of the oldest pending webhook event. Negative or non-finite
+ * inputs are clamped to 0 so a clock skew never produces a misleading spike.
+ */
+function observeWebhookOldestPendingAge(seconds) {
+  const value = Number(seconds);
+  webhookQueueOldestPendingAge.set(Number.isFinite(value) && value > 0 ? value : 0);
+}
+
+/**
+ * Records the age of the oldest dead-lettered webhook event, clamped like the
+ * pending-age gauge.
+ */
+function observeWebhookDlqOldestAge(seconds) {
+  const value = Number(seconds);
+  webhookDlqOldestAge.set(Number.isFinite(value) && value > 0 ? value : 0);
+}
+
+/**
+ * Records the attempt count and (on success) the delivery latency for a single
+ * webhook event. Attempts below 1 are clamped to 1 so the histogram always
+ * observes a valid bucket. Latency is only observed when provided and finite.
+ */
+function observeWebhookDelivery({ attempts, latencySeconds } = {}) {
+  const attemptValue = Number(attempts);
+  webhookDeliveryAttempts.observe(
+    Number.isFinite(attemptValue) && attemptValue >= 1 ? attemptValue : 1
+  );
+
+  if (latencySeconds !== undefined && latencySeconds !== null) {
+    const latencyValue = Number(latencySeconds);
+    if (Number.isFinite(latencyValue) && latencyValue >= 0) {
+      webhookDeliveryLatency.observe(latencyValue);
+    }
+  }
+}
+
 /**
  * Express middleware that tracks request count and latency.
  * Attach to app BEFORE route handlers.
