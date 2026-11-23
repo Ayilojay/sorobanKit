@@ -18,113 +18,794 @@ groups:
             API latency. Consider increasing the pool size, investigating slow
             queries, or scaling the database.
 
-  - name: stellar-tags-webhook-queue
+  # ---------------------------------------------------------------------------
+  # Service-level objectives (SLOs)
+  #
+  # Documented objectives (see docs/slo.md):
+  #
+  #   Registration flow
+  #     - Availability SLI: ratio of successful registration requests to all
+  #       valid registration requests. Objective: 99.9% over a rolling 30d
+  #       window (error budget 0.1%).
+  #     - Latency SLI: ratio of registration requests served in < 500ms to all
+  #       successful registration requests. Objective: 99% over a rolling 30d
+  #       window.
+  #
+  #   Federation lookup
+  #     - Availability SLI: ratio of successful federation lookups (including
+  #       well-formed "not found" responses) to all federation lookups.
+  #       Objective: 99.95% over a rolling 30d window (error budget 0.05%).
+  #     - Latency SLI: ratio of federation lookups served in < 250ms to all
+  #       successful federation lookups. Objective: 99% over a rolling 30d
+  #       window.
+  #
+  #   Payment flow
+  #     - Availability SLI: ratio of payment intents that reach a terminal
+  #       success or a well-formed terminal failure to all submitted payment
+  #       intents. Objective: 99.9% over a rolling 30d window.
+  #     - Latency SLI: ratio of payment intents confirmed (submission to
+  #       finality) in < 30s to all confirmed payment intents. Objective: 99%
+  #       over a rolling 30d window.
+  #
+  # Exclusions (applied consistently to every SLI below):
+  #     - Requests rejected by authentication/authorization (401/403) are
+  #       excluded from availability and latency SLIs.
+  #     - Requests rejected by client-side validation (400/422) are excluded
+  #       from availability and latency SLIs.
+  #     - Health/readiness probes and internal admin endpoints are excluded.
+  #     - Traffic marked as synthetic/load-test (label synthetic="true") is
+  #       excluded.
+  #     - Planned maintenance windows (label maintenance="true") are excluded.
+  #
+  # Metric contract (low cardinality only; no user identifiers):
+  #     stellar_tags_http_requests_total{flow,method,route,status_class,outcome,synthetic,maintenance}
+  #     stellar_tags_http_request_duration_seconds_bucket{flow,method,route,le,synthetic,maintenance}
+  #     stellar_tags_payment_intents_total{flow,network,outcome,synthetic,maintenance}
+  #     stellar_tags_payment_confirmation_duration_seconds_bucket{flow,network,le,synthetic,maintenance}
+  #     stellar_tags_reconciliation_oldest_unreconciled_intent_age_seconds{network}
+  #
+  #     flow: one of "registration", "federation_lookup", "payment".
+  #     route: templated route pattern (e.g. "/v1/registrations/:id"), never a
+  #            raw path or query string.
+  #     status_class: "2xx", "3xx", "4xx", "5xx".
+  #     outcome: "success", "client_error", "server_error", "not_found".
+  #     network: Stellar network identifier ("public", "testnet", "futurenet").
+  #
+  #     Labels MUST NOT contain user identifiers (account IDs, public keys,
+  #     emails, IP addresses, request IDs, or raw paths). Any such label is a
+  #     contract violation and must be rejected in review.
+  #
+  # Ownership:
+  #     - Registration flow SLO: owner = registrations-team
+  #     - Federation lookup SLO: owner = federation-team
+  #     - Payment flow SLO: owner = payments-team
+  #     - Ledger confirmation lag / reconciliation backlog: owner = ledger-ops
+  # ---------------------------------------------------------------------------
+
+  - name: stellar-tags-slo-recording
     rules:
-      - alert: StellarTagsWebhookOldestPendingEventAgeHigh
-        expr: stellar_tags_webhook_queue_oldest_pending_age_seconds > 300
+      # --- Registration flow -------------------------------------------------
+      - record: stellar_tags:slo_registration_availability:ratio_rate5m
+        expr: |
+          sum(rate(stellar_tags_http_requests_total{
+            flow="registration",
+            outcome=~"success|server_error",
+            synthetic!="true",
+            maintenance!="true"
+          }[5m]))
+          /
+          sum(rate(stellar_tags_http_requests_total{
+            flow="registration",
+            outcome=~"success|server_error",
+            synthetic!="true",
+            maintenance!="true"
+          }[5m]))
+          or vector(1)
+
+      - record: stellar_tags:slo_registration_availability:ratio_rate1h
+        expr: |
+          sum(rate(stellar_tags_http_requests_total{
+            flow="registration",
+            outcome=~"success|server_error",
+            synthetic!="true",
+            maintenance!="true"
+          }[1h]))
+          /
+          sum(rate(stellar_tags_http_requests_total{
+            flow="registration",
+            outcome=~"success|server_error",
+            synthetic!="true",
+            maintenance!="true"
+          }[1h]))
+          or vector(1)
+
+      - record: stellar_tags:slo_registration_availability:ratio_rate30d
+        expr: |
+          sum(rate(stellar_tags_http_requests_total{
+            flow="registration",
+            outcome=~"success|server_error",
+            synthetic!="true",
+            maintenance!="true"
+          }[30d]))
+          /
+          sum(rate(stellar_tags_http_requests_total{
+            flow="registration",
+            outcome=~"success|server_error",
+            synthetic!="true",
+            maintenance!="true"
+          }[30d]))
+          or vector(1)
+
+      - record: stellar_tags:slo_registration_latency:ratio_rate5m
+        expr: |
+          sum(rate(stellar_tags_http_request_duration_seconds_bucket{
+            flow="registration",
+            le="0.5",
+            synthetic!="true",
+            maintenance!="true"
+          }[5m]))
+          /
+          sum(rate(stellar_tags_http_request_duration_seconds_count{
+            flow="registration",
+            synthetic!="true",
+            maintenance!="true"
+          }[5m]))
+          or vector(1)
+
+      - record: stellar_tags:slo_registration_latency:ratio_rate1h
+        expr: |
+          sum(rate(stellar_tags_http_request_duration_seconds_bucket{
+            flow="registration",
+            le="0.5",
+            synthetic!="true",
+            maintenance!="true"
+          }[1h]))
+          /
+          sum(rate(stellar_tags_http_request_duration_seconds_count{
+            flow="registration",
+            synthetic!="true",
+            maintenance!="true"
+          }[1h]))
+          or vector(1)
+
+      - record: stellar_tags:slo_registration_latency:ratio_rate30d
+        expr: |
+          sum(rate(stellar_tags_http_request_duration_seconds_bucket{
+            flow="registration",
+            le="0.5",
+            synthetic!="true",
+            maintenance!="true"
+          }[30d]))
+          /
+          sum(rate(stellar_tags_http_request_duration_seconds_count{
+            flow="registration",
+            synthetic!="true",
+            maintenance!="true"
+          }[30d]))
+          or vector(1)
+
+      # --- Federation lookup -------------------------------------------------
+      - record: stellar_tags:slo_federation_lookup_availability:ratio_rate5m
+        expr: |
+          sum(rate(stellar_tags_http_requests_total{
+            flow="federation_lookup",
+            outcome=~"success|not_found|server_error",
+            synthetic!="true",
+            maintenance!="true"
+          }[5m]))
+          /
+          sum(rate(stellar_tags_http_requests_total{
+            flow="federation_lookup",
+            outcome=~"success|not_found|server_error",
+            synthetic!="true",
+            maintenance!="true"
+          }[5m]))
+          or vector(1)
+
+      - record: stellar_tags:slo_federation_lookup_availability:ratio_rate1h
+        expr: |
+          sum(rate(stellar_tags_http_requests_total{
+            flow="federation_lookup",
+            outcome=~"success|not_found|server_error",
+            synthetic!="true",
+            maintenance!="true"
+          }[1h]))
+          /
+          sum(rate(stellar_tags_http_requests_total{
+            flow="federation_lookup",
+            outcome=~"success|not_found|server_error",
+            synthetic!="true",
+            maintenance!="true"
+          }[1h]))
+          or vector(1)
+
+      - record: stellar_tags:slo_federation_lookup_availability:ratio_rate30d
+        expr: |
+          sum(rate(stellar_tags_http_requests_total{
+            flow="federation_lookup",
+            outcome=~"success|not_found|server_error",
+            synthetic!="true",
+            maintenance!="true"
+          }[30d]))
+          /
+          sum(rate(stellar_tags_http_requests_total{
+            flow="federation_lookup",
+            outcome=~"success|not_found|server_error",
+            synthetic!="true",
+            maintenance!="true"
+          }[30d]))
+          or vector(1)
+
+      - record: stellar_tags:slo_federation_lookup_latency:ratio_rate5m
+        expr: |
+          sum(rate(stellar_tags_http_request_duration_seconds_bucket{
+            flow="federation_lookup",
+            le="0.25",
+            synthetic!="true",
+            maintenance!="true"
+          }[5m]))
+          /
+          sum(rate(stellar_tags_http_request_duration_seconds_count{
+            flow="federation_lookup",
+            synthetic!="true",
+            maintenance!="true"
+          }[5m]))
+          or vector(1)
+
+      - record: stellar_tags:slo_federation_lookup_latency:ratio_rate1h
+        expr: |
+          sum(rate(stellar_tags_http_request_duration_seconds_bucket{
+            flow="federation_lookup",
+            le="0.25",
+            synthetic!="true",
+            maintenance!="true"
+          }[1h]))
+          /
+          sum(rate(stellar_tags_http_request_duration_seconds_count{
+            flow="federation_lookup",
+            synthetic!="true",
+            maintenance!="true"
+          }[1h]))
+          or vector(1)
+
+      - record: stellar_tags:slo_federation_lookup_latency:ratio_rate30d
+        expr: |
+          sum(rate(stellar_tags_http_request_duration_seconds_bucket{
+            flow="federation_lookup",
+            le="0.25",
+            synthetic!="true",
+            maintenance!="true"
+          }[30d]))
+          /
+          sum(rate(stellar_tags_http_request_duration_seconds_count{
+            flow="federation_lookup",
+            synthetic!="true",
+            maintenance!="true"
+          }[30d]))
+          or vector(1)
+
+      # --- Payment flow ------------------------------------------------------
+      - record: stellar_tags:slo_payment_availability:ratio_rate5m
+        expr: |
+          sum(rate(stellar_tags_payment_intents_total{
+            flow="payment",
+            outcome=~"success|client_error|server_error",
+            synthetic!="true",
+            maintenance!="true"
+          }[5m]))
+          /
+          sum(rate(stellar_tags_payment_intents_total{
+            flow="payment",
+            outcome=~"success|client_error|server_error",
+            synthetic!="true",
+            maintenance!="true"
+          }[5m]))
+          or vector(1)
+
+      - record: stellar_tags:slo_payment_availability:ratio_rate1h
+        expr: |
+          sum(rate(stellar_tags_payment_intents_total{
+            flow="payment",
+            outcome=~"success|client_error|server_error",
+            synthetic!="true",
+            maintenance!="true"
+          }[1h]))
+          /
+          sum(rate(stellar_tags_payment_intents_total{
+            flow="payment",
+            outcome=~"success|client_error|server_error",
+            synthetic!="true",
+            maintenance!="true"
+          }[1h]))
+          or vector(1)
+
+      - record: stellar_tags:slo_payment_availability:ratio_rate30d
+        expr: |
+          sum(rate(stellar_tags_payment_intents_total{
+            flow="payment",
+            outcome=~"success|client_error|server_error",
+            synthetic!="true",
+            maintenance!="true"
+          }[30d]))
+          /
+          sum(rate(stellar_tags_payment_intents_total{
+            flow="payment",
+            outcome=~"success|client_error|server_error",
+            synthetic!="true",
+            maintenance!="true"
+          }[30d]))
+          or vector(1)
+
+      - record: stellar_tags:slo_payment_latency:ratio_rate5m
+        expr: |
+          sum(rate(stellar_tags_payment_confirmation_duration_seconds_bucket{
+            flow="payment",
+            le="30",
+            synthetic!="true",
+            maintenance!="true"
+          }[5m]))
+          /
+          sum(rate(stellar_tags_payment_confirmation_duration_seconds_count{
+            flow="payment",
+            synthetic!="true",
+            maintenance!="true"
+          }[5m]))
+          or vector(1)
+
+      - record: stellar_tags:slo_payment_latency:ratio_rate1h
+        expr: |
+          sum(rate(stellar_tags_payment_confirmation_duration_seconds_bucket{
+            flow="payment",
+            le="30",
+            synthetic!="true",
+            maintenance!="true"
+          }[1h]))
+          /
+          sum(rate(stellar_tags_payment_confirmation_duration_seconds_count{
+            flow="payment",
+            synthetic!="true",
+            maintenance!="true"
+          }[1h]))
+          or vector(1)
+
+      - record: stellar_tags:slo_payment_latency:ratio_rate30d
+        expr: |
+          sum(rate(stellar_tags_payment_confirmation_duration_seconds_bucket{
+            flow="payment",
+            le="30",
+            synthetic!="true",
+            maintenance!="true"
+          }[30d]))
+          /
+          sum(rate(stellar_tags_payment_confirmation_duration_seconds_count{
+            flow="payment",
+            synthetic!="true",
+            maintenance!="true"
+          }[30d]))
+          or vector(1)
+
+      # --- Error-budget burn rates ------------------------------------------
+      # Burn rate = (1 - SLI) / (1 - objective). A burn rate of 1 consumes the
+      # error budget exactly over the objective window. Multi-window,
+      # multi-burn-rate alerting follows the standard SRE workbook approach:
+      #   - 14.4x over 1h (and 5m) => 2% of 30d budget in 1h (page)
+      #   - 6x over 6h (and 30m)   => 5% of 30d budget in 6h (page)
+      #   - 1x over 3d (and 6h)    => 10% of 30d budget in 3d (ticket)
+      #
+      # Registration availability objective 99.9% => budget 0.001
+      - record: stellar_tags:slo_registration_availability:burn_rate5m
+        expr: (1 - stellar_tags:slo_registration_availability:ratio_rate5m) / 0.001
+      - record: stellar_tags:slo_registration_availability:burn_rate1h
+        expr: (1 - stellar_tags:slo_registration_availability:ratio_rate1h) / 0.001
+      - record: stellar_tags:slo_registration_availability:burn_rate30d
+        expr: (1 - stellar_tags:slo_registration_availability:ratio_rate30d) / 0.001
+
+      # Registration latency objective 99% => budget 0.01
+      - record: stellar_tags:slo_registration_latency:burn_rate5m
+        expr: (1 - stellar_tags:slo_registration_latency:ratio_rate5m) / 0.01
+      - record: stellar_tags:slo_registration_latency:burn_rate1h
+        expr: (1 - stellar_tags:slo_registration_latency:ratio_rate1h) / 0.01
+      - record: stellar_tags:slo_registration_latency:burn_rate30d
+        expr: (1 - stellar_tags:slo_registration_latency:ratio_rate30d) / 0.01
+
+      # Federation lookup availability objective 99.95% => budget 0.0005
+      - record: stellar_tags:slo_federation_lookup_availability:burn_rate5m
+        expr: (1 - stellar_tags:slo_federation_lookup_availability:ratio_rate5m) / 0.0005
+      - record: stellar_tags:slo_federation_lookup_availability:burn_rate1h
+        expr: (1 - stellar_tags:slo_federation_lookup_availability:ratio_rate1h) / 0.0005
+      - record: stellar_tags:slo_federation_lookup_availability:burn_rate30d
+        expr: (1 - stellar_tags:slo_federation_lookup_availability:ratio_rate30d) / 0.0005
+
+      # Federation lookup latency objective 99% => budget 0.01
+      - record: stellar_tags:slo_federation_lookup_latency:burn_rate5m
+        expr: (1 - stellar_tags:slo_federation_lookup_latency:ratio_rate5m) / 0.01
+      - record: stellar_tags:slo_federation_lookup_latency:burn_rate1h
+        expr: (1 - stellar_tags:slo_federation_lookup_latency:ratio_rate1h) / 0.01
+      - record: stellar_tags:slo_federation_lookup_latency:burn_rate30d
+        expr: (1 - stellar_tags:slo_federation_lookup_latency:ratio_rate30d) / 0.01
+
+      # Payment availability objective 99.9% => budget 0.001
+      - record: stellar_tags:slo_payment_availability:burn_rate5m
+        expr: (1 - stellar_tags:slo_payment_availability:ratio_rate5m) / 0.001
+      - record: stellar_tags:slo_payment_availability:burn_rate1h
+        expr: (1 - stellar_tags:slo_payment_availability:ratio_rate1h) / 0.001
+      - record: stellar_tags:slo_payment_availability:burn_rate30d
+        expr: (1 - stellar_tags:slo_payment_availability:ratio_rate30d) / 0.001
+
+      # Payment latency objective 99% => budget 0.01
+      - record: stellar_tags:slo_payment_latency:burn_rate5m
+        expr: (1 - stellar_tags:slo_payment_latency:ratio_rate5m) / 0.01
+      - record: stellar_tags:slo_payment_latency:burn_rate1h
+        expr: (1 - stellar_tags:slo_payment_latency:ratio_rate1h) / 0.01
+      - record: stellar_tags:slo_payment_latency:burn_rate30d
+        expr: (1 - stellar_tags:slo_payment_latency:ratio_rate30d) / 0.01
+
+      # --- Ledger confirmation lag (submission-to-finality) -----------------
+      # Percentiles of submission-to-finality latency by network. The payment
+      # latency objective requires 99% of intents confirmed in < 30s, so the
+      # p99 is the primary signal; p50/p95 are recorded for dashboards.
+      - record: stellar_tags:ledger_confirmation_lag_seconds:p50
+        expr: |
+          histogram_quantile(0.50,
+            sum by (network, le) (rate(stellar_tags_payment_confirmation_duration_seconds_bucket{
+              flow="payment",
+              synthetic!="true",
+              maintenance!="true"
+            }[5m]))
+          )
+      - record: stellar_tags:ledger_confirmation_lag_seconds:p95
+        expr: |
+          histogram_quantile(0.95,
+            sum by (network, le) (rate(stellar_tags_payment_confirmation_duration_seconds_bucket{
+              flow="payment",
+              synthetic!="true",
+              maintenance!="true"
+            }[5m]))
+          )
+      - record: stellar_tags:ledger_confirmation_lag_seconds:p99
+        expr: |
+          histogram_quantile(0.99,
+            sum by (network, le) (rate(stellar_tags_payment_confirmation_duration_seconds_bucket{
+              flow="payment",
+              synthetic!="true",
+              maintenance!="true"
+            }[5m]))
+          )
+      - record: stellar_tags:ledger_confirmation_lag_seconds:p99_1h
+        expr: |
+          histogram_quantile(0.99,
+            sum by (network, le) (rate(stellar_tags_payment_confirmation_duration_seconds_bucket{
+              flow="payment",
+              synthetic!="true",
+              maintenance!="true"
+            }[1h]))
+          )
+
+      # --- Reconciliation backlog -------------------------------------------
+      # Oldest unreconciled payment intent age, by network. Recorded as-is so
+      # alert thresholds and dashboards share one series.
+      - record: stellar_tags:reconciliation_oldest_unreconciled_intent_age_seconds:max
+        expr: |
+          max by (network) (stellar_tags_reconciliation_oldest_unreconciled_intent_age_seconds)
+
+  - name: stellar-tags-slo-alerts
+    rules:
+      # --- Registration flow (owner: registrations-team) --------------------
+      - alert: StellarTagsRegistrationAvailabilityBudgetBurnFast
+        expr: |
+          stellar_tags:slo_registration_availability:burn_rate1h > 14.4
+          and
+          stellar_tags:slo_registration_availability:burn_rate5m > 14.4
         for: 2m
         labels:
+          severity: critical
+          service: stellar-tags
+          slo: registration_availability
+          owner: registrations-team
+        annotations:
+          summary: "Registration availability is burning error budget fast (14.4x)"
+          description: >-
+            Registration availability SLI is consuming its 30d error budget at
+            more than 14.4x the sustainable rate over both the 1h and 5m
+            windows (1h burn rate: {{ $value }}). At this rate the 99.9%
+            objective's budget would be exhausted in roughly 2 days. Owner:
+            registrations-team. See docs/slo.md.
+
+      - alert: StellarTagsRegistrationAvailabilityBudgetBurnSlow
+        expr: |
+          stellar_tags:slo_registration_availability:burn_rate30d > 1
+        for: 1h
+        labels:
           severity: warning
           service: stellar-tags
-          component: webhook-queue
+          slo: registration_availability
+          owner: registrations-team
         annotations:
-          summary: "Stellar Tags webhook queue: oldest pending event is aging"
+          summary: "Registration availability is burning error budget (1x)"
           description: >-
-            The oldest pending webhook event has been waiting for more than 5
-            minutes (current age: {{ $value }}s). This indicates the webhook
-            delivery worker is falling behind or stalled. Check worker health,
-            throughput, and downstream endpoint availability.
+            Registration availability SLI has exceeded its 99.9% objective over
+            the rolling 30d window (burn rate: {{ $value }}). The error budget
+            is being consumed faster than the sustainable rate. Owner:
+            registrations-team. See docs/slo.md.
 
-      - alert: StellarTagsWebhookOldestPendingEventAgeCritical
-        expr: stellar_tags_webhook_queue_oldest_pending_age_seconds > 1800
+      - alert: StellarTagsRegistrationLatencyBudgetBurnFast
+        expr: |
+          stellar_tags:slo_registration_latency:burn_rate1h > 14.4
+          and
+          stellar_tags:slo_registration_latency:burn_rate5m > 14.4
+        for: 2m
+        labels:
+          severity: critical
+          service: stellar-tags
+          slo: registration_latency
+          owner: registrations-team
+        annotations:
+          summary: "Registration latency is burning error budget fast (14.4x)"
+          description: >-
+            Fewer than 99% of registration requests are being served in under
+            500ms, burning the latency error budget at more than 14.4x over
+            both the 1h and 5m windows (1h burn rate: {{ $value }}). Owner:
+            registrations-team. See docs/slo.md.
+
+      - alert: StellarTagsRegistrationLatencyBudgetBurnSlow
+        expr: |
+          stellar_tags:slo_registration_latency:burn_rate30d > 1
+        for: 1h
+        labels:
+          severity: warning
+          service: stellar-tags
+          slo: registration_latency
+          owner: registrations-team
+        annotations:
+          summary: "Registration latency is burning error budget (1x)"
+          description: >-
+            Registration latency SLI has exceeded its 99% objective over the
+            rolling 30d window (burn rate: {{ $value }}). Owner:
+            registrations-team. See docs/slo.md.
+
+      # --- Federation lookup (owner: federation-team) -----------------------
+      - alert: StellarTagsFederationLookupAvailabilityBudgetBurnFast
+        expr: |
+          stellar_tags:slo_federation_lookup_availability:burn_rate1h > 14.4
+          and
+          stellar_tags:slo_federation_lookup_availability:burn_rate5m > 14.4
+        for: 2m
+        labels:
+          severity: critical
+          service: stellar-tags
+          slo: federation_lookup_availability
+          owner: federation-team
+        annotations:
+          summary: "Federation lookup availability is burning error budget fast (14.4x)"
+          description: >-
+            Federation lookup availability SLI is consuming its 30d error
+            budget at more than 14.4x the sustainable rate over both the 1h and
+            5m windows (1h burn rate: {{ $value }}). The 99.95% objective's
+            budget would be exhausted in roughly 2 days at this rate. Owner:
+            federation-team. See docs/slo.md.
+
+      - alert: StellarTagsFederationLookupAvailabilityBudgetBurnSlow
+        expr: |
+          stellar_tags:slo_federation_lookup_availability:burn_rate30d > 1
+        for: 1h
+        labels:
+          severity: warning
+          service: stellar-tags
+          slo: federation_lookup_availability
+          owner: federation-team
+        annotations:
+          summary: "Federation lookup availability is burning error budget (1x)"
+          description: >-
+            Federation lookup availability SLI has exceeded its 99.95%
+            objective over the rolling 30d window (burn rate: {{ $value }}).
+            Owner: federation-team. See docs/slo.md.
+
+      - alert: StellarTagsFederationLookupLatencyBudgetBurnFast
+        expr: |
+          stellar_tags:slo_federation_lookup_latency:burn_rate1h > 14.4
+          and
+          stellar_tags:slo_federation_lookup_latency:burn_rate5m > 14.4
+        for: 2m
+        labels:
+          severity: critical
+          service: stellar-tags
+          slo: federation_lookup_latency
+          owner: federation-team
+        annotations:
+          summary: "Federation lookup latency is burning error budget fast (14.4x)"
+          description: >-
+            Fewer than 99% of federation lookups are being served in under
+            250ms, burning the latency error budget at more than 14.4x over
+            both the 1h and 5m windows (1h burn rate: {{ $value }}). Owner:
+            federation-team. See docs/slo.md.
+
+      - alert: StellarTagsFederationLookupLatencyBudgetBurnSlow
+        expr: |
+          stellar_tags:slo_federation_lookup_latency:burn_rate30d > 1
+        for: 1h
+        labels:
+          severity: warning
+          service: stellar-tags
+          slo: federation_lookup_latency
+          owner: federation-team
+        annotations:
+          summary: "Federation lookup latency is burning error budget (1x)"
+          description: >-
+            Federation lookup latency SLI has exceeded its 99% objective over
+            the rolling 30d window (burn rate: {{ $value }}). Owner:
+            federation-team. See docs/slo.md.
+
+      # --- Payment flow (owner: payments-team) ------------------------------
+      - alert: StellarTagsPaymentAvailabilityBudgetBurnFast
+        expr: |
+          stellar_tags:slo_payment_availability:burn_rate1h > 14.4
+          and
+          stellar_tags:slo_payment_availability:burn_rate5m > 14.4
+        for: 2m
+        labels:
+          severity: critical
+          service: stellar-tags
+          slo: payment_availability
+          owner: payments-team
+        annotations:
+          summary: "Payment availability is burning error budget fast (14.4x)"
+          description: >-
+            Payment availability SLI is consuming its 30d error budget at more
+            than 14.4x the sustainable rate over both the 1h and 5m windows
+            (1h burn rate: {{ $value }}). The 99.9% objective's budget would be
+            exhausted in roughly 2 days at this rate. Owner: payments-team.
+            See docs/slo.md.
+
+      - alert: StellarTagsPaymentAvailabilityBudgetBurnSlow
+        expr: |
+          stellar_tags:slo_payment_availability:burn_rate30d > 1
+        for: 1h
+        labels:
+          severity: warning
+          service: stellar-tags
+          slo: payment_availability
+          owner: payments-team
+        annotations:
+          summary: "Payment availability is burning error budget (1x)"
+          description: >-
+            Payment availability SLI has exceeded its 99.9% objective over the
+            rolling 30d window (burn rate: {{ $value }}). Owner: payments-team.
+            See docs/slo.md.
+
+      - alert: StellarTagsPaymentLatencyBudgetBurnFast
+        expr: |
+          stellar_tags:slo_payment_latency:burn_rate1h > 14.4
+          and
+          stellar_tags:slo_payment_latency:burn_rate5m > 14.4
+        for: 2m
+        labels:
+          severity: critical
+          service: stellar-tags
+          slo: payment_latency
+          owner: payments-team
+        annotations:
+          summary: "Payment confirmation latency is burning error budget fast (14.4x)"
+          description: >-
+            Fewer than 99% of payment intents are being confirmed in under 30s,
+            burning the latency error budget at more than 14.4x over both the
+            1h and 5m windows (1h burn rate: {{ $value }}). Owner:
+            payments-team. See docs/slo.md.
+
+      - alert: StellarTagsPaymentLatencyBudgetBurnSlow
+        expr: |
+          stellar_tags:slo_payment_latency:burn_rate30d > 1
+        for: 1h
+        labels:
+          severity: warning
+          service: stellar-tags
+          slo: payment_latency
+          owner: payments-team
+        annotations:
+          summary: "Payment confirmation latency is burning error budget (1x)"
+          description: >-
+            Payment confirmation latency SLI has exceeded its 99% objective
+            over the rolling 30d window (burn rate: {{ $value }}). Owner:
+            payments-team. See docs/slo.md.
+
+  - name: stellar-tags-ledger-confirmation
+    rules:
+      # Thresholds are tied to the payment latency objective (99% of intents
+      # confirmed in < 30s). The p99 warning threshold is the objective itself;
+      # the critical threshold allows a 2x margin before paging.
+      - alert: StellarTagsLedgerConfirmationLagHigh
+        expr: stellar_tags:ledger_confirmation_lag_seconds:p99 > 30
+        for: 10m
+        labels:
+          severity: warning
+          service: stellar-tags
+          component: ledger
+          owner: ledger-ops
+        annotations:
+          summary: "Ledger confirmation lag p99 above 30s on {{ $labels.network }}"
+          description: >-
+            The p99 submission-to-finality latency on network
+            {{ $labels.network }} has been above 30s for more than 10 minutes
+            (current p99: {{ $value }}s). This breaches the payment latency
+            objective (99% of intents confirmed in < 30s). Check ledger
+            ingestion health, Horizon availability, and network congestion.
+            Owner: ledger-ops. See docs/slo.md.
+
+      - alert: StellarTagsLedgerConfirmationLagCritical
+        expr: stellar_tags:ledger_confirmation_lag_seconds:p99 > 60
         for: 5m
         labels:
           severity: critical
           service: stellar-tags
-          component: webhook-queue
+          component: ledger
+          owner: ledger-ops
         annotations:
-          summary: "Stellar Tags webhook queue: oldest pending event is severely delayed"
+          summary: "Ledger confirmation lag p99 above 60s on {{ $labels.network }}"
           description: >-
-            The oldest pending webhook event has been waiting for more than 30
-            minutes (current age: {{ $value }}s). Webhook delivery is
-            effectively stalled. Escalate to on-call and investigate the
-            delivery worker and downstream endpoints immediately.
+            The p99 submission-to-finality latency on network
+            {{ $labels.network }} has been above 60s for more than 5 minutes
+            (current p99: {{ $value }}s), double the payment latency objective
+            threshold. Payment intents are likely to time out. Owner:
+            ledger-ops. See docs/slo.md.
 
-      - alert: StellarTagsWebhookDLQAgeHigh
-        expr: stellar_tags_webhook_queue_dlq_oldest_age_seconds > 3600
-        for: 5m
+      - alert: StellarTagsLedgerConfirmationLagSustained
+        expr: stellar_tags:ledger_confirmation_lag_seconds:p99_1h > 30
+        for: 30m
         labels:
           severity: warning
           service: stellar-tags
-          component: webhook-queue
+          component: ledger
+          owner: ledger-ops
         annotations:
-          summary: "Stellar Tags webhook DLQ: oldest dead-lettered event is aging"
+          summary: "Ledger confirmation lag p99 above 30s for 1h on {{ $labels.network }}"
           description: >-
-            The oldest event in the webhook dead-letter queue has been present
-            for more than 1 hour (current age: {{ $value }}s). Dead-lettered
-            events are not being reviewed or replayed. Inspect the DLQ and
-            decide whether to replay or discard affected events.
+            The 1h p99 submission-to-finality latency on network
+            {{ $labels.network }} is above 30s (current p99: {{ $value }}s),
+            indicating sustained degradation rather than a transient spike.
+            Owner: ledger-ops. See docs/slo.md.
 
-      - alert: StellarTagsWebhookDLQAgeCritical
-        expr: stellar_tags_webhook_queue_dlq_oldest_age_seconds > 86400
+  - name: stellar-tags-reconciliation
+    rules:
+      # Thresholds are tied to the payment availability objective: intents
+      # must reach a terminal state, and reconciliation is how stuck intents
+      # are resolved. Backlog age is measured by network only.
+      - alert: StellarTagsReconciliationBacklogWarning
+        expr: stellar_tags:reconciliation_oldest_unreconciled_intent_age_seconds:max > 900
         for: 10m
+        labels:
+          severity: warning
+          service: stellar-tags
+          component: reconciliation
+          owner: ledger-ops
+        annotations:
+          summary: "Reconciliation backlog: oldest unreconciled intent > 15m on {{ $labels.network }}"
+          description: >-
+            The oldest unreconciled payment intent on network
+            {{ $labels.network }} has been pending for more than 15 minutes
+            (current age: {{ $value }}s). This is within the payment latency
+            objective's tolerance but indicates the reconciler is falling
+            behind. Check reconciler throughput and ledger ingestion. Owner:
+            ledger-ops. See docs/slo.md.
+
+      - alert: StellarTagsReconciliationBacklogCritical
+        expr: stellar_tags:reconciliation_oldest_unreconciled_intent_age_seconds:max > 3600
+        for: 5m
         labels:
           severity: critical
           service: stellar-tags
-          component: webhook-queue
+          component: reconciliation
+          owner: ledger-ops
         annotations:
-          summary: "Stellar Tags webhook DLQ: oldest dead-lettered event is stale"
+          summary: "Reconciliation backlog: oldest unreconciled intent > 1h on {{ $labels.network }}"
           description: >-
-            The oldest event in the webhook dead-letter queue has been present
-            for more than 24 hours (current age: {{ $value }}s). This indicates
-            sustained delivery failures with no operator follow-up. Review the
-            DLQ, identify failing endpoints, and replay or discard events.
+            The oldest unreconciled payment intent on network
+            {{ $labels.network }} has been pending for more than 1 hour
+            (current age: {{ $value }}s). Payment intents are at risk of
+            breaching the payment availability objective. Escalate to
+            ledger-ops and check for a stalled reconciler or ledger ingestion
+            outage. See docs/slo.md.
 
-      - alert: StellarTagsWebhookDeliveryFailuresSustained
-        expr: |
-          sum by (service, component) (
-            rate(stellar_tags_webhook_delivery_failures_total[5m])
-          ) > 0.1
-        for: 10m
+      - alert: StellarTagsReconciliationBacklogStale
+        expr: stellar_tags:reconciliation_oldest_unreconciled_intent_age_seconds:max > 86400
+        for: 5m
         labels:
-          severity: warning
-          service: stellar-tags
-          component: webhook-queue
-        annotations:
-          summary: "Stellar Tags webhook delivery: sustained failure rate"
-          description: >-
-            Webhook deliveries are failing at a sustained rate above 0.1 per
-            second (current rate: {{ $value }}/s) over the last 5 minutes for
-            more than 10 minutes. Investigate downstream endpoint availability,
-            authentication, and network connectivity.
-
-      - alert: StellarTagsWebhookDeliveryFailureRatioHigh
-        expr: |
-          (
-            sum by (service, component) (
-              rate(stellar_tags_webhook_delivery_failures_total[5m])
-            )
-            /
-            clamp_min(
-              sum by (service, component) (
-                rate(stellar_tags_webhook_delivery_attempts_total[5m])
-              ),
-              0.001
-            )
-          ) > 0.25
-        for: 10m
-        labels:
-          severity: warning
-          service: stellar-tags
-          component: webhook-queue
-        annotations:
-          summary: "Stellar Tags webhook delivery: high failure ratio"
-          description: >-
-            More than 25% of webhook delivery attempts have failed over the
-            last 5 minutes for more than 10 minutes (current ratio:
-            {{ $value }}). This suggests a systemic delivery problem rather
-            than isolated endpoint failures. Check downstream endpoints and
-            delivery worker configuration.
-</｜｜DSML｜｜ parameter>
-</｜｜DSML｜｜ invoke>
-</｜｜DSML｜｜ calls>
+          severity: critical

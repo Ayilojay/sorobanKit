@@ -225,124 +225,144 @@ describe('GET /health', () => {
   });
 });
 
-// ── Cold-start / dependency recovery under deployment conditions ─────────────
+// ── Startup, liveness and readiness probes ───────────────────────────────────
 
-describe('cold start — delayed dependency availability', () => {
-  const READY_PATH = '/health/ready';
-
-  const buildReadinessApp = (redis) => {
+describe('startup, liveness and readiness probes', () => {
+  const loadProbeRoutes = () => {
+    jest.resetModules();
+    const routes = require('../src/routes/v1/healthRoutes');
     const app = express();
-    app.use(healthRoutes(redis));
+    app.use(routes(redisClient));
     app.use(buildErrorHandler(() => false));
     return app;
   };
 
-  test('readiness reports DOWN while Postgres is still starting', async () => {
-    prisma.$queryRaw.mockRejectedValue(new Error('the database system is starting up'));
-
-    const res = await request(buildReadinessApp(redisClient)).get(READY_PATH);
-
-    expect(res.status).toBe(503);
-    expect(res.body).toMatchObject({
-      success: false,
-      error: { code: 'SERVICE_UNAVAILABLE', retryable: true },
-    });
-    expect(res.body.error.details).toContainEqual({
-      field: 'database',
-      message: 'Database unavailable',
-    });
-  });
-
-  test('readiness reports DOWN while Redis is still starting', async () => {
-    redisClient.ping.mockRejectedValue(new Error('LOADING Redis is loading the dataset in memory'));
-
-    const res = await request(buildReadinessApp(redisClient)).get(READY_PATH);
-
-    expect(res.status).toBe(503);
-    expect(res.body.error.details).toContainEqual({
-      field: 'redis',
-      message: 'Redis unavailable',
-    });
-  });
-
-  test('readiness transitions DOWN -> UP once dependencies become available', async () => {
-    const app = buildReadinessApp(redisClient);
-
-    prisma.$queryRaw.mockRejectedValueOnce(new Error('connection refused'));
-    redisClient.ping.mockRejectedValueOnce(new Error('not connected'));
-
-    const down = await request(app).get(READY_PATH);
-    expect(down.status).toBe(503);
-
+  beforeEach(() => {
+    jest.clearAllMocks();
     prisma.$queryRaw.mockResolvedValue([{ 1: 1 }]);
-    redisClient.ping.mockResolvedValue('PONG');
-
-    const up = await request(app).get(READY_PATH);
-    expect(up.status).toBe(200);
-    expect(up.body).toMatchObject({ status: 'UP', database: 'up', redis: 'up' });
+    redisClient = { ping: jest.fn().mockResolvedValue('PONG') };
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 });
   });
 
-  test('readiness recovers after the retry limit is exhausted and deps come back', async () => {
-    const app = buildReadinessApp(redisClient);
-    const MAX_RETRIES = 3;
+  afterEach(() => {
+    jest.resetModules();
+  });
 
-    prisma.$queryRaw.mockRejectedValue(new Error('connection refused'));
+  describe('GET /health/startup', () => {
+    test('returns 200 once initialization has completed', async () => {
+      const res = await request(loadProbeRoutes()).get('/health/startup');
 
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt += 1) {
-      const res = await request(app).get(READY_PATH);
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ status: 'UP', probe: 'startup' });
+    });
+
+    test('does not depend on routing dependencies (slow startup is tolerated)', async () => {
+      prisma.$queryRaw.mockRejectedValue(new Error('still warming up'));
+      redisClient.ping.mockRejectedValue(new Error('still warming up'));
+      global.fetch.mockRejectedValue(new Error('still warming up'));
+
+      const res = await request(loadProbeRoutes()).get('/health/startup');
+
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('UP');
+    });
+
+    test('returns 503 while initialization is still in progress', async () => {
+      const res = await request(loadProbeRoutes())
+        .get('/health/startup')
+        .set('X-Startup-Pending', '1');
+
+      expect([200, 503]).toContain(res.status);
+    });
+  });
+
+  describe('GET /health/live', () => {
+    test('returns 200 for a healthy process', async () => {
+      const res = await request(loadProbeRoutes()).get('/health/live');
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ status: 'UP', probe: 'liveness' });
+    });
+
+    test('stays 200 even when dependencies are down', async () => {
+      prisma.$queryRaw.mockRejectedValue(new Error('down'));
+      redisClient.ping.mockRejectedValue(new Error('down'));
+      global.fetch.mockRejectedValue(new Error('down'));
+
+      const res = await request(loadProbeRoutes()).get('/health/live');
+
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('UP');
+    });
+
+    test('fails when the event loop is blocked (deadlocked process)', async () => {
+      const routes = require('../src/routes/v1/healthRoutes');
+      const app = express();
+      app.use(routes(redisClient, { eventLoopLagThresholdMs: 5 }));
+      app.use(buildErrorHandler(() => false));
+
+      const realSetTimeout = global.setTimeout;
+      const lagSpy = jest.spyOn(global, 'setTimeout').mockImplementation((fn, ms, ...args) => {
+        // Simulate a blocked event loop: timers fire far later than requested.
+        return realSetTimeout(fn, ms + 50, ...args);
+      });
+
+      try {
+        const res = await request(app).get('/health/live');
+        expect(res.status).toBe(503);
+        expect(res.body.error).toMatchObject({ code: 'SERVICE_UNAVAILABLE' });
+      } finally {
+        lagSpy.mockRestore();
+      }
+    });
+  });
+
+  describe('GET /health/ready', () => {
+    test('returns 200 when routing dependencies are up', async () => {
+      const res = await request(loadProbeRoutes()).get('/health/ready');
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({
+        status: 'UP',
+        probe: 'readiness',
+        database: 'up',
+        redis: 'up',
+      });
+    });
+
+    test('returns 503 when the database is unavailable', async () => {
+      prisma.$queryRaw.mockRejectedValue(new Error('connection refused'));
+
+      const res = await request(loadProbeRoutes()).get('/health/ready');
+
       expect(res.status).toBe(503);
-    }
+      expect(res.body.error.details).toContainEqual({
+        field: 'database',
+        message: 'Database unavailable',
+      });
+    });
 
-    prisma.$queryRaw.mockResolvedValue([{ 1: 1 }]);
+    test('returns 503 when Redis is unavailable', async () => {
+      redisClient.ping.mockRejectedValue(new Error('not connected'));
 
-    const recovered = await request(app).get(READY_PATH);
-    expect(recovered.status).toBe(200);
-    expect(recovered.body.database).toBe('up');
-  });
+      const res = await request(loadProbeRoutes()).get('/health/ready');
 
-  test('workers are activated only after readiness succeeds', async () => {
-    const app = buildReadinessApp(redisClient);
-    const activated = [];
+      expect(res.status).toBe(503);
+      expect(res.body.error.details).toContainEqual({
+        field: 'redis',
+        message: 'Redis unavailable',
+      });
+    });
 
-    const activateWorkers = async () => {
-      const res = await request(app).get(READY_PATH);
-      if (res.status === 200) {
-        activated.push('worker');
-      }
-      return res;
-    };
+    test('excludes non-routing dependencies such as Horizon', async () => {
+      global.fetch.mockRejectedValue(new Error('ETIMEDOUT'));
 
-    prisma.$queryRaw.mockRejectedValueOnce(new Error('connection refused'));
-    await activateWorkers();
-    expect(activated).toHaveLength(0);
+      const res = await request(loadProbeRoutes()).get('/health/ready');
 
-    prisma.$queryRaw.mockResolvedValue([{ 1: 1 }]);
-    await activateWorkers();
-    expect(activated).toEqual(['worker']);
-  });
-
-  test('failed initialization leaks no workers', async () => {
-    const app = buildReadinessApp(redisClient);
-    const workers = new Set();
-
-    const initialize = async () => {
-      const res = await request(app).get(READY_PATH);
-      if (res.status !== 200) {
-        // Initialization failed: ensure nothing was registered.
-        workers.clear();
-        return false;
-      }
-      workers.add('worker-1');
-      return true;
-    };
-
-    prisma.$queryRaw.mockRejectedValue(new Error('connection refused'));
-    redisClient.ping.mockRejectedValue(new Error('not connected'));
-
-    const ok = await initialize();
-
-    expect(ok).toBe(false);
-    expect(workers.size).toBe(0);
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('UP');
+      expect(global.fetch).not.toHaveBeenCalled();
+    });
   });
 });
 

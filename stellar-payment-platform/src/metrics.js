@@ -21,6 +21,117 @@ const httpRequestDuration = new client.Histogram({
   buckets: [0.01, 0.05, 0.1, 0.5, 1, 5],
 });
 
+// ---------------------------------------------------------------------------
+// Service-level indicator (SLI) metrics.
+//
+// These back the SLOs documented in docs/operations/slo.md. Label sets are
+// deliberately low-cardinality: only route templates, operation names, status
+// classes and network identifiers are allowed. User identifiers (Stellar
+// addresses, emails, usernames, intent/payment ids) must never be used as
+// label values.
+// ---------------------------------------------------------------------------
+
+// Status classes collapse concrete HTTP codes so cardinality stays bounded.
+const STATUS_CLASSES = ['2xx', '3xx', '4xx', '5xx'];
+
+/**
+ * Maps an HTTP status code to a coarse status class label value.
+ * Unknown codes fall back to 'unknown' rather than leaking the raw code.
+ */
+function statusClass(statusCode) {
+  const code = Number(statusCode);
+  if (!Number.isFinite(code)) return 'unknown';
+  if (code >= 200 && code < 300) return '2xx';
+  if (code >= 300 && code < 400) return '3xx';
+  if (code >= 400 && code < 500) return '4xx';
+  if (code >= 500 && code < 600) return '5xx';
+  return 'unknown';
+}
+
+// Counter: SLI events for the three user-facing flows. `operation` is a fixed
+// enum (e.g. "register", "federation_lookup", "payment_submit") and `status`
+// is a status class or outcome enum, never a user-supplied value.
+const sliEventsTotal = new client.Counter({
+  name: 'stellar_tags_sli_events_total',
+  help: 'Service-level indicator events by flow, operation and status class',
+  labelNames: ['flow', 'operation', 'status'],
+});
+
+// Histogram: end-to-end latency for SLI flows, bucketed for p50/p95/p99.
+const sliLatencySeconds = new client.Histogram({
+  name: 'stellar_tags_sli_latency_seconds',
+  help: 'Latency in seconds for user-facing SLI flows',
+  labelNames: ['flow', 'operation', 'status'],
+  buckets: [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+});
+
+// Histogram: time from payment submission to ledger finality, per network.
+// `outcome` is a fixed enum: success | failed | timeout | reverted.
+const ledgerFinalitySeconds = new client.Histogram({
+  name: 'stellar_tags_ledger_finality_seconds',
+  help: 'Time from payment submission to ledger finality, by network and outcome',
+  labelNames: ['network', 'outcome'],
+  buckets: [0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300],
+});
+
+// Gauge: age in seconds of the oldest unreconciled payment intent, per network.
+// Set from a periodic reconciliation sweep; never labelled by intent id.
+const oldestUnreconciledIntentAgeSeconds = new client.Gauge({
+  name: 'stellar_tags_oldest_unreconciled_intent_age_seconds',
+  help: 'Age in seconds of the oldest unreconciled payment intent, by network',
+  labelNames: ['network'],
+});
+
+/**
+ * Records one SLI observation for a flow.
+ * @param {object} params
+ * @param {string} params.flow - e.g. "registration" | "federation" | "payment"
+ * @param {string} params.operation - fixed operation enum
+ * @param {string|number} params.status - status class or outcome enum
+ * @param {number} [params.durationSeconds] - observed latency, if any
+ */
+function recordSli({ flow, operation, status, durationSeconds } = {}) {
+  const labels = {
+    flow: flow || 'unknown',
+    operation: operation || 'unknown',
+    status: typeof status === 'number' ? statusClass(status) : status || 'unknown',
+  };
+  sliEventsTotal.inc(labels);
+  if (typeof durationSeconds === 'number' && Number.isFinite(durationSeconds)) {
+    sliLatencySeconds.observe(labels, durationSeconds);
+  }
+}
+
+/**
+ * Records submission-to-finality latency for a payment on a network.
+ * @param {object} params
+ * @param {string} params.network - network identifier (e.g. "testnet")
+ * @param {string} params.outcome - success | failed | timeout | reverted
+ * @param {number} params.durationSeconds - submission-to-finality duration
+ */
+function recordLedgerFinality({ network, outcome, durationSeconds } = {}) {
+  if (typeof durationSeconds !== 'number' || !Number.isFinite(durationSeconds)) {
+    return;
+  }
+  ledgerFinalitySeconds.observe(
+    { network: network || 'unknown', outcome: outcome || 'unknown' },
+    durationSeconds,
+  );
+}
+
+/**
+ * Updates the oldest-unreconciled-intent-age gauge for a network.
+ * @param {object} params
+ * @param {string} params.network - network identifier
+ * @param {number} params.ageSeconds - age of the oldest unreconciled intent
+ */
+function setOldestUnreconciledIntentAge({ network, ageSeconds } = {}) {
+  if (typeof ageSeconds !== 'number' || !Number.isFinite(ageSeconds)) {
+    return;
+  }
+  oldestUnreconciledIntentAgeSeconds.set({ network: network || 'unknown' }, ageSeconds);
+}
+
 // The Prisma and Redis clients are created after this module is imported, so
 // they are registered later via setMetricsSources and read at scrape time.
 let prismaSource = null;
@@ -235,11 +346,14 @@ module.exports = {
   dbPoolConnectionsIdle,
   dbPoolQueriesWaiting,
   redisConnectionsActive,
-  webhookQueueOldestPendingAge,
-  webhookDeliveryAttempts,
-  webhookDeliveryLatency,
-  webhookDlqOldestAge,
-  observeWebhookOldestPendingAge,
-  observeWebhookDlqOldestAge,
-  observeWebhookDelivery,
+  // SLI / SLO metrics
+  STATUS_CLASSES,
+  statusClass,
+  recordSli,
+  recordLedgerFinality,
+  setOldestUnreconciledIntentAge,
+  sliEventsTotal,
+  sliLatencySeconds,
+  ledgerFinalitySeconds,
+  oldestUnreconciledIntentAgeSeconds,
 };
