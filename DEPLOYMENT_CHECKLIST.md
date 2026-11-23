@@ -2,6 +2,18 @@
 
 Use this checklist for every deployment. Do not skip steps.
 
+## Build Once, Promote by Digest
+
+- [ ] Build the backend artifact exactly once per release and record its
+      immutable image digest (`sha256:...`). The same digest must be promoted
+      through staging and production; never rebuild per environment.
+- [ ] Confirm all environment configuration (API URLs, network passphrase,
+      contract IDs, secrets, feature flags) is supplied externally via
+      environment variables / secrets and is **not** baked into the image.
+      Changing an environment must not require a new build.
+- [ ] Record the promoted digest in the release notes / deployment record so
+      staging and production can be verified as byte-identical.
+
 ## Pre-Deployment
 
 - [ ] All changes merged to `main` and CI is green
@@ -14,6 +26,21 @@ Use this checklist for every deployment. Do not skip steps.
       (address/version/interface) before any timelocked authority change is
       scheduled. A candidate whose interface handshake does not match the
       expected version must be rejected and must not be delegated to.
+- [ ] **Migration compatibility preflight (#469):** run the candidate
+      migrations against both the old and new application versions. The
+      preflight must report any incompatible/destructive statements before
+      deployment. Destructive contract phases must remain blocked until old
+      replicas are drained; confirm the drain gate reports zero old replicas
+      before the contract phase is allowed to proceed.
+- [ ] **Release manifest preflight (#470):** publish the coordinated release
+      manifest recording package versions, WASM hash, interface schema,
+      supported networks, and migration level. The deployment preflight must
+      reject mismatched dashboard/client/contract combinations; confirm it
+      passes for the exact versions being deployed.
+- [ ] **Production approval (#467):** production promotion requires an explicit
+      approval (GitHub environment reviewer / change ticket). Record the
+      approver, timestamp, and the promoted digest as the deployment identity.
+- [ ] Confirm a previously verified digest is available for rollback.
 
 ## Testnet Deployment
 
@@ -26,6 +53,10 @@ Use this checklist for every deployment. Do not skip steps.
 - [ ] Verify the deploy steps run only after approval
 - [ ] Configure `TESTNET_API_URL` in **Settings → Secrets and variables → Actions** (or under the `testnet` environment secrets) pointing to the deployed testnet API base URL so the post-deploy `/health` verification step can confirm `200 OK` and `status: "up"`
 - [ ] Smoke-test the integration environment after the deploy completes
+- [ ] **Post-deploy smoke checks (#471):** run the testnet smoke checks against
+      the deployed contract. They must verify the on-chain WASM hash, network,
+      admin state, and read interface, and use bounded, non-duplicating test
+      transactions. Publish the results keyed by the deployment ID.
 
 > The `testnet` environment must exist in **Settings → Environments** with at
 > least one required reviewer configured, and `TESTNET_API_URL` must be set as a
@@ -34,6 +65,19 @@ Use this checklist for every deployment. Do not skip steps.
 
 ## Post-Deployment
 
-- [ ] Verify the deployed version/commit matches the intended release
+- [ ] Verify the deployed version/commit and image digest match the intended
+      release and the recorded deployment identity
+- [ ] Confirm the post-deploy smoke-check results are published and keyed by
+      the deployment ID, and that the on-chain WASM hash matches the release
+      manifest
 - [ ] Monitor logs and metrics for errors
 - [ ] Notify the team that the deployment is complete
+
+## Rollback
+
+- [ ] If a problem is detected, redeploy the previously verified digest
+      (recorded in the deployment identity / release manifest). Do not rebuild.
+- [ ] Re-run the post-deploy smoke checks against the rolled-back deployment
+      and publish results keyed by the new deployment ID.
+- [ ] Record the rollback (reason, approver, timestamp, digest) in the
+      deployment record.

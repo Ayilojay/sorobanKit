@@ -18,7 +18,13 @@
     "contract:build": "node scripts/deploy.js build",
     "contract:deploy": "node scripts/deploy.js deploy",
     "contract:upgrade": "node scripts/deploy.js upgrade",
-    "deploy:verify-hash": "node scripts/deploy.js verify-hash"
+    "deploy:verify-hash": "node scripts/deploy.js verify-hash",
+    "release:build": "node scripts/deploy.js release:build",
+    "release:promote": "node scripts/deploy.js release:promote",
+    "release:rollback": "node scripts/deploy.js release:rollback",
+    "release:preflight": "node scripts/deploy.js release:preflight",
+    "release:smoke": "node scripts/deploy.js release:smoke",
+    "migrate:preflight": "node scripts/deploy.js migrate:preflight"
   },
   "devDependencies": {
     "@types/jest": "^29.5.14",
