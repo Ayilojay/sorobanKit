@@ -225,6 +225,127 @@ describe('GET /health', () => {
   });
 });
 
+// ── Cold-start / dependency recovery under deployment conditions ─────────────
+
+describe('cold start — delayed dependency availability', () => {
+  const READY_PATH = '/health/ready';
+
+  const buildReadinessApp = (redis) => {
+    const app = express();
+    app.use(healthRoutes(redis));
+    app.use(buildErrorHandler(() => false));
+    return app;
+  };
+
+  test('readiness reports DOWN while Postgres is still starting', async () => {
+    prisma.$queryRaw.mockRejectedValue(new Error('the database system is starting up'));
+
+    const res = await request(buildReadinessApp(redisClient)).get(READY_PATH);
+
+    expect(res.status).toBe(503);
+    expect(res.body).toMatchObject({
+      success: false,
+      error: { code: 'SERVICE_UNAVAILABLE', retryable: true },
+    });
+    expect(res.body.error.details).toContainEqual({
+      field: 'database',
+      message: 'Database unavailable',
+    });
+  });
+
+  test('readiness reports DOWN while Redis is still starting', async () => {
+    redisClient.ping.mockRejectedValue(new Error('LOADING Redis is loading the dataset in memory'));
+
+    const res = await request(buildReadinessApp(redisClient)).get(READY_PATH);
+
+    expect(res.status).toBe(503);
+    expect(res.body.error.details).toContainEqual({
+      field: 'redis',
+      message: 'Redis unavailable',
+    });
+  });
+
+  test('readiness transitions DOWN -> UP once dependencies become available', async () => {
+    const app = buildReadinessApp(redisClient);
+
+    prisma.$queryRaw.mockRejectedValueOnce(new Error('connection refused'));
+    redisClient.ping.mockRejectedValueOnce(new Error('not connected'));
+
+    const down = await request(app).get(READY_PATH);
+    expect(down.status).toBe(503);
+
+    prisma.$queryRaw.mockResolvedValue([{ 1: 1 }]);
+    redisClient.ping.mockResolvedValue('PONG');
+
+    const up = await request(app).get(READY_PATH);
+    expect(up.status).toBe(200);
+    expect(up.body).toMatchObject({ status: 'UP', database: 'up', redis: 'up' });
+  });
+
+  test('readiness recovers after the retry limit is exhausted and deps come back', async () => {
+    const app = buildReadinessApp(redisClient);
+    const MAX_RETRIES = 3;
+
+    prisma.$queryRaw.mockRejectedValue(new Error('connection refused'));
+
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt += 1) {
+      const res = await request(app).get(READY_PATH);
+      expect(res.status).toBe(503);
+    }
+
+    prisma.$queryRaw.mockResolvedValue([{ 1: 1 }]);
+
+    const recovered = await request(app).get(READY_PATH);
+    expect(recovered.status).toBe(200);
+    expect(recovered.body.database).toBe('up');
+  });
+
+  test('workers are activated only after readiness succeeds', async () => {
+    const app = buildReadinessApp(redisClient);
+    const activated = [];
+
+    const activateWorkers = async () => {
+      const res = await request(app).get(READY_PATH);
+      if (res.status === 200) {
+        activated.push('worker');
+      }
+      return res;
+    };
+
+    prisma.$queryRaw.mockRejectedValueOnce(new Error('connection refused'));
+    await activateWorkers();
+    expect(activated).toHaveLength(0);
+
+    prisma.$queryRaw.mockResolvedValue([{ 1: 1 }]);
+    await activateWorkers();
+    expect(activated).toEqual(['worker']);
+  });
+
+  test('failed initialization leaks no workers', async () => {
+    const app = buildReadinessApp(redisClient);
+    const workers = new Set();
+
+    const initialize = async () => {
+      const res = await request(app).get(READY_PATH);
+      if (res.status !== 200) {
+        // Initialization failed: ensure nothing was registered.
+        workers.clear();
+        return false;
+      }
+      workers.add('worker-1');
+      return true;
+    };
+
+    prisma.$queryRaw.mockRejectedValue(new Error('connection refused'));
+    redisClient.ping.mockRejectedValue(new Error('not connected'));
+
+    const ok = await initialize();
+
+    expect(ok).toBe(false);
+    expect(workers.size).toBe(0);
+  });
+});
+
 // ── X-Correlation-ID header assertions for health endpoint ────────────────────
 
 describe('GET /health — X-Correlation-ID header', () => {

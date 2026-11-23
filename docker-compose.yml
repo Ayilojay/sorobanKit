@@ -5,9 +5,27 @@
 #   docker compose --profile full up         the same, plus the built frontend
 #   docker compose --profile test up         API under test + its own database
 #   docker compose --profile integration up  local standalone Stellar network
+#   docker compose --profile fault up        fault-injection stack (see below)
 #
 # dev and test use separate databases on separate host ports, so both can run
 # at once without colliding.
+#
+# Fault-injection profile (`fault`):
+#   A disposable stack for exercising Redis, PostgreSQL and Stellar outages
+#   (disconnect, slow response, reconnection, partial recovery). It is built
+#   from the same images as the test profile but every dependency is reached
+#   through a Toxiproxy sidecar, so tests can cut, delay or restore each link
+#   without touching the real services. Nothing in this profile may talk to a
+#   production endpoint or use production credentials: the API container is
+#   started with FAULT_INJECTION=1 and the test harness refuses to run unless
+#   every dependency URL points at a loopback/private host. Run it with:
+#
+#     docker compose --profile fault up --abort-on-container-exit
+#
+#   and tear it down (including volumes) with:
+#
+#     docker compose --profile fault down -v
+=======
 #
 # Database ports are published to 127.0.0.1 only. Binding to localhost keeps
 # the dev and test Postgres instances reachable from the host (for psql, the
@@ -136,6 +154,119 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:5001/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # ── fault ──────────────────────────────────────────────────────────────────
+  # Toxiproxy fronts every dependency so tests can inject disconnects and
+  # latency. Each proxy listens on the same port the real service uses inside
+  # the compose network, so the API's URLs are unchanged; only the hostname
+  # differs (toxiproxy instead of postgres/redis/stellar).
+  toxiproxy:
+    profiles: ["fault"]
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    # Seed the proxies at startup. Each entry is name:listen:upstream.
+    #  - postgres-fault  -> postgres-fault:5432
+    #  - redis-fault     -> redis-fault:6379
+    #  - stellar-fault   -> stellar-fault:8000
+    command: >
+      -host 0.0.0.0
+      -config /config/toxiproxy.json
+    volumes:
+      - ./tests/fault/toxiproxy.json:/config/toxiproxy.json:ro
+    ports:
+      # Control API for the test harness. Loopback only: the fault stack must
+      # never be reachable from the network.
+      - "127.0.0.1:8474:8474"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8474/version"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  postgres-fault:
+    profiles: ["fault"]
+    image: postgres:16.9-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: stellar_tags_fault
+    # No host port and no volume: a disposable database that starts empty and
+    # is thrown away with `down -v`.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis-fault:
+    profiles: ["fault"]
+    image: redis:7.4.2-alpine
+    # No host port: only reachable through the toxiproxy sidecar.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  stellar-fault:
+    profiles: ["fault"]
+    image: stellar/quickstart:v429
+    command: [
+      "--standalone",
+      "--enable-soroban-rpc",
+      "--enable-core-artifacts",
+      "--local",
+    ]
+    environment:
+      ENABLE_LOGS: "true"
+    # No host port: only reachable through the toxiproxy sidecar.
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  api-fault:
+    profiles: ["fault"]
+    build:
+      context: ./stellar-payment-platform
+      dockerfile: Dockerfile.test
+    environment:
+      PORT: "5002"
+      # Every dependency goes through toxiproxy. The hostnames are deliberately
+      # not the production ones, and the harness asserts they resolve to the
+      # compose network before running.
+      DATABASE_URL: postgresql://postgres:postgres@toxiproxy:5432/stellar_tags_fault?schema=public
+      REDIS_URL: redis://toxiproxy:6379
+      STELLAR_HORIZON_URL: http://toxiproxy:8000
+      STELLAR_RPC_URL: http://toxiproxy:8000/rpc
+      # Guard flag read by the fault-injection test harness. It refuses to run
+      # against anything that is not this disposable stack.
+      FAULT_INJECTION: "1"
+      # Credentials are the throwaway ones from the containers above; the
+      # harness rejects any value that looks like a production secret.
+      TEST_ADMIN_API_KEY: fault-admin-api-key
+    ports:
+      - "127.0.0.1:5002:5002"
+    command: >
+      sh -c "npx prisma migrate deploy &&
+             npm run db:seed &&
+             npm start"
+    depends_on:
+      toxiproxy:
+        condition: service_healthy
+      postgres-fault:
+        condition: service_healthy
+      redis-fault:
+        condition: service_healthy
+      stellar-fault:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5002/health"]
       interval: 5s
       timeout: 3s
       retries: 5

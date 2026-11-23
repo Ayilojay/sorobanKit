@@ -17,3 +17,114 @@ groups:
             for a free connection, which can lead to query timeouts and degraded
             API latency. Consider increasing the pool size, investigating slow
             queries, or scaling the database.
+
+  - name: stellar-tags-webhook-queue
+    rules:
+      - alert: StellarTagsWebhookOldestPendingEventAgeHigh
+        expr: stellar_tags_webhook_queue_oldest_pending_age_seconds > 300
+        for: 2m
+        labels:
+          severity: warning
+          service: stellar-tags
+          component: webhook-queue
+        annotations:
+          summary: "Stellar Tags webhook queue: oldest pending event is aging"
+          description: >-
+            The oldest pending webhook event has been waiting for more than 5
+            minutes (current age: {{ $value }}s). This indicates the webhook
+            delivery worker is falling behind or stalled. Check worker health,
+            throughput, and downstream endpoint availability.
+
+      - alert: StellarTagsWebhookOldestPendingEventAgeCritical
+        expr: stellar_tags_webhook_queue_oldest_pending_age_seconds > 1800
+        for: 5m
+        labels:
+          severity: critical
+          service: stellar-tags
+          component: webhook-queue
+        annotations:
+          summary: "Stellar Tags webhook queue: oldest pending event is severely delayed"
+          description: >-
+            The oldest pending webhook event has been waiting for more than 30
+            minutes (current age: {{ $value }}s). Webhook delivery is
+            effectively stalled. Escalate to on-call and investigate the
+            delivery worker and downstream endpoints immediately.
+
+      - alert: StellarTagsWebhookDLQAgeHigh
+        expr: stellar_tags_webhook_queue_dlq_oldest_age_seconds > 3600
+        for: 5m
+        labels:
+          severity: warning
+          service: stellar-tags
+          component: webhook-queue
+        annotations:
+          summary: "Stellar Tags webhook DLQ: oldest dead-lettered event is aging"
+          description: >-
+            The oldest event in the webhook dead-letter queue has been present
+            for more than 1 hour (current age: {{ $value }}s). Dead-lettered
+            events are not being reviewed or replayed. Inspect the DLQ and
+            decide whether to replay or discard affected events.
+
+      - alert: StellarTagsWebhookDLQAgeCritical
+        expr: stellar_tags_webhook_queue_dlq_oldest_age_seconds > 86400
+        for: 10m
+        labels:
+          severity: critical
+          service: stellar-tags
+          component: webhook-queue
+        annotations:
+          summary: "Stellar Tags webhook DLQ: oldest dead-lettered event is stale"
+          description: >-
+            The oldest event in the webhook dead-letter queue has been present
+            for more than 24 hours (current age: {{ $value }}s). This indicates
+            sustained delivery failures with no operator follow-up. Review the
+            DLQ, identify failing endpoints, and replay or discard events.
+
+      - alert: StellarTagsWebhookDeliveryFailuresSustained
+        expr: |
+          sum by (service, component) (
+            rate(stellar_tags_webhook_delivery_failures_total[5m])
+          ) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+          service: stellar-tags
+          component: webhook-queue
+        annotations:
+          summary: "Stellar Tags webhook delivery: sustained failure rate"
+          description: >-
+            Webhook deliveries are failing at a sustained rate above 0.1 per
+            second (current rate: {{ $value }}/s) over the last 5 minutes for
+            more than 10 minutes. Investigate downstream endpoint availability,
+            authentication, and network connectivity.
+
+      - alert: StellarTagsWebhookDeliveryFailureRatioHigh
+        expr: |
+          (
+            sum by (service, component) (
+              rate(stellar_tags_webhook_delivery_failures_total[5m])
+            )
+            /
+            clamp_min(
+              sum by (service, component) (
+                rate(stellar_tags_webhook_delivery_attempts_total[5m])
+              ),
+              0.001
+            )
+          ) > 0.25
+        for: 10m
+        labels:
+          severity: warning
+          service: stellar-tags
+          component: webhook-queue
+        annotations:
+          summary: "Stellar Tags webhook delivery: high failure ratio"
+          description: >-
+            More than 25% of webhook delivery attempts have failed over the
+            last 5 minutes for more than 10 minutes (current ratio:
+            {{ $value }}). This suggests a systemic delivery problem rather
+            than isolated endpoint failures. Check downstream endpoints and
+            delivery worker configuration.
+</｜｜DSML｜｜ parameter>
+</｜｜DSML｜｜ invoke>
+</｜｜DSML｜｜ calls>

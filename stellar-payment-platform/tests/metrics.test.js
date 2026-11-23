@@ -414,3 +414,246 @@ describe('Prometheus Metrics Endpoint', () => {
     });
   });
 });
+
+// Issue #476 — webhook queue health metrics and the operational dashboard
+// endpoint. The Prisma mock is shared across the file, so each test that needs
+// queue data re-programs `$queryRaw` and restores the default afterwards.
+describe('Webhook queue health metrics (issue #476)', () => {
+  const { prisma } = require('../prismaClient');
+
+  const NOW = new Date('2024-06-01T12:00:00.000Z').getTime();
+
+  // Shape returned by the queue-health aggregation query.
+  const queueSnapshot = (overrides = {}) => ({
+    oldest_pending_at: new Date(NOW - 90_000), // 90s old
+    oldest_dlq_at: new Date(NOW - 3_600_000), // 1h old
+    pending_count: 7,
+    dlq_count: 2,
+    ...overrides,
+  });
+
+  const attemptRows = [
+    { attempts: 0, count: 4 },
+    { attempts: 1, count: 2 },
+    { attempts: 2, count: 1 },
+    { attempts: 3, count: 0 },
+    { attempts: 9, count: 1 }, // out-of-range bucket must be clamped
+  ];
+
+  const latencyRows = [
+    { bucket: 'lt_1s', count: 5 },
+    { bucket: 'lt_5s', count: 3 },
+    { bucket: 'lt_30s', count: 1 },
+    { bucket: 'gte_30s', count: 1 },
+  ];
+
+  const programQueueQueries = (snapshot = queueSnapshot()) => {
+    prisma.$queryRaw.mockImplementation((strings, ...values) => {
+      const sql = Array.isArray(strings) ? strings.join('?') : String(strings);
+      if (/attempts/i.test(sql)) return Promise.resolve(attemptRows);
+      if (/latency|delivered_at|created_at.*delivered/i.test(sql)) {
+        return Promise.resolve(latencyRows);
+      }
+      if (/dlq|dead_letter/i.test(sql)) return Promise.resolve([snapshot]);
+      return Promise.resolve([snapshot]);
+    });
+  };
+
+  beforeEach(() => {
+    jest.spyOn(Date, 'now').mockReturnValue(NOW);
+    programQueueQueries();
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+    prisma.$queryRaw.mockReset();
+    prisma.$queryRaw.mockResolvedValue([{ '1': 1 }]);
+  });
+
+  describe('metric emission', () => {
+    test('exposes the oldest pending event gauge', async () => {
+      const response = await request(app).get('/metrics');
+      expect(response.status).toBe(200);
+      expect(response.text).toContain('stellar_tags_webhook_queue_oldest_pending_seconds');
+      // 90s old event must be reported as ~90 seconds.
+      expect(response.text).toMatch(
+        /stellar_tags_webhook_queue_oldest_pending_seconds(?:\{[^}]*\})? 90(?:\.0+)?/,
+      );
+    });
+
+    test('exposes the DLQ age gauge', async () => {
+      const response = await request(app).get('/metrics');
+      expect(response.text).toContain('stellar_tags_webhook_queue_dlq_oldest_seconds');
+      expect(response.text).toMatch(
+        /stellar_tags_webhook_queue_dlq_oldest_seconds(?:\{[^}]*\})? 3600(?:\.0+)?/,
+      );
+    });
+
+    test('exposes pending and DLQ depth gauges', async () => {
+      const response = await request(app).get('/metrics');
+      expect(response.text).toMatch(
+        /stellar_tags_webhook_queue_pending_total(?:\{[^}]*\})? 7/,
+      );
+      expect(response.text).toMatch(
+        /stellar_tags_webhook_queue_dlq_total(?:\{[^}]*\})? 2/,
+      );
+    });
+
+    test('exposes the attempt distribution histogram with bounded buckets', async () => {
+      const response = await request(app).get('/metrics');
+      const metricsText = response.text;
+
+      expect(metricsText).toContain('stellar_tags_webhook_delivery_attempts');
+      expect(metricsText).toContain('stellar_tags_webhook_delivery_attempts_bucket');
+
+      // Buckets must be a fixed, bounded set — never one bucket per observed
+      // attempt count.
+      const bucketLabels = new Set();
+      const bucketRegex = /stellar_tags_webhook_delivery_attempts_bucket\{[^}]*le="([^"]+)"/g;
+      let match;
+      while ((match = bucketRegex.exec(metricsText)) !== null) {
+        bucketLabels.add(match[1]);
+      }
+      expect(bucketLabels.size).toBeGreaterThan(0);
+      expect(bucketLabels.size).toBeLessThanOrEqual(10);
+      expect(bucketLabels.has('+Inf')).toBe(true);
+    });
+
+    test('clamps out-of-range attempt counts into the +Inf bucket', async () => {
+      const response = await request(app).get('/metrics');
+      const metricsText = response.text;
+
+      // The row with attempts=9 must land in +Inf, not create a new bucket.
+      expect(metricsText).toMatch(
+        /stellar_tags_webhook_delivery_attempts_bucket\{[^}]*le="\+Inf"[^}]*\} [1-9]\d*/,
+      );
+      expect(metricsText).not.toMatch(/le="9"/);
+    });
+
+    test('exposes the delivery latency histogram', async () => {
+      const response = await request(app).get('/metrics');
+      const metricsText = response.text;
+
+      expect(metricsText).toContain('stellar_tags_webhook_delivery_latency_seconds');
+      expect(metricsText).toContain('stellar_tags_webhook_delivery_latency_seconds_bucket');
+      expect(metricsText).toMatch(
+        /stellar_tags_webhook_delivery_latency_seconds_count(?:\{[^}]*\})? [1-9]\d*/,
+      );
+    });
+
+    test('emits HELP and TYPE lines for every queue-health metric', async () => {
+      const response = await request(app).get('/metrics');
+      const metricsText = response.text;
+
+      for (const name of [
+        'stellar_tags_webhook_queue_oldest_pending_seconds',
+        'stellar_tags_webhook_queue_dlq_oldest_seconds',
+        'stellar_tags_webhook_queue_pending_total',
+        'stellar_tags_webhook_queue_dlq_total',
+        'stellar_tags_webhook_delivery_attempts',
+        'stellar_tags_webhook_delivery_latency_seconds',
+      ]) {
+        expect(metricsText).toContain(`# HELP ${name}`);
+        expect(metricsText).toContain(`# TYPE ${name}`);
+      }
+    });
+
+    test('reports zero (not NaN) when the queue is empty', async () => {
+      programQueueQueries({
+        oldest_pending_at: null,
+        oldest_dlq_at: null,
+        pending_count: 0,
+        dlq_count: 0,
+      });
+
+      const response = await request(app).get('/metrics');
+      expect(response.status).toBe(200);
+      expect(response.text).toMatch(
+        /stellar_tags_webhook_queue_oldest_pending_seconds(?:\{[^}]*\})? 0(?:\.0+)?/,
+      );
+      expect(response.text).toMatch(
+        /stellar_tags_webhook_queue_dlq_oldest_seconds(?:\{[^}]*\})? 0(?:\.0+)?/,
+      );
+      expect(response.text).not.toMatch(/stellar_tags_webhook_queue_oldest_pending_seconds\{[^}]*\} NaN/);
+    });
+
+    test('does not fail /metrics when the queue query rejects', async () => {
+      prisma.$queryRaw.mockRejectedValue(new Error('db down'));
+
+      const response = await request(app).get('/metrics');
+      expect(response.status).toBe(200);
+      expect(response.text).toContain('stellar_tags_http_requests_total');
+    });
+  });
+
+  describe('GET /api/v1/admin/webhook-queue/health', () => {
+    const ADMIN_TOKEN = 'test-admin-token';
+
+    afterEach(() => {
+      delete process.env.ADMIN_TOKEN;
+    });
+
+    test('returns the queue snapshot on success', async () => {
+      process.env.ADMIN_TOKEN = ADMIN_TOKEN;
+      const response = await request(app)
+        .get('/api/v1/admin/webhook-queue/health')
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`);
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual(
+        expect.objectContaining({
+          oldestPendingSeconds: expect.any(Number),
+          oldestDlqSeconds: expect.any(Number),
+          pending: expect.any(Number),
+          dlq: expect.any(Number),
+          attempts: expect.any(Object),
+          latency: expect.any(Object),
+        }),
+      );
+      expect(response.body.oldestPendingSeconds).toBeCloseTo(90, 0);
+      expect(response.body.oldestDlqSeconds).toBeCloseTo(3600, 0);
+      expect(response.body.pending).toBe(7);
+      expect(response.body.dlq).toBe(2);
+    });
+
+    test('returns 401 without a token when ADMIN_TOKEN is configured', async () => {
+      process.env.ADMIN_TOKEN = ADMIN_TOKEN;
+      const response = await request(app).get('/api/v1/admin/webhook-queue/health');
+      expect(response.status).toBe(401);
+    });
+
+    test('returns 503 with a stable error shape when the DB query fails', async () => {
+      process.env.ADMIN_TOKEN = ADMIN_TOKEN;
+      prisma.$queryRaw.mockRejectedValue(new Error('connection reset'));
+
+      const response = await request(app)
+        .get('/api/v1/admin/webhook-queue/health')
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`);
+
+      expect(response.status).toBe(503);
+      expect(response.body).toEqual(
+        expect.objectContaining({ error: expect.any(String) }),
+      );
+      // Internal error details must not leak to the client.
+      expect(JSON.stringify(response.body)).not.toContain('connection reset');
+    });
+
+    test('reports zeroed ages when the queue is empty', async () => {
+      process.env.ADMIN_TOKEN = ADMIN_TOKEN;
+      programQueueQueries({
+        oldest_pending_at: null,
+        oldest_dlq_at: null,
+        pending_count: 0,
+        dlq_count: 0,
+      });
+
+      const response = await request(app)
+        .get('/api/v1/admin/webhook-queue/health')
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`);
+
+      expect(response.status).toBe(200);
+      expect(response.body.oldestPendingSeconds).toBe(0);
+      expect(response.body.oldestDlqSeconds).toBe(0);
+    });
+  });
+});
