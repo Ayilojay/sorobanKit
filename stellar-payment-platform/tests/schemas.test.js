@@ -12,6 +12,7 @@ const {
   adminRoutingStatsQuerySchema,
   webhookBodySchema,
   webhookQuerySchema,
+  paymentIntentBodySchema,
 } = require('../src/schemas');
 
 const messagesFor = (schema, input) => {
@@ -276,6 +277,66 @@ describe('request schemas', () => {
       ['clamps page at -1', { page: '-1' }, { page: 1 }],
     ])('%s', (_label, input, expected) => {
       expect(webhookQuerySchema.parse(input)).toMatchObject(expected);
+    });
+  });
+
+  describe('payment intent amount validation', () => {
+    const base = {
+      destination: 'GABC123XYZ456789',
+      asset: { code: 'XLM' },
+    };
+
+    const amountMessages = (amount) => {
+      const result = paymentIntentBodySchema.safeParse({ ...base, amount });
+      if (result.success) return null;
+      return result.error.issues
+        .filter((issue) => issue.path[0] === 'amount')
+        .map((issue) => issue.message);
+    };
+
+    test.each(['1', '0.1', '0.0000001', '123456789.1234567', '1.0000000'])(
+      'accepts the 7-decimal amount %s',
+      (amount) => {
+        expect(paymentIntentBodySchema.safeParse({ ...base, amount }).success).toBe(true);
+      },
+    );
+
+    test.each(['0.00000001', '1.12345678', '0.123456789'])(
+      'rejects the 8+ decimal amount %s',
+      (amount) => {
+        expect(amountMessages(amount)).not.toBeNull();
+        expect(amountMessages(amount).length).toBeGreaterThan(0);
+      },
+    );
+
+    test.each(['-1', '-0.0000001', '-123.45'])('rejects the negative amount %s', (amount) => {
+      expect(amountMessages(amount)).not.toBeNull();
+      expect(amountMessages(amount).length).toBeGreaterThan(0);
+    });
+
+    test.each(['abc', '1e-7', 'NaN', 'Infinity', '1,5', ''])(
+      'rejects the non-numeric amount %s',
+      (amount) => {
+        expect(amountMessages(amount)).not.toBeNull();
+        expect(amountMessages(amount).length).toBeGreaterThan(0);
+      },
+    );
+
+    test('accepts integer amounts', () => {
+      expect(paymentIntentBodySchema.safeParse({ ...base, amount: '100' }).success).toBe(true);
+      expect(paymentIntentBodySchema.safeParse({ ...base, amount: 100 }).success).toBe(true);
+    });
+
+    test('accepts exactly 7 decimal places (boundary)', () => {
+      expect(paymentIntentBodySchema.safeParse({ ...base, amount: '0.1234567' }).success).toBe(true);
+    });
+
+    test('accepts the smallest representable unit 0.0000001 (boundary)', () => {
+      expect(paymentIntentBodySchema.safeParse({ ...base, amount: '0.0000001' }).success).toBe(true);
+    });
+
+    test('rejects one unit below the smallest representable unit (boundary)', () => {
+      expect(amountMessages('0.00000001')).not.toBeNull();
     });
   });
 
