@@ -37,9 +37,11 @@ function MobileNav({
   };
 
   return (
-    <nav className="mobile-nav" aria-label="Primary">
+    <nav className="mobile-nav" aria-label="Primary" data-testid="mobile-nav">
       <button
         type="button"
+        data-testid="mobile-nav-dashboard"
+        data-active={active === "dashboard" ? "true" : "false"}
         className={active === "dashboard" ? "is-active" : ""}
         onClick={navigate(onDashboardClick)}
         aria-current={active === "dashboard" ? "page" : undefined}
@@ -51,6 +53,8 @@ function MobileNav({
       </button>
       <button
         type="button"
+        data-testid="mobile-nav-history"
+        data-active={active === "history" ? "true" : "false"}
         className={active === "history" ? "is-active" : ""}
         onClick={navigate(onHistoryClick)}
         aria-current={active === "history" ? "page" : undefined}
@@ -62,6 +66,8 @@ function MobileNav({
       </button>
       <button
         type="button"
+        data-testid="mobile-nav-analytics"
+        data-active={active === "analytics" ? "true" : "false"}
         className={active === "analytics" ? "is-active" : ""}
         onClick={navigate(onAnalyticsClick)}
         aria-current={active === "analytics" ? "page" : undefined}
@@ -73,6 +79,8 @@ function MobileNav({
       </button>
       <button
         type="button"
+        data-testid="mobile-nav-help"
+        data-active={active === "help" ? "true" : "false"}
         className={active === "help" ? "is-active" : ""}
         onClick={navigate(onHelpClick)}
         aria-current={active === "help" ? "page" : undefined}
@@ -86,6 +94,8 @@ function MobileNav({
       {canRegister && (
         <button
           type="button"
+          data-testid="mobile-nav-register"
+          data-active={active === "register" ? "true" : "false"}
           className={active === "register" ? "is-active" : ""}
           onClick={navigate(onRegisterClick)}
           aria-current={active === "register" ? "page" : undefined}

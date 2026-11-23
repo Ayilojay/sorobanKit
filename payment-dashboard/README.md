@@ -53,43 +53,71 @@ If the page is reloaded while a payment is in flight, the dashboard restores pro
 - **No resubmission**: resuming performs a read-only status lookup against the server using the stored reference. The payment is never re-sent on reload.
 - **Cleared on completion or mismatch**: the reference is removed once the operation reaches a terminal state (success or failure), or when it is invalid, unreadable, or does not match the current account/network.
 
-## Feature flags
+## Theming (light / dark)
 
-Remotely delivered feature flags are validated against a typed schema before they are used. The schema defines the allowed flag names and the allowed value types for each flag.
+The dashboard ships accessible design tokens for both a light and a dark theme and follows the operating system preference by default, with an explicit user override that is persisted.
 
-- **Typed schema**: only known flag names are accepted, and each flag's value must match its declared type. Unknown flags and values of the wrong type are ignored.
-- **Safe fallback**: if the remote configuration is missing, malformed, or stale, the dashboard falls back to the compiled-in defaults for every flag. A malformed payload never disables the dashboard or partially applies invalid values.
-- **No secrets**: flags are client-visible, so they must never carry secrets, credentials, or sensitive data. Only non-sensitive toggles and configuration belong in the flag payload.
-- **Stale configuration**: a payload that fails validation is discarded as a whole and the last known-good/default values are used.
+- **Tokens**: colors, surfaces, and contrast-sensitive values are defined as CSS custom properties under `src/styles/tokens.css` (or the equivalent token module). Each token has a light and dark value. Components must consume tokens rather than hard-coded colors so both themes stay accessible.
+- **Adding a token**: define the token in the light theme block, add its dark counterpart in the dark theme block, and verify contrast (WCAG AA) in both themes. Reference the token from components via `var(--token-name)`; do not add raw color literals.
+- **Pre-paint bootstrap**: a small inline script in `index.html` resolves the effective theme (stored choice, otherwise `prefers-color-scheme`) and sets the theme attribute on the root element before first paint, avoiding a flash of the wrong theme.
+- **Persistence and system changes**: the user's explicit choice is stored in `localStorage` and wins over the system preference. When the user has not chosen explicitly, the dashboard tracks `prefers-color-scheme` changes live and updates the theme without a reload.
 
-## API error catalog
+Validation:
 
-API error codes are mapped to user-facing guidance through a single central catalog. Each entry defines:
+```bash
+npm run test -- --run src/theme
+npm run lint
+npm run build
+```
 
-- **Message**: an actionable, accessible description of what went wrong and what the user can do next.
-- **Remediation**: the concrete next step (for example, retry, re-authenticate, or contact support).
-- **Retry behavior**: whether the operation is safe to retry automatically, retry manually, or not at all.
-- **Reference ID**: a safe, opaque reference identifier that can be quoted to support. Reference IDs never contain server internals, stack traces, or sensitive data.
+## Installable PWA and offline read-only mode
 
-Unknown or unmapped codes fall back to a generic safe message that does not expose server internals. The fallback still offers a reference ID and a retry recommendation.
+The dashboard is installable and, when connectivity is lost, switches to a read-only mode backed by a service worker cache.
 
-## Focus and announcement management
+- **Cache allowlist**: only eligible, non-secret data is cached (e.g. static assets and read-only dashboard views). The service worker never caches API responses containing secrets, signing material, or private keys.
+- **No signing material cached**: keys, seeds, and signing payloads are never written to service-worker storage or the offline cache. Offline mode is strictly read-only.
+- **Freshness indicators**: cached views display when the data was last refreshed so users know they are looking at stale data.
+- **Mutations disabled offline**: all write actions (payments, registration, settings changes) are disabled while offline. Financial operations are never queued for later replay; the user must reconnect and re-initiate them.
+- **Recovery**: when connectivity returns, the dashboard refreshes from the network and re-enables mutations.
 
-Focus and screen-reader announcements are centralized so navigation and form flows behave consistently.
+Validation:
 
-- **Route changes**: after a route change, focus moves to the new route's heading so keyboard and screen-reader users start at the top of the new content.
-- **Async results**: success and failure of mutations are announced through polite live regions.
-- **Background refreshes**: background data refreshes do not steal focus and do not trigger announcements, so users are not interrupted while typing or reading.
-- **Consistency**: the same manager is used for navigation and form flows, so focus and announcement behavior does not diverge between features.
+```bash
+npm run test -- --run src/offline src/sw
+npm run lint
+npm run build
+```
 
-## Cross-tab payment coordination
+## Bundle performance budgets
 
-Multiple browser tabs coordinate payment submission so that a payment is never submitted twice.
+Per-route JavaScript and asset budgets are enforced in CI for the registration, history, analytics, and help routes.
 
-- **Non-sensitive references only**: tabs share only a non-sensitive operation reference (an operation id plus a schema version) through browser storage. Payment payloads, amounts, and signing material are never shared across tabs.
-- **Expiry**: coordination state carries a time-to-live. Stale entries are treated as absent and cleaned up, so an abandoned tab cannot block or duplicate a later attempt.
-- **Backend idempotency**: correctness ultimately relies on backend idempotency. If a tab finds an in-flight operation for the same payment, it resumes or warns the user instead of starting a new attempt.
-- **Resume or warn**: a tab that detects an in-flight operation resumes status tracking or warns the user that a payment is already in progress, rather than triggering a duplicate payment attempt.
+- **Budgets**: thresholds for initial and compressed (gzip/brotli) sizes are defined in the budget configuration file. A build that exceeds a budget fails CI.
+- **Reporting**: the budget check reports the offending route and the dependencies that contributed to the overage so the regression can be traced.
+- **Updating budgets**: intentional size increases require updating the budget configuration in the same pull request, which makes the change explicit and reviewable.
+
+Validation:
+
+```bash
+npm run build
+npm run test -- --run scripts/budgets
+npm run budgets
+```
+
+## Visual regression tests
+
+Deterministic screenshots cover the registration, history, and navigation screens at mobile, tablet, and desktop sizes.
+
+- **Determinism**: dynamic data (timestamps, random ids, live balances) is masked or stubbed so screenshots are stable across runs.
+- **Minimal masking**: masking is limited to genuinely dynamic regions; layout and static content are captured unmasked.
+- **Baseline approval**: when a visual change is intentional, regenerate the baselines and commit them with the pull request. Baseline updates are reviewed like code; unexplained baseline churn should be rejected.
+
+Validation:
+
+```bash
+npm run test:visual
+npm run test:visual -- --update   # regenerate baselines after an approved change
+```
 
 ## Expanding the ESLint configuration
 

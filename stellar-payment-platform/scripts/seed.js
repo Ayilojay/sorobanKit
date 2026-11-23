@@ -65,6 +65,18 @@ const PAYMENT_STATUSES = ['pending', 'processing', 'completed', 'failed'];
 const API_KEY_PREFIX = 'sk_live_';
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+// Stellar assets carry seven decimal places. Monetary columns are stored as
+// exact integer "units" (1 unit = 1e-7 of the asset) so no float rounding can
+// creep into balances. Keep this in sync with the Prisma schema and the
+// migration that introduced amountUnits / feeUnits / assetPrecision.
+const ASSET_PRECISION = 7;
+const UNITS_PER_ASSET = 10n ** BigInt(ASSET_PRECISION);
+
+// Ledger rows are network-scoped: the same transaction hash can legitimately
+// exist on testnet and mainnet, so every transaction row must carry an
+// explicit network to satisfy the composite unique constraint.
+const DEFAULT_NETWORK = 'testnet';
+
 // ---------------------------------------------------------------------------
 // Deterministic derivation
 // ---------------------------------------------------------------------------
@@ -81,6 +93,49 @@ const stableId = (label) => uuidv5(label, UUID_NAMESPACE);
 const EPOCH = Date.parse('2026-01-01T00:00:00.000Z');
 const anchoredDate = (label, spanDays) =>
   new Date(EPOCH + (digest(`date:${label}`).readUInt32BE(0) % (spanDays * DAY_MS)));
+
+// ---------------------------------------------------------------------------
+// Monetary helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Converts a decimal string (e.g. "12.3456789") to exact integer units at the
+ * given precision. Rejects inputs with more fractional digits than the
+ * precision can represent rather than silently rounding, so a bad seed value
+ * fails loudly instead of writing a subtly wrong balance.
+ */
+const toUnits = (value, precision = ASSET_PRECISION) => {
+  const str = String(value).trim();
+  const match = /^(-?)(\d+)(?:\.(\d+))?$/.exec(str);
+  if (!match) {
+    throw new Error(`Cannot convert "${value}" to units: not a decimal number`);
+  }
+  const [, sign, whole, fraction = ''] = match;
+  if (fraction.length > precision) {
+    throw new Error(
+      `Cannot convert "${value}" to units: more than ${precision} fractional digits`,
+    );
+  }
+  const padded = fraction.padEnd(precision, '0');
+  const units = BigInt(whole) * 10n ** BigInt(precision) + BigInt(padded || '0');
+  return sign === '-' ? -units : units;
+};
+
+/**
+ * Converts integer units back to a decimal string at the given precision.
+ * Trailing zeros are trimmed but at least one fractional digit is kept so the
+ * value round-trips through toUnits().
+ */
+const fromUnits = (units, precision = ASSET_PRECISION) => {
+  const value = BigInt(units);
+  const negative = value < 0n;
+  const abs = negative ? -value : value;
+  const divisor = 10n ** BigInt(precision);
+  const whole = abs / divisor;
+  const fraction = (abs % divisor).toString().padStart(precision, '0').replace(/0+$/, '');
+  const body = fraction.length > 0 ? `${whole}.${fraction}` : `${whole}.0`;
+  return negative ? `-${body}` : body;
+};
 
 // ---------------------------------------------------------------------------
 // Users
@@ -232,6 +287,43 @@ const buildPaymentIntents = (users) => {
 };
 
 // ---------------------------------------------------------------------------
+// Payments
+// ---------------------------------------------------------------------------
+
+/**
+ * Builds Payment rows using the exact monetary columns. The legacy Float
+ * `amount` / `fee` fields are no longer written; instead each row carries
+ * integer `amountUnits` / `feeUnits` at `assetPrecision` decimal places.
+ *
+ * The natural key is (transactionHash, network): the same hash may exist on
+ * multiple networks, so we always set an explicit network (default testnet)
+ * to satisfy the composite unique constraint.
+ */
+const buildPayments = (users, { network = DEFAULT_NETWORK } = {}) => {
+  const addresses = [...new Set(users.map((u) => u.address))];
+
+  return Array.from({ length: PAYMENT_INTENT_COUNT }, (_, index) => {
+    const amountStr = amountFor(index);
+    // Fee is a small deterministic fraction of the amount, also exact.
+    const feeStr = fromUnits(toUnits(amountStr) / 1000n);
+
+    return {
+      id: stableId(`payment:${index}`),
+      transactionHash: digest(`tx-hash:${index}`).toString('hex'),
+      network,
+      from: addresses[index % addresses.length],
+      to: addresses[(index + 7) % addresses.length],
+      asset: index % 3 === 0 ? 'XLM' : 'USDC',
+      assetPrecision: ASSET_PRECISION,
+      amountUnits: toUnits(amountStr),
+      feeUnits: toUnits(feeStr),
+      status: PAYMENT_STATUSES[index % PAYMENT_STATUSES.length],
+      createdAt: anchoredDate(`payment:${index}`, 90),
+    };
+  });
+};
+
+// ---------------------------------------------------------------------------
 // API keys
 // ---------------------------------------------------------------------------
 
@@ -316,20 +408,25 @@ const assertSeedable = (env = process.env) => {
   }
 };
 
-const resetSeedData = async (prisma, { users, webhooks, paymentIntents, apiKeys }) => {
+const resetSeedData = async (prisma, { users, webhooks, paymentIntents, payments, apiKeys }) => {
   // Webhooks cascade from their user, but the seed deletes them explicitly so a
   // reset stays correct if an owner has since been removed by hand.
   await prisma.webhook.deleteMany({ where: { id: { in: webhooks.map((w) => w.id) } } });
   await prisma.paymentIntent.deleteMany({
     where: { id: { in: paymentIntents.map((p) => p.id) } },
   });
+  if (payments && payments.length > 0) {
+    // Payments are keyed on (transactionHash, network); delete by id which is
+    // stable across runs.
+    await prisma.payment.deleteMany({ where: { id: { in: payments.map((p) => p.id) } } });
+  }
   await prisma.apiKey.deleteMany({ where: { id: { in: apiKeys.map((k) => k.record.id) } } });
   await prisma.user.deleteMany({
     where: { address: { in: [...new Set(users.map((u) => u.address))] } },
   });
 };
 
-const writeSeedData = async (prisma, { users, webhooks, paymentIntents, apiKeys }) => {
+const writeSeedData = async (prisma, { users, webhooks, paymentIntents, payments, apiKeys }) => {
   for (const user of users) {
     const { username, ...rest } = user;
     await prisma.user.upsert({
@@ -353,6 +450,20 @@ const writeSeedData = async (prisma, { users, webhooks, paymentIntents, apiKeys 
     await prisma.paymentIntent.upsert({ where: { id }, create: { id, ...rest }, update: rest });
   }
 
+  if (payments) {
+    for (const payment of payments) {
+      const { id, transactionHash, network, ...rest } = payment;
+      // Upsert on the composite natural key so a re-run updates the same row
+      // rather than inserting a duplicate. The network is always explicit so
+      // the (transactionHash, network) unique constraint is satisfied.
+      await prisma.payment.upsert({
+        where: { transactionHash_network: { transactionHash, network } },
+        create: { id, transactionHash, network, ...rest },
+        update: rest,
+      });
+    }
+  }
+
   for (const { record } of apiKeys) {
     // Upsert on the stable id (not the hash) so a re-run with the same derived
     // key updates the existing row rather than inserting a duplicate.
@@ -373,6 +484,7 @@ const seedDatabase = async ({ reset = false, dryRun = false } = {}) => {
     users,
     webhooks: buildWebhooks(users),
     paymentIntents: buildPaymentIntents(users),
+    payments: buildPayments(users),
     apiKeys: buildApiKeys(),
   };
 
@@ -381,6 +493,7 @@ const seedDatabase = async ({ reset = false, dryRun = false } = {}) => {
     logger.info(`  ${data.users.length} users`);
     logger.info(`  ${data.webhooks.length} webhooks`);
     logger.info(`  ${data.paymentIntents.length} payment intents`);
+    logger.info(`  ${data.payments.length} payments`);
     logger.info(`  ${data.apiKeys.length} API keys`);
     return;
   }
@@ -406,7 +519,8 @@ const seedDatabase = async ({ reset = false, dryRun = false } = {}) => {
 
     logger.info(
       `Seeded ${data.users.length} users, ${data.webhooks.length} webhooks, ` +
-        `${data.paymentIntents.length} payment intents, ${data.apiKeys.length} API keys.`,
+        `${data.paymentIntents.length} payment intents, ${data.payments.length} payments, ` +
+        `${data.apiKeys.length} API keys.`,
     );
     for (const { rawKey, record } of data.apiKeys) {
       const state = record.revokedAt ? 'revoked' : 'active';
@@ -440,6 +554,7 @@ module.exports = {
   buildUsers,
   buildWebhooks,
   buildPaymentIntents,
+  buildPayments,
   buildApiKeys,
   activeApiKey,
   resetSeedData,
@@ -447,7 +562,11 @@ module.exports = {
   assertSeedable,
   isLocalDatabase,
   seedDatabase,
+  toUnits,
+  fromUnits,
   DEFAULT_ALLOWED_HOSTS,
+  DEFAULT_NETWORK,
+  ASSET_PRECISION,
   USER_COUNT,
   WEBHOOK_COUNT,
   PAYMENT_INTENT_COUNT,

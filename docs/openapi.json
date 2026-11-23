@@ -3,7 +3,7 @@
   "info": {
     "title": "Stellar Tags API",
     "version": "1.0.0",
-    "description": "OpenAPI specification for the Stellar Tags API. Covers the documented endpoints for tags, addresses, activity, and stats. API errors use a stable envelope with a machine-readable code and retryable flag; validation details contain only field names and safe messages.\n\n## Error catalog and recovery guidance\n\nEvery error response uses the `Error` envelope. Clients should map `error.code` to a central code-to-message catalog that provides an actionable, accessible message, remediation steps, and retry behavior. The catalog must:\n\n- Preserve a safe fallback for unknown codes (generic message, no server internals).\n- Never surface stack traces, SQL, upstream payloads, or internal identifiers.\n- Use `error.retryable` to decide whether to offer a retry action; when `retryable` is `true` clients may retry with backoff, otherwise they must not auto-retry.\n- Display `reference_id` (when present) to the user so support can correlate the failure. `reference_id` is a safe, opaque, non-sensitive identifier; it is never a secret and never contains internal details.\n- `correlation_id` may be echoed for tracing and is also safe to display.\n\n## Idempotency contract\n\nState-changing requests (tag create/update/delete/restore, payment submission) accept an optional `X-Idempotency-Key` request header. When supplied:\n\n- The server deduplicates requests sharing the same key for the same authenticated principal and operation.\n- A replayed request returns the original outcome and sets `X-Idempotent-Replay: true`; a first-time request sets `X-Idempotent-Replay: false` (or omits it).\n- Keys are scoped and expire; clients must generate a fresh key per logical operation and reuse it only for retries of that same operation.\n- Cross-tab coordination shares only non-sensitive operation references (never credentials or payment details) and relies on backend idempotency to prevent duplicate payment attempts; stale coordination state expires and clients resume or warn instead of re-submitting.\n\n## Soft-delete, restore, and username reuse semantics\n\n- **Reservation window**: when a tag (username) is soft-deleted, its name is reserved for a fixed `SOFT_DELETE_RESERVATION_DAYS` (default 30 days) from `deletedAt`. During this window the name cannot be claimed by any other owner.\n- **Restoration proof**: restoring a soft-deleted tag requires the original owner's authenticated identity (bearer token whose subject matches the tag's `ownerId`). The restore request must reference the tag id and the `deletedAt` value observed at deletion time; a mismatch (stale or already-restored) is rejected with `409 Conflict`.\n- **Post-expiry reuse**: once the reservation window elapses, the name becomes reusable. A new registration may claim it; the prior soft-deleted record is retained for audit but can no longer be restored (`410 Gone`).\n- **Transactional transitions**: delete, restore, and registration are enforced transactionally (row-level lock on the name). Concurrent delete/restore/registration cannot produce multiple active owners; losers receive `409 Conflict`.",
+    "description": "OpenAPI specification for the Stellar Tags API. Covers the documented endpoints for tags, addresses, activity, and stats. API errors use a stable envelope with a machine-readable code and retryable flag; validation details contain only field names and safe messages.\n\n## Soft-delete, restore, and username reuse semantics\n\n- **Reservation window**: when a tag (username) is soft-deleted, its name is reserved for a fixed `SOFT_DELETE_RESERVATION_DAYS` (default 30 days) from `deletedAt`. During this window the name cannot be claimed by any other owner.\n- **Restoration proof**: restoring a soft-deleted tag requires the original owner's authenticated identity (bearer token whose subject matches the tag's `ownerId`). The restore request must reference the tag id and the `deletedAt` value observed at deletion time; a mismatch (stale or already-restored) is rejected with `409 Conflict`.\n- **Post-expiry reuse**: once the reservation window elapses, the name becomes reusable. A new registration may claim it; the prior soft-deleted record is retained for audit but can no longer be restored (`410 Gone`).\n- **Transactional transitions**: delete, restore, and registration are enforced transactionally (row-level lock on the name). Concurrent delete/restore/registration cannot produce multiple active owners; losers receive `409 Conflict`.\n\n## API versioning and backward compatibility\n\n- **Version negotiation**: clients may pin a published contract version with the `X-API-Version` request header (e.g. `1.0.0`). When the header is absent the server uses the current contract version. Unknown or unsupported versions are rejected with `400 INVALID_INPUT`.\n- **Compatibility policy**: within a major version, changes are additive only. Existing response fields, types, and status codes are never removed or narrowed; new optional fields may be added. Breaking changes require a new major version.\n- **Deprecation window**: deprecated fields and endpoints are announced via the `Deprecation` and `Sunset` response headers and remain functional for at least `API_DEPRECATION_WINDOW_DAYS` (default 90 days) before removal in the next major version.\n- **Compatibility testing**: released client contracts are checked into the repository and replayed against candidate server behavior in CI; any breaking response or request change fails the build with a diff.",
     "license": {
       "name": "MIT"
     }
@@ -41,6 +41,84 @@
             }
           },
           "503": { "$ref": "#/components/responses/ApiErrorResponse" }
+        }
+      }
+    },
+    "/health/startup": {
+      "get": {
+        "tags": ["Platform"],
+        "summary": "Check startup (initialization) completion",
+        "description": "Startup probe. Reports whether the process has finished one-time initialization (configuration loaded, database migrations verified, connection pools established). It does not depend on downstream dependency availability after initialization, so slow startup is never mistaken for a dead process. Intended for Kubernetes `startupProbe`; while it returns 503 the orchestrator must not run liveness checks or restart the container.",
+        "operationId": "getStartupHealth",
+        "responses": {
+          "200": {
+            "description": "Initialization has completed",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StartupHealthStatus" }
+              }
+            }
+          },
+          "503": {
+            "description": "Initialization is still in progress (or failed); the process is not yet ready to be probed for liveness",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StartupHealthStatus" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health/live": {
+      "get": {
+        "tags": ["Platform"],
+        "summary": "Check process liveness",
+        "description": "Liveness probe. Reports whether the process event loop is responsive and not deadlocked. It intentionally ignores dependency health (database, Redis, Horizon): a dependency outage must not cause a restart. A 503 here means the process is wedged and should be restarted by the orchestrator. Intended for Kubernetes `livenessProbe`.",
+        "operationId": "getLivenessHealth",
+        "responses": {
+          "200": {
+            "description": "Process is alive and its event loop is responsive",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/LivenessHealthStatus" }
+              }
+            }
+          },
+          "503": {
+            "description": "Process is deadlocked or its event loop is unresponsive; restart required",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/LivenessHealthStatus" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health/ready": {
+      "get": {
+        "tags": ["Platform"],
+        "summary": "Check traffic readiness",
+        "description": "Readiness probe. Reports whether the instance can serve traffic: initialization must be complete and routing-critical dependencies (database, and Redis when configured) must be reachable. Horizon is not routing-critical and does not affect readiness. A 503 removes the instance from the load balancer without restarting it. Intended for Kubernetes `readinessProbe`.",
+        "operationId": "getReadinessHealth",
+        "responses": {
+          "200": {
+            "description": "Instance is ready to receive traffic",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ReadinessHealthStatus" }
+              }
+            }
+          },
+          "503": {
+            "description": "Instance is not ready to receive traffic (initialization incomplete or a routing-critical dependency is unavailable)",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ReadinessHealthStatus" }
+              }
+            }
+          }
         }
       }
     },
@@ -413,6 +491,13 @@
       }
     },
     "parameters": {
+      "ApiVersionParam": {
+        "name": "X-API-Version",
+        "in": "header",
+        "required": false,
+        "description": "Pinned published contract version (semver). Defaults to the current contract version when omitted. Unsupported versions are rejected with 400 INVALID_INPUT.",
+        "schema": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" }
+      },
       "PageParam": {
         "name": "page",
         "in": "query",
@@ -518,9 +603,17 @@
       }
     },
     "headers": {
-      "IdempotentReplayHeader": {
-        "description": "Present on responses to requests carrying `X-Idempotency-Key`. `true` indicates the response is a replay of a previously processed request; `false` indicates first-time processing.",
-        "schema": { "type": "boolean" }
+      "ApiVersion": {
+        "description": "The contract version used to serve the response.",
+        "schema": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" }
+      },
+      "Deprecation": {
+        "description": "Present when the endpoint or a field in the response is deprecated. Value is the RFC 9745 deprecation timestamp.",
+        "schema": { "type": "string" }
+      },
+      "Sunset": {
+        "description": "Present when the endpoint or a field in the response is deprecated. Value is the RFC 8594 sunset timestamp after which removal may occur (at least API_DEPRECATION_WINDOW_DAYS after Deprecation).",
+        "schema": { "type": "string" }
       }
     },
     "schemas": {
@@ -541,6 +634,44 @@
           "address": { "type": "string" },
           "createdAt": { "type": "string", "format": "date-time" },
           "deletedAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "CompatibilityReport": {
+        "type": "object",
+        "description": "Result of replaying a released client contract against the candidate server behavior.",
+        "required": ["version", "compatible"],
+        "properties": {
+          "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+          "compatible": { "type": "boolean" },
+          "breakingChanges": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["path", "method", "kind", "diff"],
+              "properties": {
+                "path": { "type": "string" },
+                "method": { "type": "string" },
+                "kind": {
+                  "type": "string",
+                  "enum": ["response_field_removed", "response_type_changed", "status_code_removed", "request_field_required", "request_field_removed"]
+                },
+                "diff": { "type": "string" }
+              }
+            }
+          },
+          "deprecations": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["path", "method", "deprecatedAt", "sunsetAt"],
+              "properties": {
+                "path": { "type": "string" },
+                "method": { "type": "string" },
+                "deprecatedAt": { "type": "string", "format": "date-time" },
+                "sunsetAt": { "type": "string", "format": "date-time" }
+              }
+            }
+          }
         }
       },
       "TagList": {
@@ -646,6 +777,62 @@
           "database": { "type": "string", "enum": ["up"] },
           "redis": { "type": "string", "enum": ["up", "not configured"] },
           "horizon": { "type": "string", "enum": ["up"] }
+        }
+      },
+      "StartupHealthStatus": {
+        "type": "object",
+        "description": "Result of the startup probe. `status` is `UP` once initialization has completed and `DOWN` while it is still in progress or has failed.",
+        "required": ["status", "timestamp", "initialized"],
+        "properties": {
+          "status": { "type": "string", "enum": ["UP", "DOWN"] },
+          "timestamp": { "type": "string", "format": "date-time" },
+          "initialized": { "type": "boolean" },
+          "phase": {
+            "type": "string",
+            "description": "Current initialization phase, for diagnostics only",
+            "enum": ["pending", "initializing", "completed", "failed"]
+          },
+          "durationMs": { "type": "integer", "minimum": 0 },
+          "error": { "type": "string" }
+        }
+      },
+      "LivenessHealthStatus": {
+        "type": "object",
+        "description": "Result of the liveness probe. Dependency health is deliberately excluded; only process responsiveness is reported.",
+        "required": ["status", "timestamp", "uptimeSeconds"],
+        "properties": {
+          "status": { "type": "string", "enum": ["UP", "DOWN"] },
+          "timestamp": { "type": "string", "format": "date-time" },
+          "uptimeSeconds": { "type": "number", "minimum": 0 },
+          "eventLoopResponsive": { "type": "boolean" },
+          "eventLoopLagMs": { "type": "number", "minimum": 0 },
+          "error": { "type": "string" }
+        }
+      },
+      "ReadinessHealthStatus": {
+        "type": "object",
+        "description": "Result of the readiness probe. Only routing-critical dependencies are reported; Horizon is excluded because it does not affect routing.",
+        "required": ["status", "timestamp", "initialized", "database"],
+        "properties": {
+          "status": { "type": "string", "enum": ["UP", "DOWN"] },
+          "timestamp": { "type": "string", "format": "date-time" },
+          "initialized": { "type": "boolean" },
+          "database": { "type": "string", "enum": ["up", "down"] },
+          "redis": { "type": "string", "enum": ["up", "down", "not configured"] },
+          "checks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name", "status", "critical"],
+              "properties": {
+                "name": { "type": "string" },
+                "status": { "type": "string", "enum": ["up", "down", "not configured"] },
+                "critical": { "type": "boolean" },
+                "latencyMs": { "type": "number", "minimum": 0 },
+                "error": { "type": "string" }
+              }
+            }
+          }
         }
       },
       "FederationEntry": {

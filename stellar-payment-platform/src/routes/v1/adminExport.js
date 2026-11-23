@@ -29,6 +29,47 @@ const csvRow = (record) => Object.values(record).map((value) => {
   return /[,"\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }).join(',') + '\n';
 
+// Convert an exact integer amount (BigInt or numeric string) at the given asset
+// precision into a plain decimal string. Trailing fractional zeros are trimmed so
+// the output stays byte-compatible with the previous Float serialization.
+const unitsToDecimalString = (units, precision) => {
+  if (units === null || units === undefined) return null;
+  const value = typeof units === 'bigint' ? units : BigInt(String(units));
+  const p = Number(precision ?? 0);
+  if (!Number.isInteger(p) || p < 0) throw new Error('Invalid asset precision');
+  if (p === 0) return value.toString();
+  const negative = value < 0n;
+  const abs = negative ? -value : value;
+  const digits = abs.toString().padStart(p + 1, '0');
+  const whole = digits.slice(0, digits.length - p);
+  const fraction = digits.slice(digits.length - p).replace(/0+$/, '');
+  const text = fraction ? `${whole}.${fraction}` : whole;
+  return negative ? `-${text}` : text;
+};
+
+const EXPORT_SELECT = {
+  id: true,
+  createdAt: true,
+  amountUnits: true,
+  feeUnits: true,
+  assetPrecision: true,
+};
+
+const serializeExportRecord = (record) => ({
+  ...record,
+  amount: unitsToDecimalString(record.amountUnits, record.assetPrecision),
+  fee: unitsToDecimalString(record.feeUnits, record.assetPrecision),
+  amountUnits: record.amountUnits === null || record.amountUnits === undefined
+    ? null
+    : String(record.amountUnits),
+  feeUnits: record.feeUnits === null || record.feeUnits === undefined
+    ? null
+    : String(record.feeUnits),
+});
+
+const jsonRow = (record) => JSON.stringify(record, (_key, value) =>
+  typeof value === 'bigint' ? value.toString() : value) + '\n';
+
 /**
  * @openapi
  * /admin/export:
@@ -100,16 +141,18 @@ module.exports = (router, adminAuth, getPrisma) => {
       while (total < rowLimit && !res.writableEnded && !res.destroyed) {
         const take = Math.min(PAGE_SIZE, rowLimit - total);
         const records = await prisma.payment.findMany({
-          where, orderBy, take, ...(cursor ? { cursor, skip: 1 } : { skip: 0 }),
+          where, orderBy, take, select: EXPORT_SELECT,
+          ...(cursor ? { cursor, skip: 1 } : { skip: 0 }),
         });
         if (records.length === 0) break;
         for (const record of records) {
           if (res.destroyed || res.writableEnded) return;
+          const serialized = serializeExportRecord(record);
           if (!isJson && !headerWritten) {
-            await writeChunk(res, Object.keys(record).map((field) => `"${field}"`).join(',') + '\n');
+            await writeChunk(res, Object.keys(serialized).map((field) => `"${field}"`).join(',') + '\n');
             headerWritten = true;
           }
-          await writeChunk(res, isJson ? JSON.stringify(record) + '\n' : csvRow(record));
+          await writeChunk(res, isJson ? jsonRow(serialized) : csvRow(serialized));
           total += 1;
         }
         if (records.length < take) break;
