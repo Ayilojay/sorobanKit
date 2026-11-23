@@ -9,6 +9,7 @@ const mockPrismaClient = {
   user: { upsert: jest.fn(), deleteMany: jest.fn() },
   webhook: { upsert: jest.fn(), deleteMany: jest.fn() },
   paymentIntent: { upsert: jest.fn(), deleteMany: jest.fn() },
+  payment: { upsert: jest.fn(), deleteMany: jest.fn() },
   apiKey: { upsert: jest.fn(), deleteMany: jest.fn() },
   $disconnect: jest.fn(),
 };
@@ -32,6 +33,7 @@ const {
   buildUsers,
   buildWebhooks,
   buildPaymentIntents,
+  buildPayments,
   buildApiKeys,
   writeSeedData,
   resetSeedData,
@@ -42,9 +44,12 @@ const {
   USER_COUNT,
   WEBHOOK_COUNT,
   PAYMENT_INTENT_COUNT,
+  PAYMENT_COUNT,
   API_KEY_COUNT,
   PAYMENT_STATUSES,
   MAX_RETRY_BACKLOG_DAYS,
+  SEED_NETWORK,
+  ASSET_PRECISION,
 } = seed;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -58,6 +63,7 @@ const mockPrisma = () => {
     user: model(),
     webhook: model(),
     paymentIntent: model(),
+    payment: model(),
     apiKey: model(),
     $disconnect: jest.fn().mockResolvedValue(undefined),
   };
@@ -67,18 +73,21 @@ describe('seed data generation', () => {
   const users = buildUsers();
   const webhooks = buildWebhooks(users);
   const intents = buildPaymentIntents(users);
+  const payments = buildPayments(users);
   const apiKeys = buildApiKeys();
 
   test('produces the record counts the issue asks for', () => {
     expect(users).toHaveLength(USER_COUNT);
     expect(webhooks).toHaveLength(WEBHOOK_COUNT);
     expect(intents).toHaveLength(PAYMENT_INTENT_COUNT);
+    expect(payments).toHaveLength(PAYMENT_COUNT);
     expect(apiKeys).toHaveLength(API_KEY_COUNT);
   });
 
   test('is deterministic across separate invocations', () => {
     expect(buildUsers()).toEqual(users);
     expect(buildPaymentIntents(buildUsers())).toEqual(intents);
+    expect(buildPayments(buildUsers())).toEqual(payments);
     expect(buildApiKeys()).toEqual(apiKeys);
     // Webhook delivery timestamps track the current time, so pin it.
     const now = Date.UTC(2026, 4, 1);
@@ -203,12 +212,17 @@ describe('payment intents', () => {
     expect(new Set(intents.map((i) => i.status))).toEqual(new Set(PAYMENT_STATUSES));
   });
 
-  test('references seeded addresses and carries a numeric amount', () => {
+  test('references seeded addresses and carries an exact amount', () => {
     const addresses = new Set(users.map((u) => u.address));
     for (const intent of intents) {
       expect(addresses.has(intent.from)).toBe(true);
       expect(addresses.has(intent.to)).toBe(true);
-      expect(Number(intent.amount)).toBeGreaterThan(0);
+      // Issue #384: monetary values are stored as integer minor units, never
+      // as floats, so the seed must emit BigInt-safe integers.
+      expect(typeof intent.amountUnits).toBe('bigint');
+      expect(intent.amountUnits).toBeGreaterThan(0n);
+      expect(intent.assetPrecision).toBe(ASSET_PRECISION);
+      expect(intent).not.toHaveProperty('amount');
       expect(validateMemo(intent.memoType, intent.memo)).toBeNull();
     }
   });
@@ -216,6 +230,43 @@ describe('payment intents', () => {
   test('gives every intent a distinct id and external id', () => {
     expect(new Set(intents.map((i) => i.id)).size).toBe(intents.length);
     expect(new Set(intents.map((i) => i.externalId)).size).toBe(intents.length);
+  });
+});
+
+describe('payments', () => {
+  const users = buildUsers();
+  const payments = buildPayments(users);
+
+  test('stores amount and fee as exact integer units with asset precision', () => {
+    for (const payment of payments) {
+      expect(typeof payment.amountUnits).toBe('bigint');
+      expect(typeof payment.feeUnits).toBe('bigint');
+      expect(payment.amountUnits).toBeGreaterThan(0n);
+      expect(payment.feeUnits).toBeGreaterThanOrEqual(0n);
+      expect(payment.assetPrecision).toBe(ASSET_PRECISION);
+      // The legacy float columns must not be written by the seed anymore.
+      expect(payment).not.toHaveProperty('amount');
+      expect(payment).not.toHaveProperty('fee');
+    }
+  });
+
+  test('every payment carries an explicit network identity', () => {
+    for (const payment of payments) {
+      expect(payment.network).toBe(SEED_NETWORK);
+    }
+  });
+
+  test('transaction identity is unique per (network, txHash)', () => {
+    const keys = payments.map((p) => `${p.network}|${p.txHash}`);
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+
+  test('references seeded addresses', () => {
+    const addresses = new Set(users.map((u) => u.address));
+    for (const payment of payments) {
+      expect(addresses.has(payment.from)).toBe(true);
+      expect(addresses.has(payment.to)).toBe(true);
+    }
   });
 });
 
@@ -265,6 +316,7 @@ describe('writeSeedData', () => {
     users,
     webhooks: buildWebhooks(users, Date.UTC(2026, 4, 1)),
     paymentIntents: buildPaymentIntents(users),
+    payments: buildPayments(users),
     apiKeys: buildApiKeys(),
   };
 
@@ -275,6 +327,7 @@ describe('writeSeedData', () => {
     expect(prisma.user.upsert).toHaveBeenCalledTimes(USER_COUNT);
     expect(prisma.webhook.upsert).toHaveBeenCalledTimes(WEBHOOK_COUNT);
     expect(prisma.paymentIntent.upsert).toHaveBeenCalledTimes(PAYMENT_INTENT_COUNT);
+    expect(prisma.payment.upsert).toHaveBeenCalledTimes(PAYMENT_COUNT);
     expect(prisma.apiKey.upsert).toHaveBeenCalledTimes(API_KEY_COUNT);
 
     expect(prisma.user.upsert.mock.calls[0][0].where).toEqual({
@@ -286,9 +339,35 @@ describe('writeSeedData', () => {
     expect(prisma.paymentIntent.upsert.mock.calls[0][0].where).toEqual({
       id: data.paymentIntents[0].id,
     });
+    // Issue #385: payments are keyed by the composite (network, txHash) identity.
+    expect(prisma.payment.upsert.mock.calls[0][0].where).toEqual({
+      network_txHash: {
+        network: data.payments[0].network,
+        txHash: data.payments[0].txHash,
+      },
+    });
     expect(prisma.apiKey.upsert.mock.calls[0][0].where).toEqual({
       keyHash: data.apiKeys[0].record.keyHash,
     });
+  });
+
+  test('writes exact-money columns and never the legacy float columns', async () => {
+    const prisma = mockPrisma();
+    await writeSeedData(prisma, data);
+
+    for (const [call] of prisma.payment.upsert.mock.calls) {
+      expect(call.create).toHaveProperty('amountUnits');
+      expect(call.create).toHaveProperty('feeUnits');
+      expect(call.create).toHaveProperty('assetPrecision');
+      expect(call.create).toHaveProperty('network');
+      expect(call.create).not.toHaveProperty('amount');
+      expect(call.create).not.toHaveProperty('fee');
+    }
+    for (const [call] of prisma.paymentIntent.upsert.mock.calls) {
+      expect(call.create).toHaveProperty('amountUnits');
+      expect(call.create).toHaveProperty('assetPrecision');
+      expect(call.create).not.toHaveProperty('amount');
+    }
   });
 
   test('never inserts a raw API key', async () => {
@@ -308,7 +387,7 @@ describe('writeSeedData', () => {
     await writeSeedData(first, data);
     await writeSeedData(second, data);
 
-    for (const model of ['user', 'webhook', 'paymentIntent', 'apiKey']) {
+    for (const model of ['user', 'webhook', 'paymentIntent', 'payment', 'apiKey']) {
       expect(second[model].upsert.mock.calls).toEqual(first[model].upsert.mock.calls);
     }
   });
@@ -321,6 +400,7 @@ describe('writeSeedData', () => {
       user: [...prisma.user.upsert.mock.calls],
       webhook: [...prisma.webhook.upsert.mock.calls],
       paymentIntent: [...prisma.paymentIntent.upsert.mock.calls],
+      payment: [...prisma.payment.upsert.mock.calls],
       apiKey: [...prisma.apiKey.upsert.mock.calls],
     };
 
@@ -329,14 +409,15 @@ describe('writeSeedData', () => {
       user: prisma.user.upsert.mock.calls.slice(firstRun.user.length),
       webhook: prisma.webhook.upsert.mock.calls.slice(firstRun.webhook.length),
       paymentIntent: prisma.paymentIntent.upsert.mock.calls.slice(firstRun.paymentIntent.length),
+      payment: prisma.payment.upsert.mock.calls.slice(firstRun.payment.length),
       apiKey: prisma.apiKey.upsert.mock.calls.slice(firstRun.apiKey.length),
     };
 
-    for (const model of ['user', 'webhook', 'paymentIntent', 'apiKey']) {
+    for (const model of ['user', 'webhook', 'paymentIntent', 'payment', 'apiKey']) {
       expect(secondRun[model]).toEqual(firstRun[model]);
     }
     // Upserts only: a re-run must never create or delete rows.
-    for (const model of ['user', 'webhook', 'paymentIntent', 'apiKey']) {
+    for (const model of ['user', 'webhook', 'paymentIntent', 'payment', 'apiKey']) {
       expect(prisma[model].deleteMany).not.toHaveBeenCalled();
     }
   });
@@ -375,6 +456,12 @@ describe('writeSeedData', () => {
     });
     expect(prisma.paymentIntent.deleteMany).toHaveBeenCalledWith({
       where: { id: { in: data.paymentIntents.map((p) => p.id) } },
+    });
+    // Payments are owned by their composite (network, txHash) identity.
+    expect(prisma.payment.deleteMany).toHaveBeenCalledWith({
+      where: {
+        OR: data.payments.map((p) => ({ network: p.network, txHash: p.txHash })),
+      },
     });
   });
 });
@@ -435,6 +522,7 @@ describe('assertSeedable', () => {
 // (mockPrismaClient) so no real database is required.
 
 const LOCAL_DB_URL = 'postgresql://postgres:postgres@localhost:5432/stellar_tags_test';
+const SEED_MODELS = ['user', 'webhook', 'paymentIntent', 'payment', 'apiKey'];
 
 describe('seedDatabase', () => {
   let origDbUrl;
@@ -444,7 +532,7 @@ describe('seedDatabase', () => {
     origDbUrl = process.env.DATABASE_URL;
     process.env.DATABASE_URL = LOCAL_DB_URL;
 
-    for (const model of ['user', 'webhook', 'paymentIntent', 'apiKey']) {
+    for (const model of SEED_MODELS) {
       mockPrismaClient[model].upsert.mockResolvedValue({});
       mockPrismaClient[model].deleteMany.mockResolvedValue({ count: 0 });
     }
@@ -461,7 +549,7 @@ describe('seedDatabase', () => {
 
   test('--reset flag calls deleteMany then upsert for every model', async () => {
     const callOrder = [];
-    for (const model of ['user', 'webhook', 'paymentIntent', 'apiKey']) {
+    for (const model of SEED_MODELS) {
       mockPrismaClient[model].deleteMany.mockImplementation(() => {
         callOrder.push(`${model}.deleteMany`);
         return Promise.resolve({ count: 0 });
@@ -475,7 +563,7 @@ describe('seedDatabase', () => {
     await seedDatabase({ reset: true });
 
     // Every deleteMany must precede the first upsert of the same model.
-    for (const model of ['user', 'webhook', 'paymentIntent', 'apiKey']) {
+    for (const model of SEED_MODELS) {
       const deleteIdx = callOrder.indexOf(`${model}.deleteMany`);
       const upsertIdx = callOrder.indexOf(`${model}.upsert`);
       expect(deleteIdx).toBeGreaterThanOrEqual(0);
@@ -488,7 +576,7 @@ describe('seedDatabase', () => {
   test('without --reset flag skips deleteMany and still upserts', async () => {
     await seedDatabase({ reset: false });
 
-    for (const model of ['user', 'webhook', 'paymentIntent', 'apiKey']) {
+    for (const model of SEED_MODELS) {
       expect(mockPrismaClient[model].deleteMany).not.toHaveBeenCalled();
       expect(mockPrismaClient[model].upsert).toHaveBeenCalled();
     }

@@ -63,6 +63,48 @@ Use this checklist for every deployment. Do not skip steps.
 > required repository secret. Without them, the approval gate or post-deploy
 > health check will fail.
 
+## Preview Environments (Pull Requests)
+
+Ephemeral preview environments are provisioned per pull request. Verify the
+following before relying on a preview for review or QA:
+
+- [ ] The preview API and dashboard are reachable at the URLs posted on the PR
+- [ ] The preview uses **synthetic data only** — confirm no production data was
+      copied or restored into the preview database
+- [ ] The preview database is **isolated** (its own instance/schema) and cannot
+      reach production databases or shared caches
+- [ ] **No production credentials** are present in the preview environment;
+      confirm the preview env only receives preview-scoped secrets
+- [ ] A **TTL** is set on the preview environment and the expiry is visible in
+      the PR comment / environment metadata
+- [ ] Closing or merging the PR triggers **auditable cleanup** — confirm the
+      cleanup run is recorded (logs/audit trail) and the resources are torn down
+
+> Preview environments must never be promoted to production. If a preview
+> appears to hold production credentials or data, tear it down immediately and
+> rotate the affected secrets.
+
+## Health Probes
+
+The API exposes three probes with distinct semantics. Verify each behaves as
+documented in the target environment:
+
+- [ ] **Startup probe** — reports initialization completion only. It must not
+      fail the process while startup is still in progress; slow startup must not
+      be killed by the liveness probe.
+- [ ] **Liveness probe** — reports process liveness only. A deadlocked process
+      must fail liveness and be restarted; transient dependency outages must
+      **not** fail liveness.
+- [ ] **Readiness probe** — reports traffic readiness. Only dependencies that
+      affect routing (e.g. the database required to serve requests) gate
+      readiness; non-routing dependencies must not remove the instance from
+      rotation.
+
+- [ ] Confirm the orchestrator is configured to use the startup probe before
+      liveness/readiness so slow boots are not restarted prematurely
+- [ ] Confirm readiness failures remove the instance from traffic without
+      restarting it, and liveness failures trigger a restart
+
 ## Post-Deployment
 
 - [ ] Verify the deployed version/commit and image digest match the intended
