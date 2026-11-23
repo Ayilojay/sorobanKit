@@ -36,6 +36,30 @@ supported state versions, keep the following in mind:
   boundaries, expected failures (including unsupported layouts), and
   recovery or concurrency behavior where relevant.
 
+## Preview environments for pull requests
+
+Pull requests can be provisioned with an isolated, ephemeral preview
+environment containing the API and dashboard. Previews are meant for manual
+verification and review; they are never connected to production.
+
+- **Isolation.** Each preview gets its own database and synthetic seed data.
+  Production credentials are never injected into a preview. Only the
+  preview-only secrets described below are available to the workload.
+- **Preview-only secrets.** Configure preview secrets under the preview
+  environment scope (for example `PREVIEW_DATABASE_URL`,
+  `PREVIEW_API_TOKEN`, and `PREVIEW_DASHBOARD_SESSION_SECRET`). These values
+  must be distinct from production and must not grant access to production
+  systems. Never reuse production credentials for a preview.
+- **TTL policy.** Every preview is created with a time-to-live. When the TTL
+  elapses the environment is torn down automatically, even if the pull
+  request is still open. Re-run the preview workflow to provision a fresh
+  environment.
+- **Auditable cleanup.** Closing or merging a pull request triggers cleanup of
+  the associated preview resources. Cleanup is recorded in an audit log that
+  captures what was removed, when, and by which trigger (TTL expiry or PR
+  closure). If you notice orphaned preview resources, report them in the
+  issue so the audit trail can be reconciled.
+
 ## Pull requests
 
 - Keep changes scoped to the issue being addressed.
