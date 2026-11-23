@@ -161,23 +161,79 @@ model WebhookDLQ {
 }
 
 // API keys for backend consumers. Only the SHA-256 hash of the secret is
-// stored; the raw key is shown once at creation time.
+// stored; the raw key is shown once at creation time and never persisted.
+//
+// #372 — Overlapping rotation. A replacement key is issued while the
+// predecessor is still valid, linked through `predecessorId`/`successorId`.
+// The predecessor keeps working until `overlapExpiresAt` (bounded overlap
+// window) or until it is revoked, whichever comes first. `rotatedAt` records
+// when the key was superseded so revocation stays auditable.
 model ApiKey {
-  id          String    @id @default(uuid())
-  name        String
-  ownerId     String    @map("owner_id")
-  keyHash     String    @unique @map("key_hash")
-  keyPrefix   String    @map("key_prefix")
-  scopes      String[]  @default(["read", "write"])
-  expiresAt   DateTime? @map("expires_at")
-  revokedAt   DateTime? @map("revoked_at")
-  revokedBy   String?   @map("revoked_by")
-  lastUsedAt  DateTime? @map("last_used_at")
-  createdAt   DateTime  @default(now()) @map("created_at")
+  id               String    @id @default(uuid())
+  name             String
+  ownerId          String    @map("owner_id")
+  keyHash          String    @unique @map("key_hash")
+  keyPrefix        String    @map("key_prefix")
+  scopes           String[]  @default(["read", "write"])
+  expiresAt        DateTime? @map("expires_at")
+  revokedAt        DateTime? @map("revoked_at")
+  revokedBy        String?   @map("revoked_by")
+  lastUsedAt       DateTime? @map("last_used_at")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  // #372 — rotation lineage and bounded overlap window.
+  predecessorId    String?   @map("predecessor_id")
+  predecessor      ApiKey?   @relation("ApiKeyRotation", fields: [predecessorId], references: [id], onDelete: SetNull)
+  successor        ApiKey?   @relation("ApiKeyRotation")
+  overlapExpiresAt DateTime? @map("overlap_expires_at")
+  rotatedAt        DateTime? @map("rotated_at")
 
   @@index([ownerId])
   @@index([keyHash])
+  @@index([predecessorId])
+  // Rotation sweeps expire predecessors by overlap window.
+  @@index([overlapExpiresAt])
   @@map("api_keys")
+}
+
+// #374 — Step-up verification challenges. A short-lived, single-use second
+// confirmation bound to a specific administrative action and the hash of its
+// payload. Only the nonce hash is stored; the raw nonce is returned once.
+model StepUpChallenge {
+  id         String    @id @default(uuid())
+  userId     String    @map("user_id")
+  action     String
+  payloadHash String   @map("payload_hash")
+  nonceHash  String    @unique @map("nonce_hash")
+  expiresAt  DateTime  @map("expires_at")
+  consumedAt DateTime? @map("consumed_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  @@index([userId, action])
+  @@index([expiresAt])
+  @@map("step_up_challenges")
+}
+
+// #373 — Policy-based administrative roles. Permissions are resolved centrally
+// from the role rather than from a single broad admin capability. Roles map to
+// the read / operational / config permission tiers.
+enum AdminRole {
+  READER
+  OPERATOR
+  CONFIG_ADMIN
+}
+
+// Administrative identity bound to an API key or user, carrying the role that
+// determines which admin routes it may call.
+model AdminIdentity {
+  id        String    @id @default(uuid())
+  userId    String    @map("user_id")
+  role      AdminRole @default(READER)
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+
+  @@unique([userId])
+  @@index([role])
+  @@map("admin_identities")
 }
 
 // PaymentIntent model for storing requested payment registrations. These are

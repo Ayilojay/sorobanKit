@@ -15,6 +15,7 @@ module.exports = (redisClient) => {
 
   const federationRoutes = require('./federationRoutes')(redisClient);
   const adminRoutes = require('./adminRoutes')(redisClient);
+  const stepUpRoutes = require('./stepUpRoutes')(redisClient);
 
   router.use('/', userRoutes);
   router.use('/', federationRoutes);
@@ -26,6 +27,7 @@ module.exports = (redisClient) => {
   router.use('/', webhookRoutes(redisClient));
   router.use('/', paymentRoutes(redisClient));
   router.use('/', statsRoutes(redisClient));
+  router.use('/', stepUpRoutes);
   router.use('/', adminRoutes);
 
   return router;

@@ -175,6 +175,10 @@ verification and review; they are never connected to production.
 - Update operational, API, contract, migration, or contributor documentation
   and generated artifacts where your change affects them.
 - Describe the validation you performed, including exact commands and results.
+- For changes touching admin permissions, step-up verification, or key
+  rotation, run the focused workspace tests for those areas plus the
+  applicable build, lint, typecheck, migration, and contract checks, and
+  report each command with its result.
 
 ## Questions
 

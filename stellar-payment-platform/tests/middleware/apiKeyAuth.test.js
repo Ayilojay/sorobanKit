@@ -124,4 +124,103 @@ describe('API key scope policy', () => {
     expect(preflightResponse.status).toBe(204);
     expect(mockValidateApiKey).not.toHaveBeenCalled();
   });
+
+  test('rejects a revoked key immediately', async () => {
+    mockValidateApiKey.mockResolvedValue({
+      id: 'key-1',
+      scopes: ['read'],
+      revokedAt: new Date('2024-01-01T00:00:00.000Z'),
+    });
+
+    const res = await request(buildApp())
+      .get('/api/v1/federation')
+      .set('X-Api-Key', 'revoked-key');
+
+    expect(res.status).toBe(401);
+    expect(res.body.error.code).toBe('UNAUTHENTICATED');
+    expect(res.body.error.retryable).toBe(false);
+  });
+
+  test('rejects a predecessor key once the overlap window has expired', async () => {
+    mockValidateApiKey.mockResolvedValue({
+      id: 'key-1',
+      scopes: ['read'],
+      overlapExpiresAt: new Date(Date.now() - 60_000),
+    });
+
+    const res = await request(buildApp())
+      .get('/api/v1/federation')
+      .set('X-Api-Key', 'expired-key');
+
+    expect(res.status).toBe(401);
+    expect(res.body.error.code).toBe('UNAUTHENTICATED');
+  });
+
+  test('accepts a predecessor key while the overlap window is open', async () => {
+    mockValidateApiKey.mockResolvedValue({
+      id: 'key-1',
+      scopes: ['read'],
+      overlapExpiresAt: new Date(Date.now() + 60_000),
+      successorKeyId: 'key-2',
+    });
+
+    const res = await request(buildApp())
+      .get('/api/v1/federation')
+      .set('X-Api-Key', 'rotating-key');
+
+    expect(res.status).toBe(200);
+  });
+
+  test('attaches lineage metadata to the authenticated request', async () => {
+    mockValidateApiKey.mockResolvedValue({
+      id: 'key-2',
+      scopes: ['read'],
+      predecessorKeyId: 'key-1',
+      successorKeyId: null,
+      overlapExpiresAt: new Date(Date.now() + 60_000),
+    });
+
+    let observed;
+    const app = express();
+    app.use(apiKeyAuthentication);
+    app.get('/api/v1/federation', (req, res) => {
+      observed = req.apiKey;
+      res.json({ ok: true });
+    });
+    app.use(buildErrorHandler(() => false));
+
+    const res = await request(app)
+      .get('/api/v1/federation')
+      .set('X-Api-Key', 'successor-key');
+
+    expect(res.status).toBe(200);
+    expect(observed).toMatchObject({
+      id: 'key-2',
+      predecessorKeyId: 'key-1',
+      successorKeyId: null,
+    });
+  });
+
+  test('falls back to the legacy ADMIN_API_KEY when no key is stored', async () => {
+    process.env.ADMIN_API_KEY = 'legacy-admin-secret';
+    mockValidateApiKey.mockResolvedValue(null);
+
+    const res = await request(buildApp())
+      .get('/api/v1/admin/stats')
+      .set('X-Api-Key', 'legacy-admin-secret');
+
+    expect(res.status).toBe(200);
+  });
+
+  test('rejects an incorrect legacy ADMIN_API_KEY', async () => {
+    process.env.ADMIN_API_KEY = 'legacy-admin-secret';
+    mockValidateApiKey.mockResolvedValue(null);
+
+    const res = await request(buildApp())
+      .get('/api/v1/admin/stats')
+      .set('X-Api-Key', 'wrong-secret');
+
+    expect(res.status).toBe(401);
+    expect(res.body.error.code).toBe('UNAUTHENTICATED');
+  });
 });

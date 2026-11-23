@@ -550,6 +550,241 @@ describe('API Key Management Endpoints', () => {
     });
   });
 
+  describe('Overlapping rotation with revocation auditability', () => {
+    const buildOldRecord = (overrides = {}) => ({
+      id: 'old-key-id',
+      name: 'Old Key',
+      ownerId: 'merchant@example.com',
+      keyHash: 'old-hash',
+      keyPrefix: 'sk_live_old',
+      scopes: ['read', 'write'],
+      expiresAt: null,
+      revokedAt: null,
+      revokedBy: null,
+      overlapExpiresAt: null,
+      predecessorId: null,
+      successorId: null,
+      createdAt: new Date(),
+      ...overrides,
+    });
+
+    it('discloses the raw replacement key exactly once on rotation', async () => {
+      const oldKeyId = 'old-key-id';
+      const newKeyId = 'new-key-id';
+      const overlapExpiresAt = new Date(Date.now() + 60 * 60 * 1000);
+
+      mockApiKeyFindUnique.mockResolvedValue(buildOldRecord({ id: oldKeyId }));
+      mockTransaction.mockResolvedValue([
+        {
+          id: newKeyId,
+          name: 'Old Key',
+          ownerId: 'merchant@example.com',
+          keyHash: 'new-hash',
+          keyPrefix: 'sk_live_new',
+          scopes: ['read', 'write'],
+          expiresAt: null,
+          predecessorId: oldKeyId,
+          successorId: null,
+          createdAt: new Date(),
+        },
+        {
+          id: oldKeyId,
+          revokedAt: null,
+          revokedBy: null,
+          overlapExpiresAt,
+          successorId: newKeyId,
+        },
+      ]);
+
+      const rotateRes = await request(app)
+        .post(`/auth/api-keys/${oldKeyId}/rotate`)
+        .set('Content-Type', 'application/json')
+        .send({});
+
+      expect(rotateRes.statusCode).toBe(201);
+      expect(rotateRes.body.data.new_key.key).toMatch(/^sk_live_/);
+      expect(rotateRes.body.data.new_key.predecessor_id).toBe(oldKeyId);
+      expect(rotateRes.body.data.old_key.successor_id).toBe(newKeyId);
+      expect(rotateRes.body.data.old_key.overlap_expires_at).toBeDefined();
+
+      // Subsequent reads must never re-expose raw key material.
+      mockApiKeyFindMany.mockResolvedValue([
+        {
+          id: newKeyId,
+          name: 'Old Key',
+          keyPrefix: 'sk_live_new',
+          ownerId: 'merchant@example.com',
+          scopes: ['read', 'write'],
+          expiresAt: null,
+          revokedAt: null,
+          revokedBy: null,
+          overlapExpiresAt: null,
+          predecessorId: oldKeyId,
+          successorId: null,
+          lastUsedAt: null,
+          createdAt: new Date(),
+        },
+      ]);
+
+      const listRes = await request(app)
+        .get('/auth/api-keys')
+        .query({ owner_id: 'merchant@example.com' });
+
+      expect(listRes.statusCode).toBe(200);
+      expect(listRes.body.data[0].key).toBeUndefined();
+      expect(listRes.body.data[0].keyHash).toBeUndefined();
+      expect(listRes.body.data[0].key_prefix).toBe('sk_live_new');
+      expect(listRes.body.data[0].predecessor_id).toBe(oldKeyId);
+    });
+
+    it('accepts the predecessor key before overlapExpiresAt and rejects it after', async () => {
+      const rawOldKey = `${KEY_PREFIX}overlapoldkey123456`;
+      const ownerId = 'merchant@example.com';
+
+      // Before the overlap window closes: predecessor still authenticates.
+      mockApiKeyFindUnique.mockResolvedValue(
+        buildOldRecord({
+          keyHash: hashKey(rawOldKey),
+          keyPrefix: rawOldKey.slice(0, 12),
+          overlapExpiresAt: new Date(Date.now() + 60 * 1000),
+          successorId: 'new-key-id',
+        }),
+      );
+
+      const beforeRes = await request(app)
+        .get('/auth/api-keys')
+        .set('X-Api-Key', rawOldKey)
+        .query({ owner_id: ownerId });
+
+      expect(beforeRes.statusCode).toBe(200);
+
+      // After the overlap window closes: predecessor is rejected immediately.
+      mockApiKeyFindUnique.mockResolvedValue(
+        buildOldRecord({
+          keyHash: hashKey(rawOldKey),
+          keyPrefix: rawOldKey.slice(0, 12),
+          overlapExpiresAt: new Date(Date.now() - 1000),
+          successorId: 'new-key-id',
+        }),
+      );
+
+      const afterRes = await request(app)
+        .get('/auth/api-keys')
+        .set('X-Api-Key', rawOldKey)
+        .query({ owner_id: ownerId });
+
+      expect(afterRes.statusCode).toBe(401);
+    });
+
+    it('rejects a revoked key immediately even inside its overlap window', async () => {
+      const rawKey = `${KEY_PREFIX}revokedoverlap12345`;
+      mockApiKeyFindUnique.mockResolvedValue(
+        buildOldRecord({
+          keyHash: hashKey(rawKey),
+          keyPrefix: rawKey.slice(0, 12),
+          revokedAt: new Date(),
+          revokedBy: 'security@example.com',
+          overlapExpiresAt: new Date(Date.now() + 60 * 60 * 1000),
+        }),
+      );
+
+      const res = await request(app)
+        .get('/auth/api-keys')
+        .set('X-Api-Key', rawKey)
+        .query({ owner_id: 'merchant@example.com' });
+
+      expect(res.statusCode).toBe(401);
+    });
+
+    it('records revocation audit metadata (revoked_by and revoked_at)', async () => {
+      const fakeId = 'key-to-revoke';
+      const revokedAt = new Date();
+      mockApiKeyFindUnique.mockResolvedValue(buildOldRecord({ id: fakeId }));
+      mockApiKeyUpdate.mockResolvedValue({
+        id: fakeId,
+        name: 'Old Key',
+        revokedAt,
+        revokedBy: 'security@example.com',
+      });
+
+      const res = await request(app)
+        .post(`/auth/api-keys/${fakeId}/revoke`)
+        .set('Content-Type', 'application/json')
+        .send({ revoked_by: 'security@example.com' });
+
+      expect(res.statusCode).toBe(200);
+      expect(mockApiKeyUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: fakeId }),
+          data: expect.objectContaining({
+            revokedAt: expect.any(Date),
+            revokedBy: 'security@example.com',
+          }),
+        }),
+      );
+    });
+
+    it('serializes concurrent rotations into a single successor chain', async () => {
+      const oldKeyId = 'old-key-id';
+      const overlapExpiresAt = new Date(Date.now() + 60 * 60 * 1000);
+
+      // First rotation wins; the second observes the key already rotated and
+      // must not create a second successor.
+      mockApiKeyFindUnique
+        .mockResolvedValueOnce(buildOldRecord({ id: oldKeyId }))
+        .mockResolvedValueOnce(
+          buildOldRecord({
+            id: oldKeyId,
+            overlapExpiresAt,
+            successorId: 'new-key-id-1',
+          }),
+        );
+
+      mockTransaction
+        .mockResolvedValueOnce([
+          {
+            id: 'new-key-id-1',
+            name: 'Old Key',
+            ownerId: 'merchant@example.com',
+            keyHash: 'new-hash-1',
+            keyPrefix: 'sk_live_new',
+            scopes: ['read', 'write'],
+            expiresAt: null,
+            predecessorId: oldKeyId,
+            successorId: null,
+            createdAt: new Date(),
+          },
+          {
+            id: oldKeyId,
+            revokedAt: null,
+            revokedBy: null,
+            overlapExpiresAt,
+            successorId: 'new-key-id-1',
+          },
+        ])
+        .mockResolvedValueOnce([]);
+
+      const [first, second] = await Promise.all([
+        request(app)
+          .post(`/auth/api-keys/${oldKeyId}/rotate`)
+          .set('Content-Type', 'application/json')
+          .send({}),
+        request(app)
+          .post(`/auth/api-keys/${oldKeyId}/rotate`)
+          .set('Content-Type', 'application/json')
+          .send({}),
+      ]);
+
+      const statuses = [first.statusCode, second.statusCode].sort();
+      expect(statuses).toEqual([201, 409]);
+
+      const winner = first.statusCode === 201 ? first : second;
+      expect(winner.body.data.old_key.successor_id).toBe('new-key-id-1');
+      expect(winner.body.data.new_key.predecessor_id).toBe(oldKeyId);
+      expect(mockTransaction).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('Seeded API key (TEST_ADMIN_API_KEY)', () => {
     // Skip when the seed has not run (e.g. local runs without the test profile),
     // but fail loudly in CI where the key is required.

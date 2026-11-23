@@ -64,7 +64,18 @@ const apiKeyAuthentication = async (req, res, next) => {
       process.env.ADMIN_API_KEY &&
       safeCompareHash(hashKey(apiKey), hashKey(process.env.ADMIN_API_KEY))
     ) {
-      req.apiKeyRecord = { id: 'legacy-admin-key', scopes: ['admin'] };
+      // Compatibility fallback: the static ADMIN_API_KEY env var predates the
+      // managed key store and cannot participate in rotation. It is marked so
+      // downstream auditing can distinguish it from managed key records.
+      req.apiKeyRecord = {
+        id: 'legacy-admin-key',
+        scopes: ['admin'],
+        source: 'legacy-env',
+        legacy: true,
+        predecessorId: null,
+        successorId: null,
+        overlapExpiresAt: null,
+      };
       return next();
     }
 
@@ -72,7 +83,26 @@ const apiKeyAuthentication = async (req, res, next) => {
     if (!record) {
       return next(new ApiError('UNAUTHENTICATED', 'Invalid or expired API key'));
     }
-    req.apiKeyRecord = record;
+
+    // validateApiKey already filters revoked keys and keys past their overlap
+    // window; re-check here so a stale or custom validator cannot leak them.
+    if (record.revokedAt) {
+      return next(new ApiError('UNAUTHENTICATED', 'Invalid or expired API key'));
+    }
+    if (record.overlapExpiresAt && Date.parse(record.overlapExpiresAt) <= Date.now()) {
+      return next(new ApiError('UNAUTHENTICATED', 'Invalid or expired API key'));
+    }
+
+    // Attach rotation lineage so downstream handlers and audit logs can trace
+    // predecessor/successor relationships across an overlapping rotation.
+    req.apiKeyRecord = {
+      ...record,
+      source: record.source || 'managed',
+      legacy: false,
+      predecessorId: record.predecessorId ?? null,
+      successorId: record.successorId ?? null,
+      overlapExpiresAt: record.overlapExpiresAt ?? null,
+    };
     return next();
   } catch (err) {
     return next(

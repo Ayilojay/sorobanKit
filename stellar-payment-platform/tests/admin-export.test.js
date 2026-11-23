@@ -88,6 +88,10 @@ const makeRecord = (i) => ({
 describe('GET /admin/export', () => {
   beforeEach(() => {
     mockFindMany.mockReset();
+    mockIssueStepUpChallenge.mockReset();
+    mockConsumeStepUpChallenge.mockReset();
+    mockRecordStepUpAudit.mockReset();
+    mockRecordStepUpAudit.mockResolvedValue(undefined);
   });
 
   it('returns 401 without API key', async () => {

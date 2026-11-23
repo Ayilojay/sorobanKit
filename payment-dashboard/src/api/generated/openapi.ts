@@ -234,6 +234,180 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/admin/api-keys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List API keys */
+        get: operations["listApiKeys"];
+        put?: never;
+        /**
+         * Issue an API key
+         * @description Issues a new API key. The raw key material is returned exactly once in the response and is never retrievable afterwards; only a redacted fingerprint is exposed by subsequent reads.
+         */
+        post: operations["createApiKey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/api-keys/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description API key identifier */
+                id: components["parameters"]["ApiKeyIdParam"];
+            };
+            cookie?: never;
+        };
+        /** Get an API key (redacted) */
+        get: operations["getApiKey"];
+        put?: never;
+        post?: never;
+        /**
+         * Revoke an API key
+         * @description Immediately revokes the API key. Revocation takes effect synchronously and is recorded in the audit log with the acting principal and reason.
+         */
+        delete: operations["revokeApiKey"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/api-keys/{id}/rotate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description API key identifier */
+                id: components["parameters"]["ApiKeyIdParam"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rotate an API key
+         * @description Issues a successor key and links it to the predecessor. The predecessor remains valid for the bounded overlap window (`overlapSeconds`) and is revoked automatically when the window elapses. The raw successor key material is returned exactly once. Rotation is idempotent per `Idempotency-Key` and audited.
+         */
+        post: operations["rotateApiKey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/step-up": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Request a step-up verification challenge
+         * @description Creates a short-lived, single-use step-up challenge bound to the requested action and the SHA-256 hash of the request payload. The challenge must be confirmed before the protected action is executed.
+         */
+        post: operations["requestStepUpChallenge"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/step-up/{challengeId}/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Step-up challenge identifier */
+                challengeId: components["parameters"]["StepUpChallengeIdParam"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Confirm a step-up verification challenge
+         * @description Confirms the challenge with the second factor. On success the challenge is consumed (single use) and the returned token authorizes exactly one execution of the bound action and payload hash until it expires.
+         */
+        post: operations["confirmStepUpChallenge"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/contracts/{contractId}/upgrade": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Contract identifier */
+                contractId: components["parameters"]["ContractIdParam"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Upgrade a contract
+         * @description High-impact action requiring a valid step-up token bound to this action and the payload hash. The upgrade is audited with the step-up evidence.
+         */
+        post: operations["upgradeContract"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/treasury": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Change treasury configuration
+         * @description High-impact action requiring a valid step-up token bound to this action and the payload hash. The change is audited with the step-up evidence.
+         */
+        post: operations["updateTreasury"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/exports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start a bulk export
+         * @description High-impact action requiring a valid step-up token bound to this action and the payload hash. The export request is audited with the step-up evidence.
+         */
+        post: operations["createBulkExport"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -845,6 +1019,306 @@ export interface operations {
                     "application/json": components["schemas"]["StatsRefreshStatus"];
                 };
             };
+        };
+    };
+    listApiKeys: {
+        parameters: {
+            query?: {
+                /** @description Page number (1-based) */
+                page?: components["parameters"]["PageParam"];
+                /** @description Maximum number of items per page */
+                limit?: components["parameters"]["LimitParam"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A paginated list of API keys (redacted) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiKeyList"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+        };
+    };
+    createApiKey: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Idempotency key for safe retries */
+                "Idempotency-Key"?: string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ApiKeyInput"];
+            };
+        };
+        responses: {
+            /** @description Key issued; raw material returned once */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiKeySecret"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            409: components["responses"]["Conflict"];
+        };
+    };
+    getApiKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description API key identifier */
+                id: components["parameters"]["ApiKeyIdParam"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Redacted API key metadata */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiKey"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    revokeApiKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description API key identifier */
+                id: components["parameters"]["ApiKeyIdParam"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["RevokeApiKeyInput"];
+            };
+        };
+        responses: {
+            /** @description Key revoked immediately */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+        };
+    };
+    rotateApiKey: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Idempotency key for safe retries */
+                "Idempotency-Key"?: string;
+            };
+            path: {
+                /** @description API key identifier */
+                id: components["parameters"]["ApiKeyIdParam"];
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["RotateApiKeyInput"];
+            };
+        };
+        responses: {
+            /** @description Successor key issued; raw material returned once */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiKeySecret"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+        };
+    };
+    requestStepUpChallenge: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StepUpChallengeInput"];
+            };
+        };
+        responses: {
+            /** @description Challenge created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpChallenge"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+        };
+    };
+    confirmStepUpChallenge: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Step-up challenge identifier */
+                challengeId: components["parameters"]["StepUpChallengeIdParam"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StepUpConfirmationInput"];
+            };
+        };
+        responses: {
+            /** @description Challenge confirmed; single-use token issued */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepUpToken"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            410: components["responses"]["Gone"];
+        };
+    };
+    upgradeContract: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Contract identifier */
+                contractId: components["parameters"]["ContractIdParam"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ContractUpgradeInput"];
+            };
+        };
+        responses: {
+            /** @description Contract upgrade accepted */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StatsRefreshStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            410: components["responses"]["Gone"];
+        };
+    };
+    updateTreasury: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TreasuryUpdateInput"];
+            };
+        };
+        responses: {
+            /** @description Treasury configuration updated */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Stats"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            409: components["responses"]["Conflict"];
+            410: components["responses"]["Gone"];
+        };
+    };
+    createBulkExport: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BulkExportInput"];
+            };
+        };
+        responses: {
+            /** @description Export queued */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BulkExport"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            409: components["responses"]["Conflict"];
+            410: components["responses"]["Gone"];
         };
     };
 }

@@ -96,7 +96,7 @@ describe('E2E: Admin Flow', () => {
   });
 
   it('should allow admin to block a user and export users', async () => {
-    // 1. Block User
+    // 1. Block User (operational permission)
     let res = await request(app)
       .post('/api/v1/admin/block')
       .set('x-api-key', 'e2e-admin-key')
@@ -106,7 +106,7 @@ describe('E2E: Admin Flow', () => {
     expect(res.body.address).toBe('GABC123XYZ456789ADMIN');
     expect(res.body.flaggedAt).toBeDefined();
 
-    // 2. Export Payments
+    // 2. Export Payments (read permission)
     res = await request(app)
       .get('/api/v1/admin/export?format=json')
       .set('x-api-key', 'e2e-admin-key');

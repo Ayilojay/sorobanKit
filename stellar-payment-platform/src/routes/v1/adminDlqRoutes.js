@@ -3,6 +3,11 @@
 const { asyncHandler } = require('../../middleware/asyncHandler');
 const { ApiError } = require('../../errors');
 const { listDLQEntries, replayFromDLQ } = require('../../webhookWorker');
+const {
+  ADMIN_PERMISSIONS,
+  requirePermission,
+  auditAdminAction,
+} = require('../../middleware/adminPermissions');
 
 // Bounds for the queue-health summary so labels stay portable across
 // environments (small test fixtures and large production queues alike).
@@ -80,6 +85,7 @@ module.exports = (router, adminAuth, getPrisma) => {
   router.get(
     '/admin/dlq',
     adminAuth,
+    requirePermission(ADMIN_PERMISSIONS.READ),
     asyncHandler(async (req, res, next) => {
       const { prisma } = getPrisma();
       const username =
@@ -301,12 +307,20 @@ module.exports = (router, adminAuth, getPrisma) => {
   router.post(
     '/admin/dlq/:id/replay',
     adminAuth,
+    requirePermission(ADMIN_PERMISSIONS.OPERATIONAL),
     asyncHandler(async (req, res, next) => {
       const { prisma } = getPrisma();
       const id =
         typeof req.params?.id === 'string' ? req.params.id.trim() : '';
 
       if (!id) {
+        await auditAdminAction(req, {
+          action: 'dlq.replay',
+          permission: ADMIN_PERMISSIONS.OPERATIONAL,
+          outcome: 'failure',
+          reason: 'invalid_input',
+          target: null,
+        });
         return next(new ApiError('INVALID_INPUT', 'DLQ entry id is required in URL path.'));
       }
 
@@ -315,11 +329,32 @@ module.exports = (router, adminAuth, getPrisma) => {
 
         if (!result.ok) {
           const code = result.error === 'DLQ entry not found' ? 'NOT_FOUND' : 'CONFLICT';
+          await auditAdminAction(req, {
+            action: 'dlq.replay',
+            permission: ADMIN_PERMISSIONS.OPERATIONAL,
+            outcome: 'failure',
+            reason: result.error,
+            target: id,
+          });
           return next(new ApiError(code, result.error));
         }
 
+        await auditAdminAction(req, {
+          action: 'dlq.replay',
+          permission: ADMIN_PERMISSIONS.OPERATIONAL,
+          outcome: 'success',
+          target: id,
+        });
+
         return res.status(200).json({ ok: true, replayed: true });
       } catch (error) {
+        await auditAdminAction(req, {
+          action: 'dlq.replay',
+          permission: ADMIN_PERMISSIONS.OPERATIONAL,
+          outcome: 'failure',
+          reason: error && error.message ? error.message : 'unknown_error',
+          target: id,
+        });
         return next(error);
       }
     }),
