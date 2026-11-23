@@ -12,7 +12,7 @@
       }
     ]
   },
-  "description": "Monitors Prisma connection pool health, HTTP request performance, and system resources for the Stellar Tags payment platform.",
+  "description": "Monitors Prisma connection pool health, HTTP request performance, system resources, service-level objectives (registration, federation lookup, payment latency/availability), ledger confirmation lag, and reconciliation backlog for the Stellar Tags payment platform.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -579,6 +579,268 @@
     {
       "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
+      "id": 20,
+      "title": "Service Level Objectives (SLOs)",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Rolling 28-day availability SLI per user-facing flow: successful requests / total requests. Excludes client errors (4xx) and requests marked as excluded (health checks, synthetic probes). Objectives: registration >= 99.9%, federation lookup >= 99.9%, payment >= 99.95%.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.999 },
+              { "color": "green", "value": 0.9995 }
+            ]
+          },
+          "unit": "percentunit",
+          "min": 0.99,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "id": 21,
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum by (flow) (rate(stellar_tags_sli_requests_total{instance=~\"$instance\",excluded=\"false\",outcome=\"success\"}[28d])) / sum by (flow) (rate(stellar_tags_sli_requests_total{instance=~\"$instance\",excluded=\"false\",outcome=~\"success|failure\"}[28d]))",
+          "legendFormat": "{{flow}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Availability SLI (28d rolling) - registration / federation_lookup / payment",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Rolling 28-day latency SLI per user-facing flow: fraction of non-excluded requests served within the flow's latency objective. Objectives: registration p99 <= 500ms, federation lookup p99 <= 300ms, payment p99 <= 1000ms.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.99 },
+              { "color": "green", "value": 0.995 }
+            ]
+          },
+          "unit": "percentunit",
+          "min": 0.9,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "id": 22,
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum by (flow) (rate(stellar_tags_sli_latency_bucket{instance=~\"$instance\",excluded=\"false\",within_objective=\"true\"}[28d])) / sum by (flow) (rate(stellar_tags_sli_latency_bucket{instance=~\"$instance\",excluded=\"false\",le=\"+Inf\"}[28d]))",
+          "legendFormat": "{{flow}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Latency SLI (28d rolling) - within objective",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Remaining error budget (1 - consumed) per flow over the 28-day rolling window. Budget consumption = (1 - SLI) / (1 - objective). Alerting rules fire at 50% (ticket), 75% (page secondary), and 100% (page primary) consumption.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.25 },
+              { "color": "green", "value": 0.5 }
+            ]
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "id": 23,
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "1 - ((1 - (sum by (flow) (rate(stellar_tags_sli_requests_total{instance=~\"$instance\",excluded=\"false\",outcome=\"success\"}[28d])) / sum by (flow) (rate(stellar_tags_sli_requests_total{instance=~\"$instance\",excluded=\"false\",outcome=~\"success|failure\"}[28d])))) / (1 - on(flow) group_left() stellar_tags_slo_objective{instance=~\"$instance\",sli=\"availability\"}))",
+          "legendFormat": "{{flow}} availability budget",
+          "refId": "A"
+        }
+      ],
+      "title": "Error Budget Remaining (28d rolling)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Submission-to-finality latency percentiles by network (p50/p95/p99), derived from the ledger confirmation lag histogram. Alert thresholds are tied to the documented payment objective (p99 <= 60s mainnet, <= 120s testnet).",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Seconds",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "dashed" }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 30 },
+              { "color": "red", "value": 60 }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "id": 24,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "right" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.50, sum by (le, network) (rate(stellar_tags_ledger_confirmation_lag_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{network}}",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.95, sum by (le, network) (rate(stellar_tags_ledger_confirmation_lag_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{network}}",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.99, sum by (le, network) (rate(stellar_tags_ledger_confirmation_lag_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{network}}",
+          "refId": "C"
+        }
+      ],
+      "title": "Submission-to-Finality Latency by Network (p50 / p95 / p99)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Age of the oldest unreconciled payment intent by network. Alert thresholds: warning at 15m, critical at 30m (mainnet) / 60m (testnet). Labels are limited to network and status; no user identifiers are included.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 900 },
+              { "color": "red", "value": 1800 }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "id": 25,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "max by (network) (stellar_tags_reconciliation_oldest_unreconciled_intent_age_seconds{instance=~\"$instance\"})",
+          "legendFormat": "{{network}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Oldest Unreconciled Intent Age by Network (alert: > 15m warn / > 30m crit)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Current reconciliation backlog: number of unreconciled payment intents by network. Tied to the reconciliation objective (backlog drained within 30 minutes).",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 10 },
+              { "color": "red", "value": 50 }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
+      "id": 26,
+      "options": {
+        "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum by (network) (stellar_tags_reconciliation_unreconciled_intents{instance=~\"$instance\"})",
+          "legendFormat": "{{network}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Reconciliation Backlog by Network",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 56 },
       "id": 14,
       "title": "Alerts",
       "type": "row"
@@ -600,7 +862,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 57 },
       "id": 15,
       "options": {
         "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" },
@@ -634,7 +896,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 57 },
       "id": 16,
       "options": {
         "colorMode": "background",
@@ -657,7 +919,7 @@
     }
   ],
   "schemaVersion": 39,
-  "tags": ["stellar-tags", "prisma", "database", "monitoring"],
+  "tags": ["stellar-tags", "prisma", "database", "monitoring", "slo", "ledger", "reconciliation"],
   "templating": {
     "list": [
       {
@@ -697,7 +959,7 @@
   "time": { "from": "now-6h", "to": "now" },
   "timepicker": {},
   "timezone": "browser",
-  "title": "Stellar Tags - DB Pool Monitoring",
+  "title": "Stellar Tags - Platform Monitoring & SLOs",
   "uid": "stellar-tags-db-pool",
   "version": 1,
   "weekStart": ""

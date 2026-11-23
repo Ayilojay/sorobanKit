@@ -9,6 +9,8 @@ const { ApiError } = require('../../errors');
 const { logger } = require('../../logger');
 const { asyncHandler } = require('../../middleware/asyncHandler');
 const { fetchFirstPaymentsPage, wrapPageWithBreaker } = require('../../services/stellarService');
+const { requireStepUp } = require('../../services/stepUpService');
+const { hashPayload } = require('../../services/payloadHash');
 
 const router = express.Router();
 
@@ -19,6 +21,14 @@ const PAGE_SIZE = 200;
 // A hard page ceiling stops a single request streaming forever.
 const MAX_PAGES = Number(process.env.EXPORT_MAX_PAGES) || 500;
 
+// Stellar amounts carry at most 7 decimal places (one stroop). Horizon returns
+// them as decimal strings, but we normalise defensively so the export never
+// emits float artefacts or excess precision.
+const STELLAR_AMOUNT_PRECISION = 7;
+
+// The network is part of a transaction's identity: the same hash can exist on
+// testnet and mainnet. It is appended as a trailing column so existing column
+// positions stay stable for downstream consumers.
 const COLUMNS = [
   'id',
   'created_at',
@@ -30,7 +40,43 @@ const COLUMNS = [
   'asset_code',
   'asset_issuer',
   'transaction_hash',
+  'network',
 ];
+
+/**
+ * Normalises a monetary amount to the asset's precision as a plain decimal
+ * string. Non-numeric or missing values are passed through untouched so the
+ * caller's escaping rules still apply.
+ */
+const normalizeAmount = (value, precision = STELLAR_AMOUNT_PRECISION) => {
+  if (value === null || value === undefined || value === '') return value;
+
+  const text = String(value).trim();
+  if (!/^-?\d+(\.\d+)?$/.test(text)) return value;
+
+  const negative = text.startsWith('-');
+  const unsigned = negative ? text.slice(1) : text;
+  const [whole, fraction = ''] = unsigned.split('.');
+
+  // Round half-up at the target precision, working on the digit string so no
+  // binary floating point is ever involved.
+  let digits = fraction.padEnd(precision + 1, '0');
+  const roundUp = Number(digits[precision]) >= 5;
+  digits = digits.slice(0, precision);
+
+  let wholePart = whole.replace(/^0+(?=\d)/, '') || '0';
+  let fractionPart = digits.replace(/0+$/, '');
+
+  if (roundUp) {
+    const combined = `${wholePart}${digits}`;
+    const incremented = (BigInt(combined) + 1n).toString().padStart(combined.length, '0');
+    wholePart = incremented.slice(0, incremented.length - precision) || '0';
+    fractionPart = incremented.slice(incremented.length - precision).replace(/0+$/, '');
+  }
+
+  const result = fractionPart ? `${wholePart}.${fractionPart}` : wholePart;
+  return negative && result !== '0' ? `-${result}` : result;
+};
 
 /**
  * Escapes one CSV field per RFC 4180: wrap in quotes when the value contains a
@@ -75,11 +121,14 @@ const normalize = (record) => {
     type: record.type,
     from,
     to,
-    amount: record.type === 'create_account' ? record.starting_balance : record.amount,
+    amount: normalizeAmount(
+      record.type === 'create_account' ? record.starting_balance : record.amount,
+    ),
     asset_type: record.type === 'create_account' ? 'native' : record.asset_type,
     asset_code: record.asset_code,
     asset_issuer: record.asset_issuer,
     transaction_hash: record.transaction_hash,
+    network: record.network || record.network_passphrase || null,
   };
 };
 
@@ -123,6 +172,26 @@ router.get(
     if (!StrKey.isValidEd25519PublicKey(address)) {
       return next(new ApiError('INVALID_INPUT', 'Invalid Stellar account'));
     }
+
+    // Bulk exports are a high-impact action: require a short-lived, single-use
+    // step-up challenge bound to this action and to the normalized query.
+    // Missing, expired, reused or mismatched challenges are rejected here,
+    // before any Horizon call or response bytes are produced.
+    const payloadHash = hashPayload({ address, order: order || 'asc' });
+    try {
+      await requireStepUp(req, { action: STEP_UP_ACTION, payloadHash });
+    } catch (err) {
+      logger.warn(
+        `[Correlation ID: ${req.correlationId}] Step-up verification failed for ` +
+          `${STEP_UP_ACTION} (payload ${payloadHash}): ${err?.code || 'UNKNOWN'}`,
+      );
+      return next(err);
+    }
+
+    logger.info(
+      `[Correlation ID: ${req.correlationId}] Step-up verified for ${STEP_UP_ACTION} ` +
+        `(payload ${payloadHash})`,
+    );
 
     let page;
     try {
@@ -215,6 +284,9 @@ router.get(
 );
 
 module.exports = router;
+module.exports.STEP_UP_ACTION = STEP_UP_ACTION;
 module.exports.COLUMNS = COLUMNS;
 module.exports.escapeField = escapeField;
 module.exports.normalize = normalize;
+module.exports.normalizeAmount = normalizeAmount;
+module.exports.STELLAR_AMOUNT_PRECISION = STELLAR_AMOUNT_PRECISION;

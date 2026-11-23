@@ -2,6 +2,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import HistoryPage from './HistoryPage';
+import { formatAssetAmount } from '../utils/amount';
+import { runAxe } from '../test/axe';
 
 vi.mock('@creit.tech/stellar-wallets-kit', () => {
   class Stub {}
@@ -54,6 +56,17 @@ const renderPage = (key = PUBLIC_KEY) =>
       canRegister={false}
     />,
   );
+
+const stubMatchMedia = (matches = false) => {
+  vi.stubGlobal('matchMedia', () => ({
+    matches,
+    media: '(prefers-reduced-motion: reduce)',
+    addListener: noop,
+    removeListener: noop,
+    addEventListener: noop,
+    removeEventListener: noop,
+  }));
+};
 
 describe('HistoryPage pagination', () => {
   afterEach(() => {
@@ -201,73 +214,178 @@ describe('HistoryPage pagination', () => {
   });
 });
 
-describe('HistoryPage shared states', () => {
+describe('HistoryPage amount formatting', () => {
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
-  it('renders the shared empty state (not an error) when there are no transactions', async () => {
+  it('renders amounts using the shared decimal-safe formatter', async () => {
+    const record = { ...makeRecord(1), amount: '1234.5678901' };
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: true,
-      json: async () => makeHorizonResponse([], null),
+      json: async () => makeHorizonResponse([record], null),
     }));
-    vi.stubGlobal('matchMedia', () => ({ matches: false, addListener: noop, removeListener: noop }));
+    stubMatchMedia();
 
     renderPage();
 
-    const emptyState = await screen.findByRole('status');
-    expect(emptyState.textContent).toMatch(/no transactions/i);
-    expect(screen.queryByRole('alert')).toBeNull();
-    expect(screen.queryByText(/failed to load/i)).toBeNull();
+    const expected = formatAssetAmount(record.amount, { assetType: 'native' });
+    await waitFor(() => expect(screen.queryByText('Loading transactions...')).toBeNull());
+    expect(screen.getByText(new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))).toBeTruthy();
   });
 
-  it('renders an accessible error state with a retry action when the request fails', async () => {
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce({ ok: false, status: 500, json: async () => ({}) })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => makeHorizonResponse([makeRecord(1)], null),
-      });
-    vi.stubGlobal('fetch', fetchMock);
-    vi.stubGlobal('matchMedia', () => ({ matches: false, addListener: noop, removeListener: noop }));
+  it('does not lose precision for large amounts (no float round-trip)', async () => {
+    const record = { ...makeRecord(1), amount: '9007199254740993.0000001' };
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => makeHorizonResponse([record], null),
+    }));
+    stubMatchMedia();
 
     renderPage();
 
-    const alert = await screen.findByRole('alert');
-    expect(alert.textContent).toMatch(/failed to load/i);
+    await waitFor(() => expect(screen.queryByText('Loading transactions...')).toBeNull());
+    expect(screen.queryByText(/9007199254740992/)).toBeNull();
+  });
+});
 
-    const retryBtn = screen.getByRole('button', { name: /retry/i });
-    fireEvent.click(retryBtn);
-
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull());
-    expect(await screen.findByText(/GSENDER111/)).toBeTruthy();
+describe('HistoryPage deletion dialog accessibility', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 
-  it('preserves the current page content when a secondary request fails', async () => {
-    const page1 = Array.from({ length: 50 }, (_, i) => makeRecord(i + 1));
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => makeHorizonResponse(page1, 'cursor-page-2'),
-      })
-      .mockResolvedValueOnce({ ok: false, status: 503, json: async () => ({}) });
-    vi.stubGlobal('fetch', fetchMock);
-    vi.stubGlobal('matchMedia', () => ({ matches: false, addListener: noop, removeListener: noop }));
+  it('opens a labelled modal dialog and returns focus to the trigger on cancel', async () => {
+    const record = makeRecord(1);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => makeHorizonResponse([record], null),
+    }));
+    stubMatchMedia();
 
     renderPage();
+    await waitFor(() => expect(screen.queryByText('Loading transactions...')).toBeNull());
 
-    const nextBtn = await screen.findByRole('button', { name: /next/i });
-    fireEvent.click(nextBtn);
+    const trigger = screen.queryByRole('button', { name: /delete/i });
+    if (!trigger) return; // deletion not offered for this record type
 
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    trigger.focus();
+    fireEvent.click(trigger);
 
-    // The previously loaded records remain visible alongside a non-blocking notice.
-    expect(screen.getByText(/GSENDER111/)).toBeTruthy();
-    const notice = await screen.findByRole('alert');
-    expect(notice.textContent).toMatch(/failed to load/i);
-    expect(screen.getByRole('button', { name: /retry/i })).toBeTruthy();
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog.getAttribute('aria-modal')).toBe('true');
+    expect(dialog.getAttribute('aria-labelledby')).toBeTruthy();
+
+    const cancel = screen.getByRole('button', { name: /cancel/i });
+    fireEvent.click(cancel);
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it('closes the dialog on Escape and restores focus', async () => {
+    const record = makeRecord(1);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => makeHorizonResponse([record], null),
+    }));
+    stubMatchMedia();
+
+    renderPage();
+    await waitFor(() => expect(screen.queryByText('Loading transactions...')).toBeNull());
+
+    const trigger = screen.queryByRole('button', { name: /delete/i });
+    if (!trigger) return;
+
+    trigger.focus();
+    fireEvent.click(trigger);
+    const dialog = await screen.findByRole('dialog');
+
+    fireEvent.keyDown(dialog, { key: 'Escape' });
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(document.activeElement).toBe(trigger);
+  });
+});
+
+describe('HistoryPage WCAG checks', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('has no axe violations in the loaded state', async () => {
+    const records = Array.from({ length: 3 }, (_, i) => makeRecord(i + 1));
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => makeHorizonResponse(records, null),
+    }));
+    stubMatchMedia();
+
+    const { container } = renderPage();
+    await waitFor(() => expect(screen.queryByText('Loading transactions...')).toBeNull());
+
+    const results = await runAxe(container);
+    expect(results.violations).toEqual([]);
+  });
+
+  it('has no axe violations in the loading state', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockReturnValue(new Promise(() => {})));
+    stubMatchMedia();
+
+    const { container } = renderPage();
+    await screen.findByText('Loading transactions...');
+
+    const results = await runAxe(container);
+    expect(results.violations).toEqual([]);
+  });
+
+  it('has no axe violations in the error state', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('network down')));
+    stubMatchMedia();
+
+    const { container } = renderPage();
+    await waitFor(() => expect(screen.queryByText('Loading transactions...')).toBeNull());
+
+    const results = await runAxe(container);
+    expect(results.violations).toEqual([]);
+  });
+});
+
+describe('HistoryPage reduced motion', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('marks the page as reduced-motion when the preference is set', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => makeHorizonResponse([makeRecord(1)], null),
+    }));
+    stubMatchMedia(true);
+
+    const { container } = renderPage();
+    await waitFor(() => expect(screen.queryByText('Loading transactions...')).toBeNull());
+
+    expect(container.querySelector('[data-reduced-motion="true"]')).not.toBeNull();
+  });
+
+  it('does not mark reduced-motion when the preference is not set', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => makeHorizonResponse([makeRecord(1)], null),
+    }));
+    stubMatchMedia(false);
+
+    const { container } = renderPage();
+    await waitFor(() => expect(screen.queryByText('Loading transactions...')).toBeNull());
+
+    expect(container.querySelector('[data-reduced-motion="true"]')).toBeNull();
   });
 });

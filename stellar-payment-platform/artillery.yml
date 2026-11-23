@@ -1,25 +1,103 @@
 config:
   target: "{{ $processEnvironment.TARGET_URL || 'http://localhost:5000' }}"
+  # Sustained-load benchmark for critical user journeys (#479).
+  # Mixes registration, federation lookup, payment initiation and history
+  # under a realistic arrival rate, ramping up, sustaining, then ramping down.
   phases:
-    - duration: 60
-      arrivalCount: 50
-      name: "Load test read-only endpoints over 60 seconds"
+    - duration: 30
+      arrivalRate: 2
+      rampTo: 10
+      name: "Warm-up ramp to sustained arrival rate"
+    - duration: 180
+      arrivalRate: 10
+      name: "Sustained load at 10 req/s for 3 minutes"
+    - duration: 30
+      arrivalRate: 10
+      rampTo: 2
+      name: "Cool-down ramp"
+  # Capture tail latency (p95/p99), error rates and throughput per phase.
+  ensure:
+    thresholds:
+      - http.response_time.p95: 500
+      - http.response_time.p99: 1500
+      - http.codes.500: 0
+  # Emit per-interval metrics so memory, pool usage and upstream calls can be
+  # correlated over time (see scripts/benchmark-report.js).
+  plugins:
+    metrics-by-endpoint:
+      useOnlyRequestNames: true
+  variables:
+    registrationPrefix:
+      - "bench-user"
+    federationDomain:
+      - "example.com"
+    paymentAsset:
+      - "XLM"
+      - "USDC"
 
 scenarios:
-  - name: "Read-only endpoints scenario"
+  - name: "Registration journey"
+    weight: 20
+    flow:
+      - post:
+          url: "/register"
+          name: "POST /register"
+          json:
+            username: "{{ registrationPrefix }}-{{ $uuid }}"
+            email: "{{ registrationPrefix }}-{{ $uuid }}@example.com"
+            password: "Benchmark-Passw0rd!"
+          capture:
+            - json: "$.userId"
+              as: "userId"
+          expect:
+            - statusCode: 201
+
+  - name: "Federation lookup journey"
+    weight: 30
+    flow:
+      - get:
+          url: "/federation?q=bench-user*{{ federationDomain }}&type=name"
+          name: "GET /federation"
+          expect:
+            - statusCode: [200, 404]
+      - get:
+          url: "/lookup?search=bench-user"
+          name: "GET /lookup"
+          expect:
+            - statusCode: [200, 404]
+
+  - name: "Payment initiation journey"
+    weight: 30
+    flow:
+      - post:
+          url: "/payments"
+          name: "POST /payments"
+          headers:
+            x-api-key: "{{ $processEnvironment.ADMIN_API_KEY }}"
+          json:
+            destination: "GBENCHMARKDESTINATIONADDRESS000000000000000000000000000"
+            amount: "1.0000000"
+            asset: "{{ paymentAsset }}"
+            memo: "bench-{{ $uuid }}"
+          expect:
+            - statusCode: [201, 202, 400, 402]
+
+  - name: "History journey"
+    weight: 20
+    flow:
+      - get:
+          url: "/transactions?limit=20"
+          name: "GET /transactions"
+          headers:
+            x-api-key: "{{ $processEnvironment.ADMIN_API_KEY }}"
+          expect:
+            - statusCode: [200, 401]
+
+  - name: "Health probe"
+    weight: 5
     flow:
       - get:
           url: "/health"
-      - get:
-          url: "/federation"
-      - get:
-          url: "/lookup?search=test"
-      - get:
-          url: "/users"
-
-  - name: "Authenticated admin export scenario"
-    flow:
-      - get:
-          url: "/transactions/export"
-          headers:
-            x-api-key: "{{ $processEnvironment.ADMIN_API_KEY }}"
+          name: "GET /health"
+          expect:
+            - statusCode: 200

@@ -273,3 +273,78 @@ describe('errors module', () => {
     });
   });
 });
+
+describe('dashboard catalog contract', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  test('every known code yields a catalog entry with code, message and retryable', () => {
+    for (const code of Object.keys(ERROR_CODES)) {
+      const body = errorBody(code, 'message');
+      expect(body.success).toBe(false);
+      expect(body.error.code).toBe(code);
+      expect(typeof body.error.message).toBe('string');
+      expect(body.error.message.length).toBeGreaterThan(0);
+      expect(typeof body.error.retryable).toBe('boolean');
+    }
+  });
+
+  test('an unknown code degrades to the safe INTERNAL_ERROR entry', () => {
+    const body = errorBody('TOTALLY_UNKNOWN_CODE', 'message');
+    expect(body.error.code).toBe('INTERNAL_ERROR');
+    expect(body.error.retryable).toBe(false);
+    expect(JSON.stringify(body)).not.toContain('TOTALLY_UNKNOWN_CODE');
+  });
+
+  test('unknown codes never leak server internals through the envelope', async () => {
+    const app = buildApp(() => {
+      throw new Error('postgres://user:hunter2@db:5432/prod');
+    });
+    const res = await request(app).get('/boom');
+
+    expect(res.status).toBe(500);
+    expect(res.body.error.code).toBe('INTERNAL_ERROR');
+    expect(res.body.error.message).toBe('Internal Server Error');
+    expect(JSON.stringify(res.body)).not.toContain('hunter2');
+    expect(JSON.stringify(res.body)).not.toContain('postgres://');
+  });
+
+  test('5xx responses carry a reference_id the dashboard can surface', async () => {
+    const app = buildApp((req, res, next) => next(new ApiError('INTERNAL_ERROR')));
+    const res = await request(app).get('/boom');
+
+    expect(res.status).toBe(500);
+    expect(res.body.reference_id).toEqual(expect.any(String));
+    expect(res.body.reference_id.length).toBeGreaterThan(0);
+    expect(res.body.correlation_id).toBe('test-correlation-id');
+  });
+
+  test('retryable flags match the catalog for representative codes', async () => {
+    const cases = [
+      ['VALIDATION_FAILED', false],
+      ['NOT_FOUND', false],
+      ['CONFLICT', false],
+      ['SERVICE_UNAVAILABLE', true],
+      ['UPSTREAM_ERROR', true],
+    ];
+
+    for (const [code, retryable] of cases) {
+      const app = buildApp((req, res, next) => next(new ApiError(code)));
+      const res = await request(app).get('/boom');
+      expect(res.body.error.code).toBe(code);
+      expect(res.body.error.retryable).toBe(retryable);
+    }
+  });
+
+  test('concurrent failures each get a distinct reference_id', async () => {
+    const app = buildApp(() => {
+      throw new Error('kaboom');
+    });
+    const responses = await Promise.all(
+      Array.from({ length: 5 }, () => request(app).get('/boom')),
+    );
+
+    const ids = responses.map((res) => res.body.reference_id);
+    expect(ids.every((id) => typeof id === 'string' && id.length > 0)).toBe(true);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+});

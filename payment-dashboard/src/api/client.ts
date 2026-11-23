@@ -1,8 +1,70 @@
 import createClient from 'openapi-fetch';
 import type { paths } from './generated/openapi';
 import { API_BASE } from './baseUrl';
+import {
+  normalizeApiError,
+  type NormalizedApiError,
+} from './errorCatalog';
 
-const transport: typeof fetch = (input, init) => globalThis.fetch(input, init);
+/**
+ * Error thrown when a mutation is attempted while the dashboard is offline.
+ *
+ * The dashboard is strictly read-only while connectivity is lost: mutations are
+ * never queued, retried, or persisted. Callers should surface this error to the
+ * user and disable the corresponding action until connectivity returns.
+ */
+export class OfflineMutationError extends Error {
+  readonly method: string;
+  readonly url: string;
+
+  constructor(method: string, url: string) {
+    super(
+      `Cannot perform ${method} ${url} while offline. The dashboard is read-only during connectivity loss; mutations are not queued.`,
+    );
+    this.name = 'OfflineMutationError';
+    this.method = method;
+    this.url = url;
+  }
+}
+
+/**
+ * Returns true when the browser reports that it is offline.
+ *
+ * Falls back to `false` in non-browser environments (e.g. tests without a
+ * `navigator`, or SSR) so that requests are not blocked unexpectedly.
+ */
+export const isOffline = (): boolean => {
+  if (typeof navigator === 'undefined') return false;
+  if (typeof navigator.onLine !== 'boolean') return false;
+  return navigator.onLine === false;
+};
+
+const MUTATION_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+const resolveMethod = (input: RequestInfo | URL, init?: RequestInit): string => {
+  if (init?.method) return init.method.toUpperCase();
+  if (typeof Request !== 'undefined' && input instanceof Request) {
+    return input.method.toUpperCase();
+  }
+  return 'GET';
+};
+
+const resolveUrl = (input: RequestInfo | URL): string => {
+  if (typeof input === 'string') return input;
+  if (typeof URL !== 'undefined' && input instanceof URL) return input.toString();
+  if (typeof Request !== 'undefined' && input instanceof Request) return input.url;
+  return String(input);
+};
+
+const transport: typeof fetch = (input, init) => {
+  const method = resolveMethod(input, init);
+  if (MUTATION_METHODS.has(method) && isOffline()) {
+    // Reject immediately; never queue or retry mutations while offline.
+    return Promise.reject(new OfflineMutationError(method, resolveUrl(input)));
+  }
+  return globalThis.fetch(input, init);
+};
+
 const createTransport = (baseUrl: string) =>
   createClient<paths>({ baseUrl, fetch: transport });
 
@@ -11,138 +73,97 @@ export const apiClient = createTransport(API_BASE);
 const clientForBase = (baseUrl: string) =>
   baseUrl === API_BASE ? apiClient : createTransport(baseUrl);
 
-export const getHealth = (signal?: AbortSignal, baseUrl = API_BASE) =>
-  clientForBase(baseUrl).GET('/health', { signal });
+/**
+ * Normalize an openapi-fetch result into a discriminated union so views can
+ * render actionable, accessible recovery guidance without touching raw
+ * server payloads.
+ */
+export type ApiResult<T> =
+  | { ok: true; data: T; response: Response }
+  | { ok: false; error: NormalizedApiError; response: Response };
 
-export const getFederation = (q: string, type: 'id' | 'name' = 'name') =>
-  apiClient.GET('/federation', { params: { query: { q, type } } });
+const normalize = <T>(
+  result: { data?: T; error?: unknown; response: Response },
+): ApiResult<T> => {
+  if (result.error !== undefined || !result.response.ok) {
+    return {
+      ok: false,
+      error: normalizeApiError(result.error, result.response),
+      response: result.response,
+    };
+  }
+  return { ok: true, data: result.data as T, response: result.response };
+};
 
 export const getLookup = (address: string) =>
   apiClient.GET('/lookup', { params: { query: { address } } });
 
 /**
- * Authorization credential used to access a payment detail.
+ * Freshness metadata for cached, read-only data shown by the dashboard.
  *
- * This value is intentionally kept out of URLs (no bearer tokens or signing
- * material in shareable deep links). It is supplied via the `Authorization`
- * header only, and callers are responsible for obtaining it out-of-band
- * (e.g. from session storage) rather than from the route.
+ * Only eligible non-secret data is cached. Signing material and financial
+ * operations are never persisted. Views use this accessor to render freshness
+ * indicators (e.g. "last updated X ago" / "stale").
  */
-export type PaymentAuth = {
-  /** Bearer token or equivalent credential. Sent as `Authorization: Bearer <token>`. */
-  token: string;
+export interface FreshnessMetadata {
+  /** Whether the data was served from cache rather than a live response. */
+  fromCache: boolean;
+  /** Epoch milliseconds when the cached data was captured, if known. */
+  cachedAt: number | null;
+  /** Whether the dashboard is currently offline. */
+  offline: boolean;
+  /** Age of the cached data in milliseconds, if known. */
+  ageMs: number | null;
+}
+
+const freshnessListeners = new Set<(meta: FreshnessMetadata) => void>();
+
+let lastCachedAt: number | null = null;
+
+const buildFreshness = (): FreshnessMetadata => {
+  const offline = isOffline();
+  const ageMs = lastCachedAt === null ? null : Date.now() - lastCachedAt;
+  return {
+    fromCache: offline,
+    cachedAt: lastCachedAt,
+    offline,
+    ageMs,
+  };
 };
 
 /**
- * Discriminated error kinds surfaced by {@link getPayment} so the detail view
- * can render distinct states without inspecting raw HTTP responses.
+ * Records that eligible non-secret data was captured for offline display.
+ * Called by the caching layer when a successful read is stored.
  */
-export type PaymentErrorKind =
-  | 'unauthorized' // 401
-  | 'forbidden' // 403
-  | 'not-found' // 404
-  | 'expired' // 410
-  | 'network' // transport failure / abort
-  | 'unknown'; // any other non-2xx
-
-export type PaymentError = {
-  kind: PaymentErrorKind;
-  status?: number;
-  message: string;
+export const recordCacheWrite = (cachedAt: number = Date.now()): void => {
+  lastCachedAt = cachedAt;
+  const meta = buildFreshness();
+  freshnessListeners.forEach((listener) => listener(meta));
 };
-
-export type PaymentResult =
-  | { ok: true; data: paths['/payments/{id}']['get']['responses'][200]['content']['application/json'] }
-  | { ok: false; error: PaymentError };
-
-const classifyStatus = (status: number): PaymentErrorKind => {
-  switch (status) {
-    case 401:
-      return 'unauthorized';
-    case 403:
-      return 'forbidden';
-    case 404:
-      return 'not-found';
-    case 410:
-      return 'expired';
-    default:
-      return 'unknown';
-  }
-};
-
-const defaultMessage = (kind: PaymentErrorKind): string => {
-  switch (kind) {
-    case 'unauthorized':
-      return 'Authentication required to view this payment.';
-    case 'forbidden':
-      return 'You are not authorized to view this payment.';
-    case 'not-found':
-      return 'Payment not found.';
-    case 'expired':
-      return 'This payment link has expired.';
-    case 'network':
-      return 'Unable to reach the payment service.';
-    default:
-      return 'Unable to load payment details.';
-  }
-};
-
-const isAbortError = (err: unknown): boolean =>
-  typeof err === 'object' &&
-  err !== null &&
-  (err as { name?: string }).name === 'AbortError';
 
 /**
- * Fetch a single payment's details by id.
- *
- * Authorization is passed via the `Authorization` header only; the payment id
- * is the sole value that belongs in a shareable URL. Errors are normalized into
- * a {@link PaymentResult} so the view can distinguish 401/403, 404, and
- * 410/expired responses (plus network/abort and unknown failures).
+ * Returns the current freshness metadata used by views to render indicators.
  */
-export const getPayment = async (
-  id: string,
-  auth?: PaymentAuth,
-  signal?: AbortSignal,
-  baseUrl = API_BASE,
-): Promise<PaymentResult> => {
-  const headers: Record<string, string> = {};
-  if (auth?.token) {
-    headers.Authorization = `Bearer ${auth.token}`;
-  }
+export const getFreshness = (): FreshnessMetadata => buildFreshness();
 
-  try {
-    const { data, error, response } = await clientForBase(baseUrl).GET(
-      '/payments/{id}',
-      {
-        params: { path: { id } },
-        headers,
-        signal,
-      },
-    );
-
-    if (response.ok && data !== undefined) {
-      return { ok: true, data };
-    }
-
-    const status = response.status;
-    const kind = classifyStatus(status);
-    const message =
-      (error as { message?: string } | undefined)?.message ??
-      defaultMessage(kind);
-
-    return { ok: false, error: { kind, status, message } };
-  } catch (err) {
-    if (isAbortError(err)) {
-      // Re-throw aborts so callers can ignore them as they do elsewhere.
-      throw err;
-    }
-    return {
-      ok: false,
-      error: {
-        kind: 'network',
-        message: defaultMessage('network'),
-      },
-    };
-  }
+/**
+ * Subscribes to freshness changes (cache writes and connectivity transitions).
+ * Returns an unsubscribe function.
+ */
+export const subscribeFreshness = (
+  listener: (meta: FreshnessMetadata) => void,
+): (() => void) => {
+  freshnessListeners.add(listener);
+  return () => {
+    freshnessListeners.delete(listener);
+  };
 };
+
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+  const notify = () => {
+    const meta = buildFreshness();
+    freshnessListeners.forEach((listener) => listener(meta));
+  };
+  window.addEventListener('online', notify);
+  window.addEventListener('offline', notify);
+}

@@ -157,6 +157,63 @@ authenticated before rate limiting and must have `read` for GET/HEAD routes,
 401; authenticated keys missing the required scope return 403. The legacy
 `ADMIN_API_KEY` remains an admin-scoped credential.
 
+#### API key rotation
+
+Keys are rotated with a bounded overlap so clients can switch over without a
+window of failed requests:
+
+1. Create the replacement key. The response is the **only** time the raw key
+   material is returned; it is stored hashed and every later read (list,
+   detail, audit log) shows a redacted form such as `sk_live_…4f2a`.
+2. Both the predecessor and the successor authenticate during the overlap
+   window. Each key carries `predecessorId` / `successorId` metadata so an
+   operator can see which key replaced which.
+3. Revoking the predecessor is immediate: the next request presenting it is
+   rejected with 401, regardless of the overlap window. Revocation is recorded
+   in the audit trail with the acting credential, timestamp, and reason.
+
+The overlap window is bounded — once it expires the predecessor stops
+authenticating even if it was never explicitly revoked. Rotate before the
+window closes, or issue a new successor.
+
+#### Administrative roles
+
+`/admin/*` routes no longer share one broad capability. Each route declares the
+permission it needs, and credentials are granted one or more roles:
+
+| Role | Grants |
+| --- | --- |
+| `admin:read` | Read-only admin endpoints (stats, audit logs, exports) |
+| `admin:operate` | Operational actions (retries, queue drains, revocations) |
+| `admin:configure` | Configuration-changing actions (treasury, limits, upgrades) |
+
+A request to an admin route without the declared permission returns 403 with
+the missing permission named in the error details. Sensitive decisions
+(role changes, revocations, configuration changes) are written to the audit
+trail with the acting credential, the permission that authorized the action,
+and the request payload hash.
+
+#### Step-up verification
+
+High-impact administrative actions require a second, short-lived confirmation
+bound to the action and the payload:
+
+- **Covered actions:** contract upgrades, treasury changes, and bulk exports.
+- **How it works:** request a step-up challenge for the action, then repeat the
+  request with the returned single-use token. The token is bound to the action
+  name and a hash of the request payload, so it cannot be replayed against a
+  different action or a modified body.
+- **Expiry:** tokens are short-lived (minutes, not hours) and single-use. An
+  expired or already-consumed token fails with 401 and the request is not
+  performed.
+- **Mismatch:** a token presented with a different action or payload hash fails
+  with 403 and is not consumed, so the operator can retry with the correct
+  payload.
+- **Audit evidence:** successful step-ups record the challenge ID, the action,
+  the payload hash, and the acting credential in the audit trail; failures are
+  recorded with the failure reason.
+=======
+
 ### Server
 
 The server uses **PostgreSQL** as its database, accessed through the
@@ -260,6 +317,68 @@ Use the active one as `X-Api-Key`; the revoked one is there to exercise the
 rejection path. The script refuses to run against a non-local `DATABASE_URL`
 unless `SEED_ALLOW_REMOTE=1` is set.
 
+### Preview environments
+
+Every pull request can be deployed to an isolated, ephemeral environment
+containing the API and the dashboard. Previews are for review and manual
+testing only; they are never a staging or production substitute.
+
+- **Isolation.** Each preview gets its own database and its own Redis instance
+  (or key prefix). Nothing is shared with `dev`, `test`, staging, or
+  production, so a destructive test in a preview cannot touch real data.
+- **Synthetic data only.** Previews are seeded with the deterministic fixture
+  set from `npm run db:seed` (see [Seed data](#seed-data)). No production dump
+  is ever restored into a preview.
+- **No production credentials.** Preview services receive only preview-scoped
+  secrets (their own `DATABASE_URL`, `REDIS_URL`, and a throwaway
+  `ADMIN_API_KEY`). Production keys, treasury keys, and mainnet signing
+  credentials are never injected; previews run against testnet.
+- **TTL.** A preview is torn down automatically after its TTL expires (default
+  72 hours, refreshed on new pushes) even if the PR stays open, so abandoned
+  environments cannot accumulate cost.
+- **Auditable cleanup.** Closing or merging the PR triggers teardown. Each
+  teardown deletes the environment's database, Redis namespace, and deployed
+  services, and writes an audit record (environment id, PR number, actor,
+  reason, timestamp) so cleanup can be verified after the fact. Teardown is
+  idempotent: re-running it on an already-removed environment is a no-op that
+  still records the attempt.
+
+Preview URLs are posted as a comment on the PR. If a preview fails to become
+ready, the comment reports the failing probe (see
+[Health probes](#health-probes)) instead of a URL.
+
+### Health probes
+
+The server exposes three probes with deliberately different semantics. Point
+each orchestrator check at the matching endpoint — using one probe for another
+purpose causes either premature restarts or traffic to unready instances.
+
+| Endpoint | Question it answers | Failing response |
+| --- | --- | --- |
+| `GET /health/startup` | Has initialization finished? | `503` until startup completes |
+| `GET /health/live` | Is the process alive and not deadlocked? | `503` when the event loop is stalled |
+| `GET /health/ready` | Should this instance receive traffic? | `503` when a routing dependency is down |
+
+- **Startup** covers one-time initialization: database connectivity, applying
+  or verifying migrations, and warming caches. It returns `503` until that work
+  completes and `200` afterwards. Configure the startup probe with a generous
+  `failureThreshold` and `periodSeconds` so a slow-but-progressing boot is not
+  killed; the startup probe is what protects slow starts, not liveness.
+- **Liveness** answers only "is this process wedged?". It does **not** check
+  the database, Redis, or Horizon: a dependency outage must not restart healthy
+  processes. It fails when the event loop is blocked past a threshold (a
+  deadlock), which is the one condition a restart can fix.
+- **Readiness** gates routing. It checks the dependencies a request actually
+  needs — PostgreSQL and Redis — and returns `503` while any is unavailable or
+  while startup is still in progress, so the load balancer stops sending
+  traffic. Horizon is reported but does not affect readiness, because most
+  routes serve from the database and a Horizon outage should degrade specific
+  endpoints rather than remove every instance from rotation.
+
+`GET /health` remains the aggregate, human-facing view of all dependencies
+(see [`GET /health`](#get-health)); the three probes above are the
+machine-facing contract.
+
 ### Render deployment
 
 The repository includes a [render.yaml](render.yaml) blueprint for the backend API and its PostgreSQL database. When you deploy from Render, import the blueprint or create the service from the repo so `DATABASE_URL` is injected automatically from the managed database.
@@ -322,6 +441,62 @@ import { get_refund_balance } from '@stellar-tags/payment-router';
 
 Importing one method no longer pulls the rest of the binding module into the
 Vite bundle.
+
+## Software Bill of Materials (SBOM)
+
+Every releasable artifact ships with a CycloneDX JSON inventory so consumers can
+audit exactly what went into a release and tie it back to the source revision
+and the artifact digest.
+
+### What gets an SBOM
+
+| Artifact | Produced by | SBOM covers |
+| --- | --- | --- |
+| Node packages (`stellar-payment-platform`, `payment-dashboard`, `packages/types`) | `npm run sbom` in each package | `package-lock.json` dependency tree |
+| Rust contract WASM (`payment_router`) | `cargo build --release --target wasm32-unknown-unknown` | `Cargo.lock` crates plus the compiled `.wasm` |
+| Container images (backend, frontend) | `docker build` | OS packages and the bundled Node/Rust artifacts |
+
+### Format and naming
+
+SBOMs are emitted as **CycloneDX JSON** (`bomFormat: "CycloneDX"`, spec version
+1.5) and named:
+
+```text
+<artifact>-<version>-<sha>.cdx.json
+```
+
+`<artifact>` is the package or image name, `<version>` is the release version
+(or `0.0.0-dev` for unreleased builds), and `<sha>` is the first 12 characters
+of the artifact digest — the npm tarball SHA-512 for Node packages, the WASM
+SHA-256 for the contract, and the image digest for containers. Each document
+records the source revision in `metadata.component.properties` as
+`vcs.revision` (the full git commit SHA) alongside `vcs.url`.
+
+### Attaching SBOMs to releases
+
+The release workflow runs `scripts/generate-sbom.sh` for each artifact and
+uploads the resulting `*.cdx.json` files as assets on the GitHub Release, next
+to the artifact they describe. A release is not considered complete until every
+artifact has a matching SBOM.
+
+### Generating and verifying locally
+
+```bash
+# Generate SBOMs for all artifacts into ./sbom/
+./scripts/generate-sbom.sh --all --out ./sbom
+
+# Generate for a single artifact
+./scripts/generate-sbom.sh --artifact payment_router --out ./sbom
+
+# Verify an SBOM matches a source revision and artifact digest
+./scripts/generate-sbom.sh --verify ./sbom/payment_router-1.2.0-<sha>.cdx.json \
+  --revision "$(git rev-parse HEAD)" \
+  --digest "sha256:<artifact-sha256>"
+```
+
+`--verify` recomputes the artifact digest, compares it with the digest recorded
+in the SBOM, and checks that `vcs.revision` matches the supplied revision. It
+exits non-zero on any mismatch, so it can be used as a release gate or in CI.
 
 ## Webhook signature verification
 
@@ -386,6 +561,8 @@ For Render deployments, make sure the web service has `DATABASE_URL` set in its 
 
 ### CI / GitHub Actions Secrets
 - `TESTNET_API_URL` - **(Required for `deploy-testnet.yml`)** Base URL of the deployed testnet API service (e.g., `https://api.example.com`). Used by the post-deploy health check step (`${TESTNET_API_URL}/health`) to verify an HTTP `200` response and `status: "up"` before marking the deployment workflow green.
+- `PREVIEW_TTL_HOURS` - (Optional) Lifetime of a pull-request preview environment before automatic teardown. Defaults to `72`.
+- `PREVIEW_SEED` - (Optional) Seed used for a preview's synthetic data. Defaults to the fixed seed used by `npm run db:seed`, so previews are reproducible.
 
 ## Logging
 
@@ -638,14 +815,124 @@ Streams transaction records from the database as a CSV or NDJSON download for ex
   - `limit` (optional) – positive integer row limit. When omitted, only the server cap applies.
   - `startDate` (optional) – `YYYY-MM-DD` inclusive lower bound on `createdAt`.
   - `endDate` (optional) – `YYYY-MM-DD` inclusive upper bound on `createdAt`.
-- **Headers:** `x-api-key` (required) – must match `ADMIN_API_KEY`.
+- **Headers:** `x-api-key` (required) – must hold the `admin:read` permission.
 - **Returns:** `text/csv` or `application/x-ndjson` with a `Content-Disposition: attachment` header.
 - **Status Codes:**
   - `200 OK`: Stream started.
   - `400 Bad Request`: Invalid date format or `startDate` after `endDate`.
   - `401 Unauthorized`: Missing or invalid API key.
+  - `403 Forbidden`: The key lacks `admin:read`, or a required step-up token is
+    missing, expired, already used, or bound to a different action/payload.
+
+Bulk exports are a high-impact action: they require a step-up token bound to
+the export's action and payload hash (see
+[Step-up verification](#step-up-verification)).
 
 Records are fetched at most 500 at a time and written directly to the response. The export stops at the lower of `limit` and `ADMIN_EXPORT_MAX_ROWS` (default `1000000`). Configure the cap as a positive integer no greater than `2147483647`; invalid configuration fails closed with HTTP 500. Invalid limits return HTTP 400. A bounded one-row probe checks for additional matching records before streaming starts, so truncated downloads include `X-Truncated: true`; exports ending exactly at the boundary omit that header. JSON output remains newline-delimited (one object per line).
+
+Large exports can also be run as durable background jobs — see
+[Background admin export jobs](#background-admin-export-jobs) below.
+
+### Background admin export jobs
+
+Exports that would take longer than a request should live are run as durable
+background jobs. A job is created, persisted, and processed by a bounded worker
+pool; the caller polls for progress, can cancel it, and downloads the finished
+artifact from a short-lived link.
+
+#### Creating a job
+
+```bash
+curl -X POST "http://localhost:5000/admin/export/jobs" \
+  -H "x-api-key: $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"format":"csv","startDate":"2026-01-01","endDate":"2026-01-31"}'
+```
+
+The body accepts the same `format`, `limit`, `startDate` and `endDate` fields as
+`GET /admin/export`. The response is `202 Accepted` with the job record:
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": "c1f0…",
+    "status": "queued",
+    "format": "csv",
+    "progress": { "rowsWritten": 0, "percent": 0 },
+    "createdAt": "2026-01-31T12:00:00.000Z",
+    "expiresAt": null
+  }
+}
+```
+
+Jobs are owned by the credential that created them. Polling, cancelling or
+downloading a job with a different credential returns `404 Not Found` rather
+than `403`, so job IDs cannot be probed for existence.
+
+#### Polling progress
+
+```bash
+curl "http://localhost:5000/admin/export/jobs/c1f0…" -H "x-api-key: $ADMIN_API_KEY"
+```
+
+`status` moves `queued` → `running` → `succeeded` | `failed` | `cancelled`.
+While running, `progress.rowsWritten` and `progress.percent` are updated as rows
+are written. A failed job carries `error.code` and `error.message`; the stack
+stays in the server log under the job's reference ID.
+
+#### Cancelling
+
+```bash
+curl -X DELETE "http://localhost:5000/admin/export/jobs/c1f0…" -H "x-api-key: $ADMIN_API_KEY"
+```
+
+Cancellation is cooperative: a queued job is cancelled immediately, and a
+running job stops at the next chunk boundary, discards its partial artifact and
+settles as `cancelled`. Cancelling a job that already finished returns `409
+Conflict`.
+
+#### Downloading
+
+```bash
+curl -L "http://localhost:5000/admin/export/jobs/c1f0…/download" -H "x-api-key: $ADMIN_API_KEY"
+```
+
+The download endpoint streams the artifact from disk with the same content type
+and `Content-Disposition` as the synchronous export. Artifacts expire
+`EXPORT_ARTIFACT_TTL` seconds after the job succeeds; after that the endpoint
+returns `410 Gone` and the file is deleted by the cleanup sweep. Re-running the
+export means creating a new job.
+
+#### Storage and worker configuration
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `EXPORT_ARTIFACT_DIR` | `stellar-payment-platform/var/exports` | Directory where finished artifacts are written. Must be writable by the server process and shared by every instance that may serve downloads. |
+| `EXPORT_ARTIFACT_TTL` | `86400` (24h) | Seconds a finished artifact stays downloadable before it is deleted. |
+| `EXPORT_WORKER_CONCURRENCY` | `2` | Maximum number of export jobs processed at once per instance. Queued jobs wait until a slot frees. |
+
+Workers stream rows straight to the artifact file, so memory use stays flat
+regardless of export size — the same bounded paging as the synchronous export,
+with no full result set or full CSV held in memory. Because jobs are persisted,
+a restart resumes `queued` jobs and marks `running` jobs `failed` so they can be
+retried; artifacts already on disk survive restarts until their TTL elapses.
+
+#### Monitoring
+
+Background exports add these metrics to `GET /metrics`:
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `export_jobs_queued` | gauge | Jobs waiting for a worker slot |
+| `export_jobs_running` | gauge | Jobs currently being processed |
+| `export_jobs_completed_total` | counter | Jobs finished, by `status` (`succeeded`, `failed`, `cancelled`) |
+| `export_job_duration_seconds` | histogram | Time from job start to terminal status |
+| `export_job_rows_written_total` | counter | Rows written across finished jobs |
+
+Alert on a sustained `export_jobs_queued` above `EXPORT_WORKER_CONCURRENCY` (the
+queue is not draining) and on any rise in `export_jobs_completed_total{status="failed"}`.
+=======
 
 ### `GET /admin/stats/routing`
 Returns historical payment routing statistics and aggregated volumes, fees, and transaction counts grouped by day, week, or month.
@@ -656,12 +943,13 @@ Returns historical payment routing statistics and aggregated volumes, fees, and 
   - `interval` (optional) – Alias for `groupBy`.
   - `weekStart` (optional) – Only meaningful with `groupBy=week`. `'monday'` (default) or `'sunday'`.
   - `assetCode` (optional) – Filter transactions by asset code (e.g., `XLM`, `USDC`).
-- **Headers:** `x-api-key` (required) – must match `ADMIN_API_KEY` (or pass `api_key` in query params).
+- **Headers:** `x-api-key` (required) – must hold the `admin:read` permission (or pass `api_key` in query params).
 - **Returns:** JSON object containing `interval`, `startDate`, `endDate`, `summary` (`total_volume`, `total_fees`, `total_count`), and `data` array of periodic records (`[{ period, volume, fees, count }]`).
 - **Status Codes:**
   - `200 OK`: Statistics retrieved successfully.
   - `400 Bad Request`: Invalid date format, `startDate` after `endDate`, invalid `groupBy`, or invalid `weekStart`.
   - `401 Unauthorized`: Missing or invalid API key.
+  - `403 Forbidden`: The key lacks `admin:read`.
 
 **Week boundaries:** with `groupBy=week`, periods are ISO weeks starting on
 Monday by default. Pass `weekStart=sunday` to group into Sunday-based weeks
@@ -672,13 +960,14 @@ weeks under each convention (e.g. a Sunday) will appear in different periods.
 Retrieves recent immutable audit trail records for mutating admin actions (`POST`, `PUT`, `DELETE`, `PATCH`).
 - **Query Parameters:**
   - `limit` (optional) – Maximum number of records to return (1-100, default 50).
-- **Headers:** `x-api-key` (required) – must match `ADMIN_API_KEY` (or pass `api_key` in query params).
+- **Headers:** `x-api-key` (required) – must hold the `admin:read` permission (or pass `api_key` in query params).
 - **Returns:** JSON object with `success: true`, `count`, and `data` array of audit records containing `action`, `method`, `path`, `userId`, `ipAddress`, `userAgent`, `statusCode`, `payload` (sensitive data redacted), and `createdAt`.
 - **Status Codes:**
   - `200 OK`: Audit logs retrieved successfully.
   - `401 Unauthorized`: Missing or invalid API key.
+  - `403 Forbidden`: The key lacks `admin:read`.
 
-Mutating admin requests are intercepted by `auditLogMiddleware` and recorded asynchronously upon response completion. Sensitive keys (`password`, `secret`, `apiKey`, `token`, `signature`, `privateKey`, `seed`) are deeply redacted before persistence.
+Mutating admin requests are intercepted by `auditLogMiddleware` and recorded asynchronously upon response completion. Sensitive keys (`password`, `secret`, `apiKey`, `token`, `signature`, `privateKey`, `seed`) are deeply redacted before persistence. Raw API key material is never persisted or returned after issuance; audit records for key rotation and revocation carry the redacted key identifier, the acting credential, and the reason. Step-up decisions record the challenge ID, action, payload hash, and outcome.
 
 ### `GET /metrics`
 
@@ -814,6 +1103,101 @@ Upon successful deployment, the tool automatically updates the contract address 
 - `payment-dashboard/.env` (`VITE_CONTRACT_ID`, `CONTRACT_ID`)
 - `payment-dashboard/src/views/shared.js` (`CONTRACT_ID`)
 
+## Release pipeline
+
+The release pipeline builds **one immutable artifact per commit** and promotes
+that exact artifact through staging and production. Nothing is rebuilt between
+environments: promotion is by content digest, so what was verified in staging is
+byte-for-byte what runs in production.
+
+### Build once, promote by digest
+
+```bash
+# Build the artifact once and record its digest (writes dist/release/artifact.json)
+node scripts/release.js build --artifact-dir dist/release
+
+# Promote the recorded digest to staging, then production
+node scripts/release.js promote --artifact-dir dist/release --environment staging --approver alice --identity ci@example.com
+node scripts/release.js promote --artifact-dir dist/release --environment production --approver bob --identity ci@example.com
+```
+
+- The artifact digest (SHA-256 over the artifact contents) is computed at build
+  time and stored in `artifact.json`. `promote` refuses to run if the artifact
+  on disk no longer matches the recorded digest, so a mutated artifact cannot be
+  promoted.
+- Each promotion records the environment, digest, approver, deployer identity,
+  and timestamp in the release ledger (`dist/release/releases.json`). Production
+  promotion requires an explicit `--approver`; staging does not.
+- Environment configuration (contract IDs, API base URLs, network, secrets) is
+  **external to the image** and supplied per environment at deploy time. The
+  same artifact is deployed everywhere; only the injected configuration differs.
+
+### Rollback
+
+```bash
+# Roll back an environment to a previously verified digest
+node scripts/release.js rollback --artifact-dir dist/release --environment production --to <digest> --approver bob --identity ci@example.com
+```
+
+Rollback only accepts a digest that was previously promoted to that environment
+and is still present in the ledger, so you cannot roll back to an unverified
+build. The rollback itself is recorded as a new ledger entry.
+
+### Migration compatibility preflight
+
+Before promoting to production, run the schema compatibility preflight. It
+applies the candidate migrations against both the **old** and **new**
+application versions and reports any statement that would break old replicas
+still serving traffic:
+
+```bash
+node scripts/migration-preflight.js --migrations-dir stellar-payment-platform/prisma/migrations --report dist/release/migration-preflight.json
+```
+
+- Destructive contract phases (dropping or renaming columns/tables, narrowing
+  types) are **blocked** while old replicas may still be running. The preflight
+  exits non-zero and lists each incompatible statement before deployment.
+- Run it in CI and attach the JSON report to the release; a failing preflight
+  fails the pipeline.
+
+### Coordinated release manifest
+
+The release manifest records the package versions, WASM hash, interface schema,
+supported networks, and migration level for a release, and is validated during
+deployment preflight:
+
+```bash
+# Generate the manifest from the current workspace
+node scripts/release-manifest.js generate --out dist/release/manifest.json
+
+# Validate a manifest (rejects mismatched dashboard/client/contract combinations)
+node scripts/release-manifest.js validate --manifest dist/release/manifest.json
+```
+
+Validation fails when the dashboard's expected contract interface version, the
+client bindings, and the contract's `interface_version` disagree, or when the
+recorded WASM hash does not match the built artifact. Run `validate` as part of
+deployment preflight so a mismatched combination never reaches an environment.
+
+### Post-deployment smoke checks
+
+After deploying to testnet, run the smoke checks against the deployed contract.
+They verify the on-chain WASM hash, network, admin state, and read interface,
+using bounded, non-duplicating test transactions, and publish the results with
+the deployment ID:
+
+```bash
+node scripts/smoke-test.js --network testnet --contract-id C... --expected-wasm-hash <sha256> --deployment-id <id> --out dist/release/smoke.json
+```
+
+- The smoke checks are idempotent: test transactions are bounded and keyed so a
+  rerun does not duplicate state.
+- Results (pass/fail per check plus the deployment ID) are written to the
+  `--out` file and printed to the log, so the deployment record links to the
+  verification that ran against it.
+- A failed check exits non-zero and fails the deployment workflow.
+=======
+
 ### Routing and governance semantics
 
 `route_payments` is all-or-nothing. The first failing item returns its stable
@@ -830,6 +1214,54 @@ the nominee must call `accept_admin` within seven days, and the current admin
 remains active until acceptance. The current admin can cancel a nomination;
 anyone can clear it after expiry. `emergency_freeze` remains immediate, while
 unfreezing requires a matured `Unfreeze` action.
+
+## Security and threat model
+
+Assets, trust boundaries, attacker capabilities, mitigations and owners across
+wallet signing, admin actions, webhooks, persistence, RPC and contract
+governance are documented in
+[docs/security/threat-model.md](docs/security/threat-model.md). Read it before
+changing anything that crosses one of those boundaries (signature
+verification, admin credentials, webhook delivery, database access, Horizon
+calls, or timelocked contract actions).
+
+Operational response procedures live alongside it:
+
+- [docs/runbooks/payment-failures.md](docs/runbooks/payment-failures.md) —
+  delayed settlement, webhook backlog, contract pause events.
+- [docs/runbooks/infrastructure-failures.md](docs/runbooks/infrastructure-failures.md) —
+  database failover and dependency outages.
+
+Each runbook lists diagnostics, escalation, rollback and dashboard links, and
+only uses commands that are safe to run against the affected environment.
+
+## Local bootstrap
+
+`npm run bootstrap` (from the repository root) is the supported one-command
+local setup. It validates the required tool versions, starts the isolated
+`dev` Compose stack, applies migrations, seeds the database and reports
+readiness. It refuses to run against non-local resources and exits with an
+actionable message when a prerequisite is missing.
+
+```bash
+npm run bootstrap          # full setup
+npm run bootstrap -- --check   # validate prerequisites only
+```
+
+## Compatibility tests
+
+Contract and API compatibility is covered by focused suites that must pass
+before merging changes to the contract ABI, the OpenAPI document, or the
+generated bindings:
+
+```bash
+# contract ABI / interface compatibility
+cd payment_router && cargo test
+
+# API contract and generated-binding drift
+cd stellar-payment-platform && npm run test:contract
+cd payment-dashboard && npm run api:check
+```
 
 ## Architecture notes
 
@@ -866,3 +1298,12 @@ See [LICENSE](LICENSE).
 
 <!-- handsoff-issue-414 -->
 - #414: Verify refund liabilities remain fully backed by token balances
+
+<!-- handsoff-issue-472 -->
+- #472: Preview environment teardown audit records are written to the application log only; a durable audit store is still pending
+
+<!-- handsoff-issue-473 -->
+- #473: Liveness deadlock detection threshold is not yet configurable per environment
+
+<!-- handsoff-issue-474 -->
+- #474: SLO definitions for registration, federation lookup, and payment flows are documented but not yet wired to alerting

@@ -21,6 +21,7 @@
 // ---------------------------------------------------------------------------
 
 const { execFile } = require('child_process');
+const fs = require('fs');
 const path = require('path');
 
 const { logger } = require('./logger');
@@ -33,6 +34,430 @@ const MIGRATION_CHECK_TIMEOUT_MS =
   parseInt(process.env.MIGRATION_CHECK_TIMEOUT_MS, 10) || 30_000;
 
 const POLICIES = new Set(['strict', 'warn', 'off']);
+
+// ---------------------------------------------------------------------------
+// Compatibility preflight (issue #469)
+// ---------------------------------------------------------------------------
+// Before a candidate migration is deployed we want to know whether it is safe
+// to run while old application replicas are still serving traffic. The
+// preflight:
+//   1. Parses the candidate migration SQL into individual statements.
+//   2. Classifies each statement as destructive (contract phase) or
+//      non-destructive (expand phase).
+//   3. Checks the candidate against the old and new application schema
+//      snapshots to report incompatible statements.
+//   4. Requires an explicit replica-drain marker/flag before destructive
+//      contract phases are allowed to proceed.
+//   5. Emits a machine-readable report so CI can fail before deployment.
+//
+// The startup status check above is untouched; these helpers are additive and
+// exported for focused tests.
+// ---------------------------------------------------------------------------
+
+/** Environment flag that signals all old replicas have been drained. */
+const REPLICA_DRAIN_ENV = 'MIGRATION_REPLICAS_DRAINED';
+
+/** Marker file (relative to the project root) recording a completed drain. */
+const REPLICA_DRAIN_MARKER = path.join(PROJECT_ROOT, '.migration-replicas-drained');
+
+/**
+ * Statement kinds that can break old replicas still running the previous
+ * application version. These are the "contract" phase of an expand/contract
+ * migration and must only run after old replicas are drained.
+ */
+const DESTRUCTIVE_PATTERNS = [
+  { kind: 'drop-table', re: /^\s*drop\s+table\b/i },
+  { kind: 'drop-column', re: /^\s*alter\s+table\b[\s\S]*\bdrop\s+column\b/i },
+  { kind: 'rename-column', re: /^\s*alter\s+table\b[\s\S]*\brename\s+column\b/i },
+  { kind: 'rename-table', re: /^\s*alter\s+table\b[\s\S]*\brename\s+to\b/i },
+  { kind: 'drop-constraint', re: /^\s*alter\s+table\b[\s\S]*\bdrop\s+constraint\b/i },
+  { kind: 'drop-index', re: /^\s*drop\s+index\b/i },
+  { kind: 'truncate', re: /^\s*truncate\b/i },
+  { kind: 'set-not-null', re: /^\s*alter\s+table\b[\s\S]*\bset\s+not\s+null\b/i },
+  { kind: 'alter-type', re: /^\s*alter\s+table\b[\s\S]*\balter\s+column\b[\s\S]*\btype\b/i },
+];
+
+/**
+ * Splits a migration SQL file into individual statements.
+ *
+ * Handles `--` line comments, `/* ... *\/` block comments, single-quoted
+ * string literals (with `''` escapes) and dollar-quoted bodies so that a `;`
+ * inside any of those does not split a statement. Empty statements are
+ * dropped.
+ *
+ * @param {string} sql
+ * @returns {string[]}
+ */
+function parseMigrationStatements(sql) {
+  if (typeof sql !== 'string' || sql.trim() === '') return [];
+
+  const statements = [];
+  let current = '';
+  let i = 0;
+  const len = sql.length;
+
+  while (i < len) {
+    const ch = sql[i];
+    const next = sql[i + 1];
+
+    // Line comment.
+    if (ch === '-' && next === '-') {
+      while (i < len && sql[i] !== '\n') i += 1;
+      current += ' ';
+      continue;
+    }
+
+    // Block comment.
+    if (ch === '/' && next === '*') {
+      i += 2;
+      while (i < len && !(sql[i] === '*' && sql[i + 1] === '/')) i += 1;
+      i += 2;
+      current += ' ';
+      continue;
+    }
+
+    // Single-quoted string literal.
+    if (ch === "'") {
+      current += ch;
+      i += 1;
+      while (i < len) {
+        current += sql[i];
+        if (sql[i] === "'") {
+          if (sql[i + 1] === "'") {
+            current += sql[i + 1];
+            i += 2;
+            continue;
+          }
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      continue;
+    }
+
+    // Dollar-quoted string ($$ ... $$ or $tag$ ... $tag$).
+    if (ch === '$') {
+      const tagMatch = /^\$[A-Za-z_]*\$/.exec(sql.slice(i));
+      if (tagMatch) {
+        const tag = tagMatch[0];
+        const end = sql.indexOf(tag, i + tag.length);
+        if (end !== -1) {
+          current += sql.slice(i, end + tag.length);
+          i = end + tag.length;
+          continue;
+        }
+      }
+    }
+
+    if (ch === ';') {
+      const trimmed = current.trim();
+      if (trimmed) statements.push(trimmed);
+      current = '';
+      i += 1;
+      continue;
+    }
+
+    current += ch;
+    i += 1;
+  }
+
+  const tail = current.trim();
+  if (tail) statements.push(tail);
+  return statements;
+}
+
+/**
+ * Classifies a single SQL statement as destructive or not.
+ *
+ * @param {string} statement
+ * @returns {{ statement: string, destructive: boolean, kind: string }}
+ */
+function classifyStatement(statement) {
+  const text = (statement || '').trim();
+  for (const { kind, re } of DESTRUCTIVE_PATTERNS) {
+    if (re.test(text)) {
+      return { statement: text, destructive: true, kind };
+    }
+  }
+  return { statement: text, destructive: false, kind: 'non-destructive' };
+}
+
+/**
+ * Classifies every statement in a migration SQL string.
+ *
+ * @param {string} sql
+ * @returns {{ statements: Array<{statement: string, destructive: boolean, kind: string}>, destructive: boolean, destructiveKinds: string[] }}
+ */
+function classifyMigration(sql) {
+  const statements = parseMigrationStatements(sql).map(classifyStatement);
+  const destructiveKinds = statements
+    .filter((s) => s.destructive)
+    .map((s) => s.kind);
+  return {
+    statements,
+    destructive: destructiveKinds.length > 0,
+    destructiveKinds,
+  };
+}
+
+/**
+ * Normalises a schema snapshot into a set of `table.column` keys.
+ *
+ * Accepts either:
+ *   - an object: { users: ['id', 'email'], ... }
+ *   - an array of { table, columns: [...] } entries
+ *   - a raw Prisma schema string (best-effort `model`/field parsing)
+ *
+ * @param {object|Array|string} snapshot
+ * @returns {Set<string>}
+ */
+function normaliseSnapshot(snapshot) {
+  const keys = new Set();
+  if (!snapshot) return keys;
+
+  const addTable = (table, columns) => {
+    if (!table) return;
+    keys.add(String(table));
+    for (const column of columns || []) {
+      keys.add(`${table}.${column}`);
+    }
+  };
+
+  if (typeof snapshot === 'string') {
+    // Best-effort Prisma schema parsing: `model Name { field Type ... }`.
+    const modelRe = /model\s+(\w+)\s*\{([\s\S]*?)\}/g;
+    let match;
+    while ((match = modelRe.exec(snapshot)) !== null) {
+      const table = match[1];
+      const body = match[2];
+      const columns = [];
+      for (const line of body.split('\n')) {
+        const fieldMatch = /^\s*(\w+)\s+\w+/.exec(line);
+        if (fieldMatch) columns.push(fieldMatch[1]);
+      }
+      addTable(table, columns);
+    }
+    return keys;
+  }
+
+  if (Array.isArray(snapshot)) {
+    for (const entry of snapshot) {
+      if (!entry) continue;
+      addTable(entry.table || entry.name, entry.columns || entry.fields);
+    }
+    return keys;
+  }
+
+  if (typeof snapshot === 'object') {
+    for (const [table, columns] of Object.entries(snapshot)) {
+      addTable(table, Array.isArray(columns) ? columns : []);
+    }
+  }
+  return keys;
+}
+
+/**
+ * Extracts the tables/columns a migration statement touches so it can be
+ * checked against a schema snapshot.
+ *
+ * @param {string} statement
+ * @returns {{ tables: string[], columns: string[] }}
+ */
+function extractTouchedObjects(statement) {
+  const text = statement || '';
+  const tables = [];
+  const columns = [];
+
+  const tableRe = /\b(?:alter\s+table|drop\s+table|create\s+table|truncate(?:\s+table)?|drop\s+index\s+\w+\s+on|create\s+(?:unique\s+)?index\s+\w+\s+on)\s+(?:if\s+exists\s+)?["`]?(\w+)["`]?/gi;
+  let match;
+  while ((match = tableRe.exec(text)) !== null) {
+    tables.push(match[1]);
+  }
+
+  const columnRe = /\b(?:drop\s+column|add\s+column|alter\s+column|rename\s+column)\s+(?:if\s+exists\s+)?["`]?(\w+)["`]?/gi;
+  while ((match = columnRe.exec(text)) !== null) {
+    columns.push(match[1]);
+  }
+
+  return { tables, columns };
+}
+
+/**
+ * Checks a candidate migration against the old and new application schema
+ * snapshots and reports incompatible statements.
+ *
+ * A statement is incompatible when it references an object that does not
+ * exist in the snapshot it must be compatible with:
+ *   - destructive statements must be valid against the OLD snapshot (they
+ *     remove things old code still uses, so the object must exist), and
+ *   - non-destructive statements must be valid against the NEW snapshot.
+ *
+ * @param {string} sql Candidate migration SQL.
+ * @param {{ oldSchema?: object|Array|string, newSchema?: object|Array|string }} snapshots
+ * @returns {{ compatible: boolean, incompatible: Array<{statement: string, kind: string, reason: string}>, statements: Array<object> }}
+ */
+function checkCompatibility(sql, snapshots = {}) {
+  const oldKeys = normaliseSnapshot(snapshots.oldSchema);
+  const newKeys = normaliseSnapshot(snapshots.newSchema);
+  const { statements } = classifyMigration(sql);
+  const incompatible = [];
+
+  for (const entry of statements) {
+    const { tables, columns } = extractTouchedObjects(entry.statement);
+    const targetKeys = entry.destructive ? oldKeys : newKeys;
+    const targetLabel = entry.destructive ? 'old' : 'new';
+
+    // Only validate when we actually have a snapshot to compare against.
+    if (targetKeys.size === 0) continue;
+
+    for (const table of tables) {
+      if (!targetKeys.has(table)) {
+        incompatible.push({
+          statement: entry.statement,
+          kind: entry.kind,
+          reason: `references table "${table}" missing from the ${targetLabel} schema snapshot`,
+        });
+      }
+    }
+    for (const column of columns) {
+      const qualified = tables.length > 0 ? `${tables[0]}.${column}` : null;
+      if (qualified && !targetKeys.has(qualified)) {
+        incompatible.push({
+          statement: entry.statement,
+          kind: entry.kind,
+          reason: `references column "${qualified}" missing from the ${targetLabel} schema snapshot`,
+        });
+      }
+    }
+  }
+
+  return {
+    compatible: incompatible.length === 0,
+    incompatible,
+    statements,
+  };
+}
+
+/**
+ * Determines whether old replicas have been drained.
+ *
+ * A drain is signalled by either the MIGRATION_REPLICAS_DRAINED env flag
+ * (truthy string) or the presence of the drain marker file.
+ *
+ * @param {{ env?: object, markerPath?: string, existsSync?: Function }} [options]
+ * @returns {{ drained: boolean, source: string }}
+ */
+function isReplicaDrainConfirmed(options = {}) {
+  const env = options.env || process.env;
+  const markerPath = options.markerPath || REPLICA_DRAIN_MARKER;
+  const existsSync = options.existsSync || fs.existsSync;
+
+  const flag = String(env[REPLICA_DRAIN_ENV] || '').trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(flag)) {
+    return { drained: true, source: 'env' };
+  }
+
+  try {
+    if (existsSync(markerPath)) {
+      return { drained: true, source: 'marker' };
+    }
+  } catch (_err) {
+    // Treat an unreadable marker as "not drained" — fail closed.
+  }
+
+  return { drained: false, source: 'none' };
+}
+
+/**
+ * Runs the full compatibility preflight for a candidate migration.
+ *
+ * @param {object} params
+ * @param {string} params.sql Candidate migration SQL.
+ * @param {object|Array|string} [params.oldSchema] Old application schema snapshot.
+ * @param {object|Array|string} [params.newSchema] New application schema snapshot.
+ * @param {object} [params.env] Environment to read the drain flag from.
+ * @param {string} [params.markerPath] Drain marker path override.
+ * @param {Function} [params.existsSync] fs.existsSync override (for tests).
+ * @returns {{
+ *   ok: boolean,
+ *   destructive: boolean,
+ *   destructiveKinds: string[],
+ *   compatible: boolean,
+ *   incompatible: Array<object>,
+ *   drain: { drained: boolean, source: string },
+ *   blocked: boolean,
+ *   reasons: string[],
+ *   report: string,
+ * }}
+ */
+function runCompatibilityPreflight(params = {}) {
+  const { sql = '', oldSchema, newSchema } = params;
+  const classification = classifyMigration(sql);
+  const compatibility = checkCompatibility(sql, { oldSchema, newSchema });
+  const drain = isReplicaDrainConfirmed({
+    env: params.env,
+    markerPath: params.markerPath,
+    existsSync: params.existsSync,
+  });
+
+  const reasons = [];
+
+  if (!compatibility.compatible) {
+    for (const item of compatibility.incompatible) {
+      reasons.push(`incompatible statement (${item.kind}): ${item.reason}`);
+    }
+  }
+
+  // Destructive contract phases must wait until old replicas are drained.
+  const blocked = classification.destructive && !drain.drained;
+  if (blocked) {
+    reasons.push(
+      `destructive contract phase (${classification.destructiveKinds.join(', ')}) ` +
+        `requires old replicas to be drained; set ${REPLICA_DRAIN_ENV}=true or create ` +
+        `${path.basename(REPLICA_DRAIN_MARKER)} after draining`,
+    );
+  }
+
+  const ok = compatibility.compatible && !blocked;
+
+  const reportLines = [
+    '[migrate-preflight] Candidate migration compatibility report',
+    `  statements: ${classification.statements.length}`,
+    `  destructive: ${classification.destructive ? classification.destructiveKinds.join(', ') : 'none'}`,
+    `  compatible: ${compatibility.compatible}`,
+    `  replicas drained: ${drain.drained} (${drain.source})`,
+    `  result: ${ok ? 'PASS' : 'BLOCKED'}`,
+  ];
+  if (reasons.length > 0) {
+    reportLines.push('  reasons:');
+    for (const reason of reasons) reportLines.push(`    - ${reason}`);
+  }
+
+  return {
+    ok,
+    destructive: classification.destructive,
+    destructiveKinds: classification.destructiveKinds,
+    compatible: compatibility.compatible,
+    incompatible: compatibility.incompatible,
+    drain,
+    blocked,
+    reasons,
+    report: reportLines.join('\n'),
+  };
+}
+
+/**
+ * Reads a candidate migration SQL file and runs the compatibility preflight.
+ *
+ * @param {string} filePath
+ * @param {object} [params] Same options as runCompatibilityPreflight.
+ * @returns {ReturnType<typeof runCompatibilityPreflight>}
+ */
+function preflightMigrationFile(filePath, params = {}) {
+  const sql = fs.readFileSync(filePath, 'utf8');
+  return runCompatibilityPreflight({ ...params, sql });
+}
 
 /**
  * Resolves the active migration policy from MIGRATION_POLICY, defaulting to
@@ -289,6 +714,304 @@ function flushLogs() {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Migration SQL lint (expand / contract guard)
+// ---------------------------------------------------------------------------
+// Enforces the expand-contract migration discipline so rolling deploys stay
+// zero-downtime:
+//
+//   expand    -> additive, backwards-compatible changes (add nullable column,
+//                add index, backfill UPDATE). Always allowed.
+//   contract  -> destructive changes (DROP COLUMN, DROP TABLE, narrowing a
+//                column type, ADD COLUMN ... NOT NULL without a DEFAULT).
+//                Rejected unless explicitly allowed, because old instances
+//                still running during a rolling deploy would break.
+//
+// The lint is intentionally a lightweight SQL scanner, not a full parser: it
+// strips comments and string literals, then matches the handful of statement
+// shapes that matter for compatibility. It errs on the side of flagging.
+// ---------------------------------------------------------------------------
+
+/** Types considered "narrower" than their common predecessors. */
+const NARROWING_TYPES = new Set([
+  'smallint',
+  'int2',
+  'integer',
+  'int',
+  'int4',
+  'bigint',
+  'int8',
+  'varchar',
+  'character varying',
+  'char',
+  'character',
+  'text',
+  'date',
+  'timestamp',
+  'timestamptz',
+  'timestamp with time zone',
+  'timestamp without time zone',
+  'real',
+  'float4',
+  'double precision',
+  'float8',
+  'numeric',
+  'decimal',
+  'boolean',
+  'bool',
+  'uuid',
+]);
+
+/**
+ * Removes SQL line comments (`-- ...`), block comments (`/* ... *\/`) and
+ * single-quoted string literals so keyword matching is not fooled by content
+ * inside them. String literals are replaced with a placeholder.
+ * @param {string} sql
+ * @returns {string}
+ */
+function stripSqlNoise(sql) {
+  let out = '';
+  let i = 0;
+  const len = sql.length;
+  while (i < len) {
+    const ch = sql[i];
+    const next = sql[i + 1];
+    if (ch === '-' && next === '-') {
+      while (i < len && sql[i] !== '\n') i += 1;
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      i += 2;
+      while (i < len && !(sql[i] === '*' && sql[i + 1] === '/')) i += 1;
+      i += 2;
+      continue;
+    }
+    if (ch === "'") {
+      i += 1;
+      while (i < len) {
+        if (sql[i] === "'" && sql[i + 1] === "'") {
+          i += 2;
+          continue;
+        }
+        if (sql[i] === "'") {
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      out += "''";
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+  return out;
+}
+
+/**
+ * Splits a SQL script into individual statements on top-level semicolons.
+ * @param {string} sql
+ * @returns {string[]}
+ */
+function splitStatements(sql) {
+  return stripSqlNoise(sql)
+    .split(';')
+    .map((stmt) => stmt.trim())
+    .filter((stmt) => stmt.length > 0);
+}
+
+/**
+ * Normalises a SQL type expression for comparison.
+ * @param {string} raw
+ * @returns {string}
+ */
+function normalizeType(raw) {
+  return (raw || '')
+    .toLowerCase()
+    .replace(/\([^)]*\)/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Lints a single migration SQL statement.
+ * @param {string} statement
+ * @param {{ allowDestructive?: boolean }} [options]
+ * @returns {Array<{ rule: string, message: string, statement: string }>}
+ */
+function lintStatement(statement, options = {}) {
+  const allowDestructive = Boolean(options.allowDestructive);
+  const findings = [];
+  const normalized = statement.replace(/\s+/g, ' ').trim();
+  const lower = normalized.toLowerCase();
+
+  const add = (rule, message) => {
+    if (allowDestructive) return;
+    findings.push({ rule, message, statement: normalized });
+  };
+
+  // DROP TABLE
+  if (/^drop\s+table\b/.test(lower)) {
+    add(
+      'drop-table',
+      'DROP TABLE is destructive; use the contract phase after all code stops reading the table.'
+    );
+    return findings;
+  }
+
+  // DROP COLUMN (also covers ALTER TABLE ... DROP COLUMN)
+  if (/\bdrop\s+column\b/.test(lower)) {
+    add(
+      'drop-column',
+      'DROP COLUMN is destructive; move it to the contract phase once no code references the column.'
+    );
+    return findings;
+  }
+
+  // ALTER COLUMN ... TYPE <narrower>
+  const alterType = lower.match(
+    /\balter\s+column\s+\S+\s+(?:set\s+data\s+)?type\s+([a-z0-9_ ]+?)(?:\s+using\b|$|\s+(?:not|null|default)\b)/
+  );
+  if (alterType) {
+    const target = normalizeType(alterType[1]);
+    if (NARROWING_TYPES.has(target)) {
+      add(
+        'narrowing-type',
+        `ALTER COLUMN ... TYPE ${target} may narrow the column and break old readers; add a new column and backfill instead.`
+      );
+    }
+  }
+
+  // ADD COLUMN ... NOT NULL without DEFAULT
+  const addColumn = lower.match(/\badd\s+column\s+(?:if\s+not\s+exists\s+)?\S+/);
+  if (addColumn) {
+    const hasNotNull = /\bnot\s+null\b/.test(lower);
+    const hasDefault = /\bdefault\b/.test(lower);
+    if (hasNotNull && !hasDefault) {
+      add(
+        'add-not-null-without-default',
+        'ADD COLUMN ... NOT NULL without DEFAULT fails on non-empty tables and breaks old writers; add it nullable, backfill, then enforce NOT NULL in the contract phase.'
+      );
+    }
+  }
+
+  return findings;
+}
+
+/**
+ * Lints a migration SQL script.
+ *
+ * @param {string} sql Raw migration SQL.
+ * @param {{ allowDestructive?: boolean }} [options]
+ * @returns {{ ok: boolean, findings: Array<{ rule: string, message: string, statement: string }> }}
+ */
+function lintMigrationSql(sql, options = {}) {
+  const findings = [];
+  for (const statement of splitStatements(sql || '')) {
+    findings.push(...lintStatement(statement, options));
+  }
+  return { ok: findings.length === 0, findings };
+}
+
+/**
+ * Lints every `*.sql` file in a directory (non-recursive).
+ * @param {string} dir
+ * @param {{ allowDestructive?: boolean }} [options]
+ * @returns {{ ok: boolean, findings: Array<{ file: string, rule: string, message: string, statement: string }> }}
+ */
+function lintMigrationDir(dir, options = {}) {
+  const findings = [];
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (err) {
+    return {
+      ok: false,
+      findings: [
+        {
+          file: dir,
+          rule: 'read-error',
+          message: `Could not read migration directory: ${err.message}`,
+          statement: '',
+        },
+      ],
+    };
+  }
+
+  const files = entries
+    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith('.sql'))
+    .map((entry) => entry.name)
+    .sort();
+
+  for (const name of files) {
+    const fullPath = path.join(dir, name);
+    let sql;
+    try {
+      sql = fs.readFileSync(fullPath, 'utf8');
+    } catch (err) {
+      findings.push({
+        file: name,
+        rule: 'read-error',
+        message: `Could not read migration file: ${err.message}`,
+        statement: '',
+      });
+      continue;
+    }
+    const result = lintMigrationSql(sql, options);
+    for (const finding of result.findings) {
+      findings.push({ file: name, ...finding });
+    }
+  }
+
+  return { ok: findings.length === 0, findings };
+}
+
+/**
+ * CLI entry point for the migration lint.
+ *
+ * Usage:
+ *   node src/migrate-check.js --lint <dir> [--allow-destructive]
+ *
+ * Exits 0 when clean, 1 when violations are found, 2 on usage errors.
+ * @param {string[]} argv
+ * @returns {number} process exit code
+ */
+function runLintCli(argv) {
+  const args = argv.slice();
+  const lintIndex = args.indexOf('--lint');
+  if (lintIndex === -1) {
+    process.stderr.write('Usage: node src/migrate-check.js --lint <dir> [--allow-destructive]\n');
+    return 2;
+  }
+
+  const allowDestructive = args.includes('--allow-destructive');
+  const dir = args[lintIndex + 1];
+  if (!dir || dir.startsWith('--')) {
+    process.stderr.write('Error: --lint requires a migration directory argument.\n');
+    return 2;
+  }
+
+  const result = lintMigrationDir(dir, { allowDestructive });
+  if (result.ok) {
+    process.stdout.write(`[migrate-lint] ${dir}: no destructive changes detected.\n`);
+    return 0;
+  }
+
+  process.stderr.write(
+    `[migrate-lint] ${result.findings.length} destructive change(s) detected in ${dir}:\n`
+  );
+  for (const finding of result.findings) {
+    process.stderr.write(`  - ${finding.file} [${finding.rule}] ${finding.message}\n`);
+    if (finding.statement) {
+      process.stderr.write(`      ${finding.statement}\n`);
+    }
+  }
+  process.stderr.write(
+    '\nSplit destructive changes into a separate contract-phase migration and re-run with --allow-destructive.\n'
+  );
+  return 1;
+}
+
 module.exports = {
   checkMigrations,
   enforceMigrationPolicy,
@@ -296,5 +1019,21 @@ module.exports = {
   classifyStatus,
   runMigrateStatus,
   flushLogs,
+  lintMigrationSql,
+  lintMigrationDir,
+  runLintCli,
   PRISMA_BIN,
+  // Compatibility preflight (issue #469)
+  parseMigrationStatements,
+  classifyStatement,
+  classifyMigration,
+  normaliseSnapshot,
+  extractTouchedObjects,
+  checkCompatibility,
+  isReplicaDrainConfirmed,
+  runCompatibilityPreflight,
+  preflightMigrationFile,
+  REPLICA_DRAIN_ENV,
+  REPLICA_DRAIN_MARKER,
+  DESTRUCTIVE_PATTERNS,
 };

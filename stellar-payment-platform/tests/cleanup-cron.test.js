@@ -206,3 +206,90 @@ describe('scheduleCleanupJob', () => {
     expect(logger.error).toHaveBeenCalledWith('[cleanup-cron] Sweep failed:', 'db down');
   });
 });
+
+describe('cleanup job shutdown', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  function makePrisma() {
+    return {
+      user: {
+        deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
+        updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+      },
+      webhookDLQ: {
+        deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
+      },
+    };
+  }
+
+  it('stops the scheduled task and awaits an in-flight sweep', async () => {
+    let scheduledCallback;
+    const task = { stop: jest.fn() };
+    cron.schedule.mockImplementation((expr, cb) => {
+      scheduledCallback = cb;
+      return task;
+    });
+
+    let resolveDelete;
+    const prisma = makePrisma();
+    prisma.user.deleteMany.mockImplementation(
+      () => new Promise((resolve) => {
+        resolveDelete = resolve;
+      }),
+    );
+
+    const handle = scheduleCleanupJob(prisma);
+    expect(typeof handle.stop).toBe('function');
+
+    const inFlight = scheduledCallback();
+    await Promise.resolve();
+
+    const stopPromise = handle.stop();
+    expect(task.stop).toHaveBeenCalledTimes(1);
+
+    let settled = false;
+    stopPromise.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    resolveDelete({ count: 0 });
+    await stopPromise;
+    await inFlight;
+    expect(settled).toBe(true);
+  });
+
+  it('does not run the sweep after stop has been called', async () => {
+    let scheduledCallback;
+    const task = { stop: jest.fn() };
+    cron.schedule.mockImplementation((expr, cb) => {
+      scheduledCallback = cb;
+      return task;
+    });
+
+    const prisma = makePrisma();
+    const handle = scheduleCleanupJob(prisma);
+    await handle.stop();
+
+    await scheduledCallback();
+
+    expect(prisma.user.deleteMany).not.toHaveBeenCalled();
+    expect(prisma.webhookDLQ.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it('treats a second stop call as a no-op', async () => {
+    const task = { stop: jest.fn() };
+    cron.schedule.mockImplementation(() => task);
+
+    const prisma = makePrisma();
+    const handle = scheduleCleanupJob(prisma);
+
+    await handle.stop();
+    await handle.stop();
+
+    expect(task.stop).toHaveBeenCalledTimes(1);
+  });
+});

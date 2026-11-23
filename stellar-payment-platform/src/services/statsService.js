@@ -101,6 +101,29 @@ const snapToWeekBoundary = (dateStr, side) => {
   return d.toISOString().slice(0, 10);
 };
 
+/**
+ * Formats an exact integer unit amount as a fixed-precision decimal string.
+ *
+ * @param {bigint} units - Amount expressed in the asset's smallest unit.
+ * @param {number} precision - Number of decimal places for the asset.
+ * @returns {string} Decimal string, e.g. formatUnits(1234567n, 7) === '0.1234567'.
+ */
+const formatUnits = (units, precision) => {
+  const p = Number.isInteger(precision) && precision >= 0 ? precision : 7;
+  const value = BigInt(units);
+  const negative = value < 0n;
+  const abs = negative ? -value : value;
+
+  if (p === 0) {
+    return `${negative ? '-' : ''}${abs.toString()}`;
+  }
+
+  const divisor = 10n ** BigInt(p);
+  const whole = abs / divisor;
+  const fraction = (abs % divisor).toString().padStart(p, '0');
+  return `${negative ? '-' : ''}${whole.toString()}.${fraction}`;
+};
+
 const getRoutingStats = async ({
   prisma,
   startDate,
@@ -133,53 +156,77 @@ const getRoutingStats = async ({
     select: {
       id: true,
       createdAt: true,
-      amount: true,
-      fee: true,
+      amountUnits: true,
+      feeUnits: true,
       assetCode: true,
+      assetPrecision: true,
       status: true,
     },
     orderBy: { createdAt: 'asc' },
   });
 
-  let totalVolume = 0;
-  let totalFees = 0;
+  // All monetary values are stored as exact integer units (BigInt) alongside
+  // the asset's precision. Summing integers avoids floating-point drift; the
+  // conversion to a decimal string happens once, at the end, per precision.
+  let totalVolumeUnits = 0n;
+  let totalFeesUnits = 0n;
   let totalCount = 0;
 
   const buckets = new Map();
 
   for (const record of records) {
-    const amount = Number(record.amount) || 0;
-    const fee = Number(record.fee) || 0;
+    const amountUnits = BigInt(record.amountUnits ?? 0);
+    const feeUnits = BigInt(record.feeUnits ?? 0);
+    const precision = Number.isInteger(record.assetPrecision) ? record.assetPrecision : 7;
 
-    totalVolume += amount;
-    totalFees += fee;
+    totalVolumeUnits += amountUnits;
+    totalFeesUnits += feeUnits;
     totalCount += 1;
 
     const bucketKey = getBucketKey(record.createdAt, selectedInterval);
     if (!buckets.has(bucketKey)) {
       buckets.set(bucketKey, {
         period: bucketKey,
-        volume: 0,
-        fees: 0,
+        volumeUnits: 0n,
+        feesUnits: 0n,
         count: 0,
+        // Highest precision seen in the bucket; used to render decimal strings.
+        precision: 0,
       });
     }
 
     const bucket = buckets.get(bucketKey);
-    bucket.volume = Number((bucket.volume + amount).toFixed(7));
-    bucket.fees = Number((bucket.fees + fee).toFixed(7));
+    bucket.volumeUnits += amountUnits;
+    bucket.feesUnits += feeUnits;
     bucket.count += 1;
+    if (precision > bucket.precision) bucket.precision = precision;
   }
 
-  const data = Array.from(buckets.values());
+  const data = Array.from(buckets.values()).map((bucket) => ({
+    period: bucket.period,
+    volume: formatUnits(bucket.volumeUnits, bucket.precision),
+    fees: formatUnits(bucket.feesUnits, bucket.precision),
+    count: bucket.count,
+  }));
+
+  // Summary precision: the highest precision across all records, defaulting to
+  // the platform's canonical 7 decimals when there are no records.
+  const summaryPrecision = records.reduce(
+    (max, record) =>
+      Number.isInteger(record.assetPrecision) && record.assetPrecision > max
+        ? record.assetPrecision
+        : max,
+    0,
+  );
+  const effectiveSummaryPrecision = records.length > 0 ? summaryPrecision : 7;
 
   return {
     interval: selectedInterval,
     startDate: startDate || null,
     endDate: endDate || null,
     summary: {
-      total_volume: Number(totalVolume.toFixed(7)),
-      total_fees: Number(totalFees.toFixed(7)),
+      total_volume: formatUnits(totalVolumeUnits, effectiveSummaryPrecision),
+      total_fees: formatUnits(totalFeesUnits, effectiveSummaryPrecision),
       total_count: totalCount,
     },
     data,
@@ -226,5 +273,6 @@ module.exports = {
   buildDateFilter,
   snapToWeekBoundary,
   fetchAdminStats,
+  formatUnits,
   SERVER_START_TIME,
 };

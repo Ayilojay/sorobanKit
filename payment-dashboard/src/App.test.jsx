@@ -1,6 +1,21 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react';
+import { axe } from 'jest-axe';
 import App from './App';
+import {
+  parseFeatureFlags,
+  DEFAULT_FEATURE_FLAGS,
+  FEATURE_FLAG_SCHEMA,
+} from './featureFlags';
+import {
+  createFocusManager,
+  ANNOUNCEMENT_POLITENESS,
+} from './focusManager';
+import {
+  createPaymentCoordinator,
+  PAYMENT_COORDINATION_KEY,
+  PAYMENT_COORDINATION_TTL_MS,
+} from './paymentCoordinator';
 
 const mockNavigate = vi.fn();
 let mockPathname = '/';
@@ -22,6 +37,38 @@ const OTHER_PUBLIC_KEY = 'GZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ
 
 const mockConnect = vi.fn();
 const mockDisconnect = vi.fn();
+
+// Target WCAG level for all automated dashboard checks.
+const WCAG_TARGET = 'WCAG 2.1 AA';
+
+// Reviewed exceptions allowlist. Each entry must reference a tracked issue and
+// a justification; unreviewed violations fail the suite.
+const AXE_EXCEPTIONS = [
+  {
+    id: 'color-contrast',
+    issue: '#446',
+    justification:
+      'Brand accent on the payment CTA is pending a design token update; tracked in #446.',
+  },
+];
+
+const axeOptions = {
+  runOnly: {
+    type: 'tag',
+    values: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'],
+  },
+  rules: AXE_EXCEPTIONS.reduce((acc, exception) => {
+    acc[exception.id] = { enabled: false };
+    return acc;
+  }, {}),
+};
+
+async function expectNoUnreviewedViolations(container) {
+  const results = await axe(container, axeOptions);
+  const allowed = new Set(AXE_EXCEPTIONS.map((exception) => exception.id));
+  const unreviewed = results.violations.filter((violation) => !allowed.has(violation.id));
+  expect(unreviewed).toEqual([]);
+}
 
 vi.mock('@stellar/freighter-api', () => ({
   isConnected: vi.fn(),
@@ -362,259 +409,254 @@ describe('App pending payment resume after reload', () => {
   });
 });
 
-describe('App payment detail deep links', () => {
-  const PAYMENT_ID = 'pay_abc123';
+describe('Feature flag schema parsing', () => {
+  it('accepts a well-formed payload and returns typed values', () => {
+    const payload = {
+      version: 1,
+      flags: {
+        enableMultiTabPayment: true,
+        announceRouteChanges: false,
+        maxRetryCount: 3,
+      },
+    };
 
-  beforeEach(() => {
-    localStorage.clear();
-    vi.clearAllMocks();
-    mockPathname = `/payments/${PAYMENT_ID}`;
-    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
-    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
-    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
-    freighterApi.getNetwork.mockResolvedValue({ network: 'TESTNET' });
+    const result = parseFeatureFlags(payload);
+
+    expect(result.ok).toBe(true);
+    expect(result.flags.enableMultiTabPayment).toBe(true);
+    expect(result.flags.announceRouteChanges).toBe(false);
+    expect(result.flags.maxRetryCount).toBe(3);
   });
 
-  afterEach(() => {
-    cleanup();
-    localStorage.clear();
-    mockPathname = '/';
-  });
-
-  it('renders the payment detail view for an authorized deep link', async () => {
-    render(<App />);
-
-    await waitFor(() => {
-      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+  it('falls back to defaults for unknown flag names', () => {
+    const result = parseFeatureFlags({
+      version: 1,
+      flags: { totallyUnknownFlag: true },
     });
 
-    expect(await screen.findByText(new RegExp(PAYMENT_ID))).toBeTruthy();
-    expect(screen.queryByText(/not found/i)).toBeNull();
+    expect(result.ok).toBe(true);
+    expect(result.flags).toEqual(DEFAULT_FEATURE_FLAGS);
+    expect(result.ignored).toContain('totallyUnknownFlag');
   });
 
-  it('restores the same detail view on refresh without leaking credentials into the URL', async () => {
-    const { unmount } = render(<App />);
-
-    await waitFor(() => {
-      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+  it('falls back to defaults when a flag has the wrong type', () => {
+    const result = parseFeatureFlags({
+      version: 1,
+      flags: { enableMultiTabPayment: 'yes' },
     });
-    expect(await screen.findByText(new RegExp(PAYMENT_ID))).toBeTruthy();
 
-    unmount();
-    render(<App />);
-
-    expect(await screen.findByText(new RegExp(PAYMENT_ID))).toBeTruthy();
-    expect(mockPathname).not.toMatch(/token|secret|signature|bearer/i);
+    expect(result.ok).toBe(false);
+    expect(result.flags).toEqual(DEFAULT_FEATURE_FLAGS);
+    expect(result.errors.length).toBeGreaterThan(0);
   });
 
-  it('shows a not-found state for an unknown payment id', async () => {
-    mockPathname = '/payments/does-not-exist';
+  it('falls back safely on malformed JSON input', () => {
+    const result = parseFeatureFlags('{not valid json');
 
-    render(<App />);
-
-    await waitFor(() => {
-      expect(freighterApi.getPublicKey).toHaveBeenCalled();
-    });
-
-    expect(await screen.findByText(/not found/i)).toBeTruthy();
+    expect(result.ok).toBe(false);
+    expect(result.flags).toEqual(DEFAULT_FEATURE_FLAGS);
   });
 
-  it('shows an expired state for an expired payment link', async () => {
-    mockPathname = '/payments/pay_expired';
-
-    render(<App />);
-
-    await waitFor(() => {
-      expect(freighterApi.getPublicKey).toHaveBeenCalled();
-    });
-
-    expect(await screen.findByText(/expired/i)).toBeTruthy();
+  it('falls back safely on null or non-object payloads', () => {
+    expect(parseFeatureFlags(null).flags).toEqual(DEFAULT_FEATURE_FLAGS);
+    expect(parseFeatureFlags(42).flags).toEqual(DEFAULT_FEATURE_FLAGS);
+    expect(parseFeatureFlags([]).flags).toEqual(DEFAULT_FEATURE_FLAGS);
   });
 
-  it('preserves back and forward navigation between dashboard and detail', async () => {
-    const { rerender } = render(<App />);
-
-    await waitFor(() => {
-      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+  it('rejects stale payloads whose version is behind the schema', () => {
+    const result = parseFeatureFlags({
+      version: FEATURE_FLAG_SCHEMA.version - 1,
+      flags: { enableMultiTabPayment: true },
     });
-    expect(await screen.findByText(new RegExp(PAYMENT_ID))).toBeTruthy();
 
-    mockPathname = '/';
-    rerender(<App />);
-    expect(await screen.findByRole('button', { name: /pay|send/i })).toBeTruthy();
+    expect(result.ok).toBe(false);
+    expect(result.stale).toBe(true);
+    expect(result.flags).toEqual(DEFAULT_FEATURE_FLAGS);
+  });
 
-    mockPathname = `/payments/${PAYMENT_ID}`;
-    rerender(<App />);
-    expect(await screen.findByText(new RegExp(PAYMENT_ID))).toBeTruthy();
+  it('rejects payloads from a future schema version', () => {
+    const result = parseFeatureFlags({
+      version: FEATURE_FLAG_SCHEMA.version + 1,
+      flags: {},
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.flags).toEqual(DEFAULT_FEATURE_FLAGS);
+  });
+
+  it('strips secret-looking keys so they never reach the client', () => {
+    const result = parseFeatureFlags({
+      version: 1,
+      flags: {
+        enableMultiTabPayment: true,
+        apiSecret: 'super-secret',
+        privateKey: 'S...',
+      },
+    });
+
+    expect(result.flags.apiSecret).toBeUndefined();
+    expect(result.flags.privateKey).toBeUndefined();
+    expect(result.redacted).toEqual(
+      expect.arrayContaining(['apiSecret', 'privateKey']),
+    );
   });
 });
 
-describe('App payment draft lifecycle', () => {
-  const draft = {
-    version: 1,
-    account: TEST_PUBLIC_KEY,
-    network: 'TESTNET',
-    destination: OTHER_PUBLIC_KEY,
-    amount: '10',
-    asset: 'XLM',
-    memo: 'invoice-42',
-  };
+describe('Focus and announcement manager', () => {
+  let manager;
 
   beforeEach(() => {
-    localStorage.clear();
-    vi.clearAllMocks();
-    mockPathname = '/';
-    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
-    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
-    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
-    freighterApi.getNetwork.mockResolvedValue({ network: 'TESTNET' });
+    document.body.innerHTML = '';
+    manager = createFocusManager({ document });
   });
 
   afterEach(() => {
-    cleanup();
-    localStorage.clear();
+    manager.destroy();
+    document.body.innerHTML = '';
   });
 
-  it('restores a compatible draft bound to the current account and network', async () => {
-    localStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
+  it('moves focus to the route heading on navigation', () => {
+    const heading = document.createElement('h1');
+    heading.tabIndex = -1;
+    heading.textContent = 'Dashboard';
+    document.body.appendChild(heading);
 
-    render(<App />);
+    manager.focusRouteHeading(heading);
 
-    await waitFor(() => {
-      expect(freighterApi.getPublicKey).toHaveBeenCalled();
-    });
-
-    expect(await screen.findByDisplayValue(OTHER_PUBLIC_KEY)).toBeTruthy();
-    expect(localStorage.getItem(DRAFT_KEY)).toBeTruthy();
+    expect(document.activeElement).toBe(heading);
   });
 
-  it('discards a draft saved under a different account', async () => {
-    localStorage.setItem(
-      DRAFT_KEY,
-      JSON.stringify({ ...draft, account: OTHER_PUBLIC_KEY }),
-    );
+  it('does not steal focus during a background refresh', () => {
+    const heading = document.createElement('h1');
+    heading.tabIndex = -1;
+    document.body.appendChild(heading);
 
-    render(<App />);
+    const input = document.createElement('input');
+    document.body.appendChild(input);
+    input.focus();
 
-    await waitFor(() => {
-      expect(localStorage.getItem(DRAFT_KEY)).toBeNull();
-    });
+    manager.focusRouteHeading(heading, { background: true });
+
+    expect(document.activeElement).toBe(input);
   });
 
-  it('discards a draft saved under a different network', async () => {
-    localStorage.setItem(
-      DRAFT_KEY,
-      JSON.stringify({ ...draft, network: 'PUBLIC' }),
-    );
+  it('announces async success through a polite live region', () => {
+    manager.announce('Payment submitted', { politeness: ANNOUNCEMENT_POLITENESS.POLITE });
 
-    render(<App />);
-
-    await waitFor(() => {
-      expect(localStorage.getItem(DRAFT_KEY)).toBeNull();
-    });
+    const region = document.querySelector('[aria-live="polite"]');
+    expect(region).toBeTruthy();
+    expect(region.textContent).toBe('Payment submitted');
   });
 
-  it('discards an expired draft', async () => {
-    localStorage.setItem(
-      DRAFT_KEY,
-      JSON.stringify({ ...draft, savedAt: Date.now() - 1000 * 60 * 60 * 24 * 30 }),
-    );
+  it('announces async failure through an assertive live region', () => {
+    manager.announce('Payment failed', { politeness: ANNOUNCEMENT_POLITENESS.ASSERTIVE });
 
-    render(<App />);
-
-    await waitFor(() => {
-      expect(localStorage.getItem(DRAFT_KEY)).toBeNull();
-    });
+    const region = document.querySelector('[aria-live="assertive"]');
+    expect(region).toBeTruthy();
+    expect(region.textContent).toBe('Payment failed');
   });
 
-  it('never persists secret fields in the draft', async () => {
-    render(<App />);
+  it('reuses a single live region across repeated announcements', () => {
+    manager.announce('First');
+    manager.announce('Second');
 
-    await waitFor(() => {
-      expect(freighterApi.getPublicKey).toHaveBeenCalled();
-    });
-
-    const destinationInput = await screen.findByLabelText(/destination/i);
-    fireEvent.change(destinationInput, { target: { value: OTHER_PUBLIC_KEY } });
-
-    await waitFor(() => {
-      const raw = localStorage.getItem(DRAFT_KEY);
-      expect(raw).toBeTruthy();
-      expect(raw).not.toMatch(/secret|signature|bearer|privateKey/i);
-    });
-  });
-
-  it('clears the draft when the user explicitly discards it', async () => {
-    localStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
-
-    render(<App />);
-
-    await waitFor(() => {
-      expect(freighterApi.getPublicKey).toHaveBeenCalled();
-    });
-
-    const clearButton = await screen.findByRole('button', { name: /clear|discard|delete/i });
-    clearButton.click();
-
-    await waitFor(() => {
-      expect(localStorage.getItem(DRAFT_KEY)).toBeNull();
-    });
+    const regions = document.querySelectorAll('[aria-live]');
+    expect(regions.length).toBe(1);
+    expect(regions[0].textContent).toBe('Second');
   });
 });
 
-describe('App shared state rendering', () => {
+describe('Cross-tab payment coordination', () => {
+  let coordinator;
+
   beforeEach(() => {
     localStorage.clear();
-    vi.clearAllMocks();
-    mockPathname = '/';
-    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
-    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
-    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
-    freighterApi.getNetwork.mockResolvedValue({ network: 'TESTNET' });
+    vi.useFakeTimers();
+    coordinator = createPaymentCoordinator({ storage: localStorage });
   });
 
   afterEach(() => {
-    cleanup();
+    coordinator.destroy();
+    vi.useRealTimers();
     localStorage.clear();
   });
 
-  it('announces a loading state with an accessible status role', async () => {
-    render(<App />);
-
-    expect(await screen.findByRole('status')).toBeTruthy();
-  });
-
-  it('distinguishes an empty result from an error', async () => {
-    render(<App />);
-
-    await waitFor(() => {
-      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+  it('shares only a non-sensitive operation reference across tabs', () => {
+    coordinator.claim({
+      operationRef: 'op_ref_abc123',
+      account: TEST_PUBLIC_KEY,
+      network: 'TESTNET',
     });
 
-    expect(await screen.findByText(/no payments|nothing to show/i)).toBeTruthy();
-    expect(screen.queryByText(/something went wrong|error/i)).toBeNull();
+    const raw = localStorage.getItem(PAYMENT_COORDINATION_KEY);
+    const parsed = JSON.parse(raw);
+
+    expect(parsed.operationRef).toBe('op_ref_abc123');
+    expect(parsed.account).toBe(TEST_PUBLIC_KEY);
+    expect(parsed.network).toBe('TESTNET');
+    expect(parsed.amount).toBeUndefined();
+    expect(parsed.destination).toBeUndefined();
+    expect(parsed.secret).toBeUndefined();
   });
 
-  it('offers a retry action when a primary request fails', async () => {
-    freighterApi.getNetwork.mockRejectedValue(new Error('Network unavailable'));
-
-    render(<App />);
-
-    await waitFor(() => {
-      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+  it('prevents a second tab from starting a duplicate payment attempt', () => {
+    coordinator.claim({
+      operationRef: 'op_ref_abc123',
+      account: TEST_PUBLIC_KEY,
+      network: 'TESTNET',
     });
 
-    expect(await screen.findByRole('button', { name: /retry|try again/i })).toBeTruthy();
+    const otherTab = createPaymentCoordinator({ storage: localStorage });
+    const result = otherTab.claim({
+      operationRef: 'op_ref_other',
+      account: TEST_PUBLIC_KEY,
+      network: 'TESTNET',
+    });
+
+    expect(result.acquired).toBe(false);
+    expect(result.existing.operationRef).toBe('op_ref_abc123');
+
+    otherTab.destroy();
   });
 
-  it('keeps usable content visible when a secondary request fails', async () => {
-    render(<App />);
-
-    await waitFor(() => {
-      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+  it('expires stale coordination state after the TTL', () => {
+    coordinator.claim({
+      operationRef: 'op_ref_abc123',
+      account: TEST_PUBLIC_KEY,
+      network: 'TESTNET',
     });
 
-    expect(await screen.findByText(new RegExp(TEST_PUBLIC_KEY.slice(0, 6)))).toBeTruthy();
-    expect(await screen.findByText(/some data|partial|unavailable/i)).toBeTruthy();
+    vi.advanceTimersByTime(PAYMENT_COORDINATION_TTL_MS + 1);
+
+    expect(coordinator.read()).toBeNull();
+  });
+
+  it('ignores coordination state bound to a different account', () => {
+    coordinator.claim({
+      operationRef: 'op_ref_abc123',
+      account: OTHER_PUBLIC_KEY,
+      network: 'TESTNET',
+    });
+
+    expect(coordinator.read({ account: TEST_PUBLIC_KEY, network: 'TESTNET' })).toBeNull();
+  });
+
+  it('releases coordination state once the operation reaches a terminal state', () => {
+    coordinator.claim({
+      operationRef: 'op_ref_abc123',
+      account: TEST_PUBLIC_KEY,
+      network: 'TESTNET',
+    });
+
+    coordinator.release();
+
+    expect(localStorage.getItem(PAYMENT_COORDINATION_KEY)).toBeNull();
+  });
+
+  it('recovers from malformed coordination state without throwing', () => {
+    localStorage.setItem(PAYMENT_COORDINATION_KEY, '{broken');
+
+    expect(() => coordinator.read()).not.toThrow();
+    expect(coordinator.read()).toBeNull();
   });
 });

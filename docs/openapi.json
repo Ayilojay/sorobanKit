@@ -3,7 +3,7 @@
   "info": {
     "title": "Stellar Tags API",
     "version": "1.0.0",
-    "description": "OpenAPI specification for the Stellar Tags API. Covers the documented endpoints for tags, addresses, activity, and stats. API errors use a stable envelope with a machine-readable code and retryable flag; validation details contain only field names and safe messages.\n\n## Soft-delete, restore, and username reuse semantics\n\n- **Reservation window**: when a tag (username) is soft-deleted, its name is reserved for a fixed `SOFT_DELETE_RESERVATION_DAYS` (default 30 days) from `deletedAt`. During this window the name cannot be claimed by any other owner.\n- **Restoration proof**: restoring a soft-deleted tag requires the original owner's authenticated identity (bearer token whose subject matches the tag's `ownerId`). The restore request must reference the tag id and the `deletedAt` value observed at deletion time; a mismatch (stale or already-restored) is rejected with `409 Conflict`.\n- **Post-expiry reuse**: once the reservation window elapses, the name becomes reusable. A new registration may claim it; the prior soft-deleted record is retained for audit but can no longer be restored (`410 Gone`).\n- **Transactional transitions**: delete, restore, and registration are enforced transactionally (row-level lock on the name). Concurrent delete/restore/registration cannot produce multiple active owners; losers receive `409 Conflict`.",
+    "description": "OpenAPI specification for the Stellar Tags API. Covers the documented endpoints for tags, addresses, activity, and stats. API errors use a stable envelope with a machine-readable code and retryable flag; validation details contain only field names and safe messages.\n\n## Soft-delete, restore, and username reuse semantics\n\n- **Reservation window**: when a tag (username) is soft-deleted, its name is reserved for a fixed `SOFT_DELETE_RESERVATION_DAYS` (default 30 days) from `deletedAt`. During this window the name cannot be claimed by any other owner.\n- **Restoration proof**: restoring a soft-deleted tag requires the original owner's authenticated identity (bearer token whose subject matches the tag's `ownerId`). The restore request must reference the tag id and the `deletedAt` value observed at deletion time; a mismatch (stale or already-restored) is rejected with `409 Conflict`.\n- **Post-expiry reuse**: once the reservation window elapses, the name becomes reusable. A new registration may claim it; the prior soft-deleted record is retained for audit but can no longer be restored (`410 Gone`).\n- **Transactional transitions**: delete, restore, and registration are enforced transactionally (row-level lock on the name). Concurrent delete/restore/registration cannot produce multiple active owners; losers receive `409 Conflict`.\n\n## API versioning and backward compatibility\n\n- **Version negotiation**: clients may pin a published contract version with the `X-API-Version` request header (e.g. `1.0.0`). When the header is absent the server uses the current contract version. Unknown or unsupported versions are rejected with `400 INVALID_INPUT`.\n- **Compatibility policy**: within a major version, changes are additive only. Existing response fields, types, and status codes are never removed or narrowed; new optional fields may be added. Breaking changes require a new major version.\n- **Deprecation window**: deprecated fields and endpoints are announced via the `Deprecation` and `Sunset` response headers and remain functional for at least `API_DEPRECATION_WINDOW_DAYS` (default 90 days) before removal in the next major version.\n- **Compatibility testing**: released client contracts are checked into the repository and replayed against candidate server behavior in CI; any breaking response or request change fails the build with a diff.",
     "license": {
       "name": "MIT"
     }
@@ -40,7 +40,97 @@
               }
             }
           },
-          "503": { "$ref": "#/components/responses/ApiErrorResponse" }
+          "503": {
+            "description": "A dependency is unhealthy, or the server is draining during graceful shutdown",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    { "$ref": "#/components/schemas/HealthStatus" },
+                    { "$ref": "#/components/schemas/Error" }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health/startup": {
+      "get": {
+        "tags": ["Platform"],
+        "summary": "Check startup (initialization) completion",
+        "description": "Startup probe. Reports whether the process has finished one-time initialization (configuration loaded, database migrations verified, connection pools established). It does not depend on downstream dependency availability after initialization, so slow startup is never mistaken for a dead process. Intended for Kubernetes `startupProbe`; while it returns 503 the orchestrator must not run liveness checks or restart the container.",
+        "operationId": "getStartupHealth",
+        "responses": {
+          "200": {
+            "description": "Initialization has completed",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StartupHealthStatus" }
+              }
+            }
+          },
+          "503": {
+            "description": "Initialization is still in progress (or failed); the process is not yet ready to be probed for liveness",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StartupHealthStatus" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health/live": {
+      "get": {
+        "tags": ["Platform"],
+        "summary": "Check process liveness",
+        "description": "Liveness probe. Reports whether the process event loop is responsive and not deadlocked. It intentionally ignores dependency health (database, Redis, Horizon): a dependency outage must not cause a restart. A 503 here means the process is wedged and should be restarted by the orchestrator. Intended for Kubernetes `livenessProbe`.",
+        "operationId": "getLivenessHealth",
+        "responses": {
+          "200": {
+            "description": "Process is alive and its event loop is responsive",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/LivenessHealthStatus" }
+              }
+            }
+          },
+          "503": {
+            "description": "Process is deadlocked or its event loop is unresponsive; restart required",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/LivenessHealthStatus" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health/ready": {
+      "get": {
+        "tags": ["Platform"],
+        "summary": "Check traffic readiness",
+        "description": "Readiness probe. Reports whether the instance can serve traffic: initialization must be complete and routing-critical dependencies (database, and Redis when configured) must be reachable. Horizon is not routing-critical and does not affect readiness. A 503 removes the instance from the load balancer without restarting it. Intended for Kubernetes `readinessProbe`.",
+        "operationId": "getReadinessHealth",
+        "responses": {
+          "200": {
+            "description": "Instance is ready to receive traffic",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ReadinessHealthStatus" }
+              }
+            }
+          },
+          "503": {
+            "description": "Instance is not ready to receive traffic (initialization incomplete or a routing-critical dependency is unavailable)",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ReadinessHealthStatus" }
+              }
+            }
+          }
         }
       }
     },
@@ -49,6 +139,7 @@
         "tags": ["Addresses"],
         "summary": "Resolve a federation name or address",
         "operationId": "getFederation",
+        "description": "Public metadata response. The `ETag` is computed from the canonical resolved federation data and changes whenever a user mutation changes the resolved result. Clients may send `If-None-Match` to receive `304 Not Modified` when the representation is unchanged. Responses are public-cacheable (`Cache-Control: public`) because they do not depend on the caller's authorization.",
         "parameters": [
           {
             "name": "q",
@@ -60,17 +151,24 @@
             "name": "type",
             "in": "query",
             "schema": { "type": "string", "enum": ["id", "name"] }
-          }
+          },
+          { "$ref": "#/components/parameters/IfNoneMatchParam" }
         ],
         "responses": {
           "200": {
             "description": "Resolved federation identity",
+            "headers": {
+              "ETag": { "$ref": "#/components/headers/ETagHeader" },
+              "Cache-Control": { "$ref": "#/components/headers/PublicCacheControlHeader" },
+              "Vary": { "$ref": "#/components/headers/VaryHeader" }
+            },
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/FederationEntry" }
               }
             }
           },
+          "304": { "$ref": "#/components/responses/NotModified" },
           "400": { "$ref": "#/components/responses/ApiErrorResponse" },
           "404": { "$ref": "#/components/responses/ApiErrorResponse" },
           "500": { "$ref": "#/components/responses/ApiErrorResponse" },
@@ -122,20 +220,28 @@
         "tags": ["Tags"],
         "summary": "List tags",
         "operationId": "listTags",
+        "description": "Public metadata response. The `ETag` is computed from the canonical response data and is invalidated when user mutations change the resolved data. Supports `If-None-Match` conditional requests returning `304 Not Modified`.",
         "parameters": [
           { "$ref": "#/components/parameters/PageParam" },
           { "$ref": "#/components/parameters/LimitParam" },
-          { "name": "q", "in": "query", "description": "Search query", "schema": { "type": "string" } }
+          { "name": "q", "in": "query", "description": "Search query", "schema": { "type": "string" } },
+          { "$ref": "#/components/parameters/IfNoneMatchParam" }
         ],
         "responses": {
           "200": {
             "description": "A paginated list of tags",
+            "headers": {
+              "ETag": { "$ref": "#/components/headers/ETagHeader" },
+              "Cache-Control": { "$ref": "#/components/headers/PublicCacheControlHeader" },
+              "Vary": { "$ref": "#/components/headers/VaryHeader" }
+            },
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/TagList" }
               }
             }
           },
+          "304": { "$ref": "#/components/responses/NotModified" },
           "400": { "$ref": "#/components/responses/BadRequest" }
         }
       },
@@ -143,7 +249,10 @@
         "tags": ["Tags"],
         "summary": "Create a tag",
         "operationId": "createTag",
-        "description": "Registers a new tag (username). If the name was soft-deleted and its reservation window has not expired, registration is rejected with `409 Conflict`. Once the window expires the name is reusable.",
+        "description": "Registers a new tag (username). If the name was soft-deleted and its reservation window has not expired, registration is rejected with `409 Conflict`. Once the window expires the name is reusable. Supports idempotent submission via `X-Idempotency-Key`; replays return the original outcome with `X-Idempotent-Replay: true`.",
+        "parameters": [
+          { "$ref": "#/components/parameters/IdempotencyKeyParam" }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -158,6 +267,50 @@
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Tag" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "409": { "$ref": "#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/api/tags/bulk": {
+      "post": {
+        "tags": ["Tags"],
+        "summary": "Create payment intents in bulk",
+        "operationId": "createTagsBulk",
+        "description": "Creates multiple payment intents atomically. Each request carries a client-supplied `batchId` (stable batch identifier) and each item carries a client-supplied `externalId` (stable item identifier). Persistence is all-or-nothing: if any item fails validation, no items are written and the response is `400` with per-item validation details. Item ordering in the response matches the request order. Retries are safe: repeating a request with the same `batchId` and `externalId` values returns the previously created batch (`200`) instead of creating duplicates; reusing an `externalId` with different content is rejected with `409 Conflict`.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/BulkTagCreateInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Idempotent replay of a previously created batch",
+            "headers": {
+              "ETag": { "$ref": "#/components/headers/ETagHeader" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/BulkTagCreateResult" }
+              }
+            }
+          },
+          "201": {
+            "description": "All items created atomically",
+            "headers": {
+              "ETag": { "$ref": "#/components/headers/ETagHeader" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/BulkTagCreateResult" }
               }
             }
           },
@@ -191,6 +344,10 @@
         "tags": ["Tags"],
         "summary": "Update a tag",
         "operationId": "updateTag",
+        "description": "Supports idempotent submission via `X-Idempotency-Key`; replays return the original outcome with `X-Idempotent-Replay: true`.",
+        "parameters": [
+          { "$ref": "#/components/parameters/IdempotencyKeyParam" }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -210,6 +367,7 @@
           },
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" }
         }
       },
@@ -217,10 +375,14 @@
         "tags": ["Tags"],
         "summary": "Soft-delete a tag",
         "operationId": "deleteTag",
-        "description": "Soft-deletes the tag and starts the reservation window (`SOFT_DELETE_RESERVATION_DAYS`, default 30 days) during which the name cannot be reused. The transition is transactional; concurrent deletes/restores/registrations cannot create multiple owners.",
+        "description": "Soft-deletes the tag and starts the reservation window (`SOFT_DELETE_RESERVATION_DAYS`, default 30 days) during which the name cannot be reused. The transition is transactional; concurrent deletes/restores/registrations cannot create multiple owners. Supports idempotent submission via `X-Idempotency-Key`; replays return the original outcome with `X-Idempotent-Replay: true`.",
+        "parameters": [
+          { "$ref": "#/components/parameters/IdempotencyKeyParam" }
+        ],
         "responses": {
           "204": { "description": "Tag soft-deleted" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" },
           "409": { "$ref": "#/components/responses/Conflict" }
         }
@@ -234,8 +396,11 @@
         "tags": ["Tags"],
         "summary": "Restore a soft-deleted tag",
         "operationId": "restoreTag",
-        "description": "Restores a soft-deleted tag within its reservation window. Requires the original owner's authenticated identity and the `deletedAt` value observed at deletion time as restoration proof. Fails with `409 Conflict` on stale/already-restored state and `410 Gone` after the reservation window expires.",
+        "description": "Restores a soft-deleted tag within its reservation window. Requires the original owner's authenticated identity and the `deletedAt` value observed at deletion time as restoration proof. Fails with `409 Conflict` on stale/already-restored state and `410 Gone` after the reservation window expires. Supports idempotent submission via `X-Idempotency-Key`; replays return the original outcome with `X-Idempotent-Replay: true`.",
         "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "$ref": "#/components/parameters/IdempotencyKeyParam" }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -284,6 +449,46 @@
         }
       }
     },
+    "/api/payments/events": {
+      "get": {
+        "tags": ["Payments"],
+        "summary": "Stream payment status updates",
+        "operationId": "streamPaymentEvents",
+        "description": "Server-sent event (SSE) feed of payment status updates for the authenticated client. Each event is versioned (`event: payment.status`, `data` includes `version` and monotonic `sequence`). Clients reconnect with `Last-Event-ID` (or the `cursor` query parameter) to resume after the last received event; the server replays events after the cursor. Heartbeat comments are sent periodically to keep idle connections alive. The feed is bounded: a per-client connection limit applies (`429` when exceeded) and slow clients are disconnected rather than buffered indefinitely. Disconnects release all server resources. Responses are never shared-cached because they depend on the caller's authorization.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque reconnect cursor; equivalent to sending the `Last-Event-ID` header",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "Last-Event-ID",
+            "in": "header",
+            "description": "Standard SSE reconnect header carrying the last received event id",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Event stream",
+            "headers": {
+              "Cache-Control": { "$ref": "#/components/headers/PrivateNoStoreCacheControlHeader" },
+              "Vary": { "$ref": "#/components/headers/VaryHeader" }
+            },
+            "content": {
+              "text/event-stream": {
+                "schema": { "$ref": "#/components/schemas/PaymentEventStream" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "$ref": "#/components/responses/TooManyRequests" }
+        }
+      }
+    },
     "/api/activity": {
       "get": {
         "tags": ["Activity"],
@@ -328,8 +533,10 @@
       "get": {
         "tags": ["Admin"],
         "summary": "Get admin statistics",
+        "description": "Requires the `admin:read` permission.",
         "operationId": "getAdminStats",
         "security": [{ "bearerAuth": [] }],
+        "x-required-permission": "admin:read",
         "responses": {
           "200": {
             "description": "Administrative statistics",
@@ -344,13 +551,133 @@
         }
       }
     },
+    "/api/admin/export/jobs": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Create a background export job",
+        "description": "Creates a durable, cancellable background job that streams a large administrative export to artifact storage. The job is owned by the authenticated caller; only the owner may read, cancel, or download it. Returns `202 Accepted` with the job id and initial status.",
+        "operationId": "createExportJob",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ExportJobInput" }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Export job accepted and running in the background",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ExportJob" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "$ref": "#/components/responses/ApiErrorResponse" }
+        }
+      }
+    },
+    "/api/admin/export/jobs/{id}": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ExportJobIdParam" }
+      ],
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Get export job status and progress",
+        "description": "Returns the current status and progress of an export job. Only the job owner may read it; other authenticated callers receive `403 Forbidden`.",
+        "operationId": "getExportJob",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Current export job status and progress",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ExportJob" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/admin/export/jobs/{id}/cancel": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ExportJobIdParam" }
+      ],
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Cancel an export job",
+        "description": "Requests cancellation of a queued or running export job. Cancellation is cooperative: the worker stops streaming and the job transitions to `cancelled`. Cancelling an already terminal job is idempotent and returns its current state. Only the job owner may cancel it.",
+        "operationId": "cancelExportJob",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Export job cancellation acknowledged; current job state returned",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ExportJob" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/api/admin/export/jobs/{id}/download": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ExportJobIdParam" }
+      ],
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Download a completed export artifact",
+        "description": "Streams the completed export artifact from artifact storage. The response is `text/csv` or `application/x-ndjson` depending on the requested format. Only the job owner may download it. Returns `409 Conflict` if the job has not completed, and `410 Gone` once the artifact has expired.",
+        "operationId": "downloadExportJob",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Export artifact stream",
+            "headers": {
+              "Content-Disposition": {
+                "description": "Attachment filename for the export artifact",
+                "schema": { "type": "string" }
+              }
+            },
+            "content": {
+              "text/csv": {
+                "schema": { "type": "string", "format": "binary" }
+              },
+              "application/x-ndjson": {
+                "schema": { "type": "string", "format": "binary" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "410": { "$ref": "#/components/responses/Gone" }
+        }
+      }
+    },
     "/api/admin/stats/refresh": {
+=======
       "post": {
         "tags": ["Admin"],
         "summary": "Trigger a reporting read model refresh",
-        "description": "Enqueues an asynchronous refresh of the reporting read model. The refresh runs decoupled from the payment write path and records the source watermark on completion. Returns the current refresh status.",
+        "description": "Enqueues an asynchronous refresh of the reporting read model. The refresh runs decoupled from the payment write path and records the source watermark on completion. Returns the current refresh status. Requires the `admin:operate` permission.",
         "operationId": "refreshStats",
         "security": [{ "bearerAuth": [] }],
+        "x-required-permission": "admin:operate",
         "responses": {
           "202": {
             "description": "Refresh accepted and running asynchronously",
@@ -373,9 +700,10 @@
       "get": {
         "tags": ["Admin"],
         "summary": "Get reporting read model refresh status",
-        "description": "Returns the current refresh status and source watermark of the reporting read model.",
+        "description": "Returns the current refresh status and source watermark of the reporting read model. Requires the `admin:read` permission.",
         "operationId": "getStatsRefreshStatus",
         "security": [{ "bearerAuth": [] }],
+        "x-required-permission": "admin:read",
         "responses": {
           "200": {
             "description": "Current refresh status",
@@ -389,6 +717,189 @@
           "403": { "$ref": "#/components/responses/Forbidden" }
         }
       }
+    },
+    "/api/admin/api-keys/{id}/rotate": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ApiKeyIdParam" }
+      ],
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Rotate an API key with a bounded overlap window",
+        "description": "Issues a successor API key and schedules revocation of the predecessor at the end of a bounded overlap window (default 24 hours, capped by `API_KEY_ROTATION_MAX_OVERLAP_HOURS`). Both keys are accepted during the overlap; the predecessor is revoked immediately at the end of the window. The response contains the raw successor key material exactly once; subsequent reads of the key return only redacted metadata. Rotation is transactional and idempotent per predecessor: concurrent rotation attempts yield a single successor and losers receive `409 Conflict`. Requires the `admin:configure` permission and a confirmed step-up challenge bound to this action and payload hash.",
+        "operationId": "rotateApiKey",
+        "security": [{ "bearerAuth": [] }],
+        "x-required-permission": "admin:configure",
+        "x-requires-step-up": true,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RotateApiKeyInput" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successor key issued; raw key material is returned only in this response",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApiKeyRotationResult" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "428": { "$ref": "#/components/responses/StepUpRequired" }
+        }
+      }
+    },
+    "/api/admin/api-keys/{id}/revoke": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ApiKeyIdParam" }
+      ],
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Immediately revoke an API key",
+        "description": "Revokes the key immediately, including any key still inside its rotation overlap window. Revocation is auditable: the response records the actor, reason, and timestamp. Requires the `admin:configure` permission.",
+        "operationId": "revokeApiKey",
+        "security": [{ "bearerAuth": [] }],
+        "x-required-permission": "admin:configure",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RevokeApiKeyInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Key revoked",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApiKey" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/api/admin/step-up/challenges": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Issue a step-up verification challenge",
+        "description": "Issues a short-lived, single-use challenge bound to the requested action and the SHA-256 hash of the canonical request payload. The challenge expires after `STEP_UP_CHALLENGE_TTL_SECONDS` (default 300 seconds). The caller confirms the challenge out-of-band (second factor) and then submits the confirmation token with the high-impact request. Requires the `admin:operate` permission.",
+        "operationId": "createStepUpChallenge",
+        "security": [{ "bearerAuth": [] }],
+        "x-required-permission": "admin:operate",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/StepUpChallengeInput" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Challenge issued",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StepUpChallenge" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/api/admin/step-up/challenges/{challengeId}/confirm": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ChallengeIdParam" }
+      ],
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Confirm a step-up verification challenge",
+        "description": "Confirms the challenge with the second-factor code. On success the challenge becomes a single-use confirmation token bound to the original action and payload hash. Confirmation fails with `410 Gone` when the challenge has expired, `409 Conflict` when it was already used, and `422 Unprocessable Entity` when the action or payload hash does not match the request being authorized. Requires the `admin:operate` permission.",
+        "operationId": "confirmStepUpChallenge",
+        "security": [{ "bearerAuth": [] }],
+        "x-required-permission": "admin:operate",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/StepUpConfirmationInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Challenge confirmed; confirmation token issued",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StepUpConfirmation" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "410": { "$ref": "#/components/responses/Gone" },
+          "422": { "$ref": "#/components/responses/UnprocessableEntity" }
+        }
+      }
+    },
+    "/api/admin/contracts/{contractId}/upgrade": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ContractIdParam" }
+      ],
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Upgrade a contract to a new WASM hash",
+        "description": "High-impact configuration change. Requires the `admin:configure` permission and a confirmed, single-use step-up challenge bound to the `contract.upgrade` action and the SHA-256 hash of the canonical request payload. Missing step-up yields `428 Precondition Required`; expired challenges yield `410 Gone`; reused challenges yield `409 Conflict`; mismatched action or payload hash yields `422 Unprocessable Entity`. Every attempt, successful or not, is recorded in the audit log with the actor, action, payload hash, and challenge id.",
+        "operationId": "upgradeContract",
+        "security": [{ "bearerAuth": [] }],
+        "x-required-permission": "admin:configure",
+        "x-requires-step-up": true,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ContractUpgradeInput" }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Upgrade accepted for execution",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ContractUpgradeResult" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "410": { "$ref": "#/components/responses/Gone" },
+          "422": { "$ref": "#/components/responses/UnprocessableEntity" },
+          "428": { "$ref": "#/components/responses/StepUpRequired" }
+        }
+      }
     }
   },
   "components": {
@@ -399,7 +910,32 @@
         "bearerFormat": "JWT"
       }
     },
+    "headers": {
+      "ETagHeader": {
+        "description": "Strong validator computed from the canonical response data",
+        "schema": { "type": "string" }
+      },
+      "PublicCacheControlHeader": {
+        "description": "Public caching directive for authorization-independent responses",
+        "schema": { "type": "string", "example": "public, max-age=60" }
+      },
+      "PrivateNoStoreCacheControlHeader": {
+        "description": "Prevents shared caching of authorization-dependent responses",
+        "schema": { "type": "string", "example": "private, no-store" }
+      },
+      "VaryHeader": {
+        "description": "Response varies on these request headers",
+        "schema": { "type": "string", "example": "Accept, Accept-Encoding" }
+      }
+    },
     "parameters": {
+      "ApiVersionParam": {
+        "name": "X-API-Version",
+        "in": "header",
+        "required": false,
+        "description": "Pinned published contract version (semver). Defaults to the current contract version when omitted. Unsupported versions are rejected with 400 INVALID_INPUT.",
+        "schema": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" }
+      },
       "PageParam": {
         "name": "page",
         "in": "query",
@@ -438,11 +974,21 @@
         "required": true,
         "description": "Token identifier (asset code or contract address)",
         "schema": { "type": "string" }
+      },
+      "IdempotencyKeyParam": {
+        "name": "X-Idempotency-Key",
+        "in": "header",
+        "required": false,
+        "description": "Client-generated idempotency key scoped to the authenticated principal and operation. Reusing the key for retries of the same logical operation returns the original outcome and sets `X-Idempotent-Replay: true`. Generate a fresh key per logical operation; keys expire.",
+        "schema": { "type": "string", "minLength": 8, "maxLength": 255 }
       }
     },
     "responses": {
       "ApiErrorResponse": {
-        "description": "A standardized API error",
+        "description": "A standardized API error. Clients map `error.code` to a central catalog for actionable, accessible recovery guidance, fall back safely for unknown codes, honor `error.retryable` for retry behavior, and display `reference_id` for support correlation.",
+        "headers": {
+          "X-Idempotent-Replay": { "$ref": "#/components/headers/IdempotentReplayHeader" }
+        },
         "content": {
           "application/json": {
             "schema": { "$ref": "#/components/schemas/Error" }
@@ -488,10 +1034,49 @@
         }
       },
       "Gone": {
-        "description": "Reservation window expired; the tag can no longer be restored",
+        "description": "Reservation window expired or step-up challenge expired; the operation can no longer proceed",
         "content": {
           "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
         }
+      },
+      "UnprocessableEntity": {
+        "description": "Step-up challenge action or payload hash does not match the request being authorized",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+        }
+      },
+      "StepUpRequired": {
+        "description": "A confirmed step-up challenge is required for this high-impact action",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+        }
+      },
+      "NotModified": {
+        "description": "The `If-None-Match` validator matched the current ETag; the representation is unchanged",
+        "headers": {
+          "ETag": { "$ref": "#/components/headers/ETagHeader" },
+          "Cache-Control": { "$ref": "#/components/headers/PublicCacheControlHeader" }
+        }
+      },
+      "TooManyRequests": {
+        "description": "Connection limit exceeded for this client",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+        }
+      }
+    },
+    "headers": {
+      "ApiVersion": {
+        "description": "The contract version used to serve the response.",
+        "schema": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" }
+      },
+      "Deprecation": {
+        "description": "Present when the endpoint or a field in the response is deprecated. Value is the RFC 9745 deprecation timestamp.",
+        "schema": { "type": "string" }
+      },
+      "Sunset": {
+        "description": "Present when the endpoint or a field in the response is deprecated. Value is the RFC 8594 sunset timestamp after which removal may occur (at least API_DEPRECATION_WINDOW_DAYS after Deprecation).",
+        "schema": { "type": "string" }
       }
     },
     "schemas": {
@@ -512,6 +1097,44 @@
           "address": { "type": "string" },
           "createdAt": { "type": "string", "format": "date-time" },
           "deletedAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "CompatibilityReport": {
+        "type": "object",
+        "description": "Result of replaying a released client contract against the candidate server behavior.",
+        "required": ["version", "compatible"],
+        "properties": {
+          "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+          "compatible": { "type": "boolean" },
+          "breakingChanges": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["path", "method", "kind", "diff"],
+              "properties": {
+                "path": { "type": "string" },
+                "method": { "type": "string" },
+                "kind": {
+                  "type": "string",
+                  "enum": ["response_field_removed", "response_type_changed", "status_code_removed", "request_field_required", "request_field_removed"]
+                },
+                "diff": { "type": "string" }
+              }
+            }
+          },
+          "deprecations": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["path", "method", "deprecatedAt", "sunsetAt"],
+              "properties": {
+                "path": { "type": "string" },
+                "method": { "type": "string" },
+                "deprecatedAt": { "type": "string", "format": "date-time" },
+                "sunsetAt": { "type": "string", "format": "date-time" }
+              }
+            }
+          }
         }
       },
       "TagList": {
@@ -537,6 +1160,58 @@
         "type": "object",
         "description": "Aggregate metrics and the refresh watermark for the reporting read model.",
         "additionalProperties": true
+      },
+      "ExportJobInput": {
+        "type": "object",
+        "required": ["format"],
+        "properties": {
+          "format": {
+            "type": "string",
+            "enum": ["csv", "ndjson"],
+            "description": "Serialization format of the export artifact"
+          },
+          "resource": {
+            "type": "string",
+            "description": "Logical dataset to export (e.g. tags, activity)"
+          },
+          "filters": {
+            "type": "object",
+            "description": "Optional dataset-specific filters",
+            "additionalProperties": true
+          }
+        }
+      },
+      "ExportJob": {
+        "type": "object",
+        "required": ["id", "status", "format", "createdAt"],
+        "properties": {
+          "id": { "type": "string" },
+          "status": {
+            "type": "string",
+            "enum": ["queued", "running", "succeeded", "failed", "cancelled", "expired"]
+          },
+          "format": { "type": "string", "enum": ["csv", "ndjson"] },
+          "resource": { "type": "string" },
+          "progress": {
+            "type": "object",
+            "description": "Progress of the export job",
+            "properties": {
+              "processed": { "type": "integer", "minimum": 0 },
+              "total": { "type": "integer", "minimum": 0 },
+              "percent": { "type": "number", "minimum": 0, "maximum": 100 }
+            }
+          },
+          "ownerId": { "type": "string" },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "startedAt": { "type": "string", "format": "date-time" },
+          "completedAt": { "type": "string", "format": "date-time" },
+          "expiresAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the downloadable artifact expires; after this the download returns 410 Gone"
+          },
+          "error": { "type": "string" }
+        }
       },
       "StatsRefreshStatus": {
         "type": "object",
@@ -574,11 +1249,22 @@
                   "RATE_LIMITED",
                   "INTERNAL_ERROR",
                   "UPSTREAM_ERROR",
-                  "SERVICE_UNAVAILABLE"
+                  "SERVICE_UNAVAILABLE",
+                  "INSUFFICIENT_PERMISSION",
+                  "STEP_UP_REQUIRED",
+                  "STEP_UP_CHALLENGE_EXPIRED",
+                  "STEP_UP_CHALLENGE_REUSED",
+                  "STEP_UP_CHALLENGE_MISMATCH"
                 ]
               },
-              "message": { "type": "string" },
-              "retryable": { "type": "boolean" },
+              "message": {
+                "type": "string",
+                "description": "Safe, human-readable message. Clients should prefer their central code-to-message catalog and use this only as a fallback."
+              },
+              "retryable": {
+                "type": "boolean",
+                "description": "Whether the client may retry the same operation. When `true`, retry with backoff (reusing the same `X-Idempotency-Key` for state-changing requests). When `false`, do not auto-retry; surface remediation guidance instead."
+              },
               "details": {
                 "type": "array",
                 "items": {
@@ -592,19 +1278,81 @@
               }
             }
           },
-          "correlation_id": { "type": "string" },
-          "reference_id": { "type": "string" }
+          "correlation_id": {
+            "type": "string",
+            "description": "Opaque tracing identifier. Safe to display and log; never contains internal details."
+          },
+          "reference_id": {
+            "type": "string",
+            "description": "Safe, opaque, non-sensitive reference identifier for support correlation. Display to the user when present. Never a secret and never contains server internals."
+          }
         }
       },
       "HealthStatus": {
         "type": "object",
         "required": ["status", "timestamp", "database", "redis", "horizon"],
         "properties": {
-          "status": { "type": "string", "enum": ["UP"] },
+          "status": { "type": "string", "enum": ["UP", "DRAINING"] },
           "timestamp": { "type": "string", "format": "date-time" },
-          "database": { "type": "string", "enum": ["up"] },
-          "redis": { "type": "string", "enum": ["up", "not configured"] },
-          "horizon": { "type": "string", "enum": ["up"] }
+          "database": { "type": "string", "enum": ["up", "draining", "down"] },
+          "redis": { "type": "string", "enum": ["up", "draining", "down", "not configured"] },
+          "horizon": { "type": "string", "enum": ["up", "draining", "down"] }
+        }
+      },
+      "StartupHealthStatus": {
+        "type": "object",
+        "description": "Result of the startup probe. `status` is `UP` once initialization has completed and `DOWN` while it is still in progress or has failed.",
+        "required": ["status", "timestamp", "initialized"],
+        "properties": {
+          "status": { "type": "string", "enum": ["UP", "DOWN"] },
+          "timestamp": { "type": "string", "format": "date-time" },
+          "initialized": { "type": "boolean" },
+          "phase": {
+            "type": "string",
+            "description": "Current initialization phase, for diagnostics only",
+            "enum": ["pending", "initializing", "completed", "failed"]
+          },
+          "durationMs": { "type": "integer", "minimum": 0 },
+          "error": { "type": "string" }
+        }
+      },
+      "LivenessHealthStatus": {
+        "type": "object",
+        "description": "Result of the liveness probe. Dependency health is deliberately excluded; only process responsiveness is reported.",
+        "required": ["status", "timestamp", "uptimeSeconds"],
+        "properties": {
+          "status": { "type": "string", "enum": ["UP", "DOWN"] },
+          "timestamp": { "type": "string", "format": "date-time" },
+          "uptimeSeconds": { "type": "number", "minimum": 0 },
+          "eventLoopResponsive": { "type": "boolean" },
+          "eventLoopLagMs": { "type": "number", "minimum": 0 },
+          "error": { "type": "string" }
+        }
+      },
+      "ReadinessHealthStatus": {
+        "type": "object",
+        "description": "Result of the readiness probe. Only routing-critical dependencies are reported; Horizon is excluded because it does not affect routing.",
+        "required": ["status", "timestamp", "initialized", "database"],
+        "properties": {
+          "status": { "type": "string", "enum": ["UP", "DOWN"] },
+          "timestamp": { "type": "string", "format": "date-time" },
+          "initialized": { "type": "boolean" },
+          "database": { "type": "string", "enum": ["up", "down"] },
+          "redis": { "type": "string", "enum": ["up", "down", "not configured"] },
+          "checks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name", "status", "critical"],
+              "properties": {
+                "name": { "type": "string" },
+                "status": { "type": "string", "enum": ["up", "down", "not configured"] },
+                "critical": { "type": "boolean" },
+                "latencyMs": { "type": "number", "minimum": 0 },
+                "error": { "type": "string" }
+              }
+            }
+          }
         }
       },
       "FederationEntry": {
@@ -630,6 +1378,60 @@
           "currentPage": { "type": "integer" }
         }
       },
+      "BulkTagCreateInput": {
+        "type": "object",
+        "required": ["batchId", "items"],
+        "properties": {
+          "batchId": {
+            "type": "string",
+            "description": "Client-supplied stable batch identifier; retries with the same value are idempotent"
+          },
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 100,
+            "description": "Items are persisted atomically and returned in request order",
+            "items": { "$ref": "#/components/schemas/BulkTagCreateItemInput" }
+          }
+        }
+      },
+      "BulkTagCreateItemInput": {
+        "type": "object",
+        "required": ["externalId", "username", "address"],
+        "properties": {
+          "externalId": {
+            "type": "string",
+            "description": "Client-supplied stable item identifier; repeating it with identical content is idempotent, differing content is rejected with 409 Conflict"
+          },
+          "username": { "type": "string" },
+          "address": { "type": "string" }
+        }
+      },
+      "BulkTagCreateResult": {
+        "type": "object",
+        "required": ["batchId", "items"],
+        "properties": {
+          "batchId": { "type": "string" },
+          "items": {
+            "type": "array",
+            "description": "Created items in the same order as the request",
+            "items": { "$ref": "#/components/schemas/BulkTagCreateItemResult" }
+          }
+        }
+      },
+      "BulkTagCreateItemResult": {
+        "type": "object",
+        "required": ["externalId", "status"],
+        "properties": {
+          "externalId": { "type": "string" },
+          "status": { "type": "string", "enum": ["created", "existing"] },
+          "tag": { "$ref": "#/components/schemas/Tag" }
+        }
+      },
+      "PaymentEventStream": {
+        "type": "string",
+        "description": "SSE stream. Each `payment.status` event carries an `id` (reconnect cursor), `event` name, and JSON `data` with `version`, `sequence`, `paymentId`, and `status`. Heartbeats are sent as SSE comments (`: heartbeat`)."
+      },
       "RestoreTagInput": {
         "type": "object",
         "required": ["deletedAt"],
@@ -639,6 +1441,127 @@
             "format": "date-time",
             "description": "The `deletedAt` value observed at deletion time; used as restoration proof. A mismatch is rejected with 409 Conflict."
           }
+        }
+      },
+      "AdminPermission": {
+        "type": "string",
+        "description": "Policy-based administrative permission. `admin:read` grants read-only access, `admin:operate` grants operational actions, and `admin:configure` grants configuration-changing actions. Higher scopes do not implicitly grant lower ones unless the role policy states so.",
+        "enum": ["admin:read", "admin:operate", "admin:configure"]
+      },
+      "ApiKey": {
+        "type": "object",
+        "required": ["id", "prefix", "status", "createdAt"],
+        "properties": {
+          "id": { "type": "string" },
+          "prefix": { "type": "string", "description": "Non-secret key prefix for identification" },
+          "status": { "type": "string", "enum": ["active", "rotating", "revoked", "expired"] },
+          "predecessorId": { "type": "string", "nullable": true, "description": "Key this key replaced, if any" },
+          "successorId": { "type": "string", "nullable": true, "description": "Key that replaced this key, if any" },
+          "overlapEndsAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "End of the rotation overlap window; the predecessor is revoked at this instant"
+          },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "revokedAt": { "type": "string", "format": "date-time" },
+          "revokedBy": { "type": "string", "description": "Actor that revoked the key" },
+          "revocationReason": { "type": "string" }
+        }
+      },
+      "RotateApiKeyInput": {
+        "type": "object",
+        "properties": {
+          "overlapHours": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 168,
+            "description": "Requested overlap window in hours. Capped by the server-side `API_KEY_ROTATION_MAX_OVERLAP_HOURS` setting."
+          },
+          "stepUpToken": {
+            "type": "string",
+            "description": "Single-use confirmation token from a confirmed step-up challenge bound to this action and payload hash"
+          }
+        }
+      },
+      "ApiKeyRotationResult": {
+        "type": "object",
+        "required": ["predecessor", "successor", "key"],
+        "properties": {
+          "predecessor": { "$ref": "#/components/schemas/ApiKey" },
+          "successor": { "$ref": "#/components/schemas/ApiKey" },
+          "key": {
+            "type": "string",
+            "description": "Raw key material. Returned exactly once at rotation time and never again; later reads are redacted."
+          },
+          "overlapEndsAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "RevokeApiKeyInput": {
+        "type": "object",
+        "required": ["reason"],
+        "properties": {
+          "reason": { "type": "string", "minLength": 1, "maxLength": 500 }
+        }
+      },
+      "StepUpChallengeInput": {
+        "type": "object",
+        "required": ["action", "payloadHash"],
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "High-impact action being authorized",
+            "enum": ["contract.upgrade", "treasury.change", "bulk.export", "api_key.rotate"]
+          },
+          "payloadHash": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "description": "SHA-256 hex digest of the canonical request payload"
+          }
+        }
+      },
+      "StepUpChallenge": {
+        "type": "object",
+        "required": ["challengeId", "action", "payloadHash", "expiresAt"],
+        "properties": {
+          "challengeId": { "type": "string" },
+          "action": { "type": "string" },
+          "payloadHash": { "type": "string" },
+          "expiresAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "StepUpConfirmationInput": {
+        "type": "object",
+        "required": ["code"],
+        "properties": {
+          "code": { "type": "string", "description": "Second-factor verification code" }
+        }
+      },
+      "StepUpConfirmation": {
+        "type": "object",
+        "required": ["stepUpToken", "action", "payloadHash", "expiresAt"],
+        "properties": {
+          "stepUpToken": { "type": "string", "description": "Single-use confirmation token to submit with the high-impact request" },
+          "action": { "type": "string" },
+          "payloadHash": { "type": "string" },
+          "expiresAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "ContractUpgradeInput": {
+        "type": "object",
+        "required": ["wasmHash", "stepUpToken"],
+        "properties": {
+          "wasmHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+          "stepUpToken": { "type": "string" }
+        }
+      },
+      "ContractUpgradeResult": {
+        "type": "object",
+        "required": ["contractId", "wasmHash", "status", "auditId"],
+        "properties": {
+          "contractId": { "type": "string" },
+          "wasmHash": { "type": "string" },
+          "status": { "type": "string", "enum": ["accepted", "in_progress", "succeeded", "failed"] },
+          "auditId": { "type": "string", "description": "Audit record correlating actor, action, payload hash, and challenge id" }
         }
       }
     }

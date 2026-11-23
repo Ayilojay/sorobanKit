@@ -22,4 +22,28 @@ updates:
         update-types:
           - "minor"
           - "patch"
-</parameter>
+
+  # Keep GitHub Actions pinned to immutable commit SHAs up to date.
+  # Dependabot rewrites the SHA and preserves/updates the trailing
+  # "# vX.Y.Z" version comment so pins stay readable and reviewable.
+  # See the pinning policy in .github/workflows/ for rationale.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(actions)"
+    labels:
+      - "dependencies"
+      - "ci"
+    reviewers:
+      - "maintainers"
+    # Group patch/minor bumps so a single PR keeps the pins current.
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"

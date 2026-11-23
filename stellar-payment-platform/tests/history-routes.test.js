@@ -57,7 +57,23 @@ describe('GET /accounts/:account/payments', () => {
 
   it('returns payments, next and prev cursors', async () => {
     mockFetchPaymentsForAccount.mockResolvedValue({
-      _embedded: { records: [{ id: 'p1' }] },
+      _embedded: {
+        records: [
+          {
+            id: 'p1',
+            paging_token: 'p1',
+            type: 'payment',
+            transaction_hash: 'abc123',
+            network: 'testnet',
+            asset_type: 'credit_alphanum4',
+            asset_code: 'USDC',
+            asset_issuer: 'GISSUER',
+            amount: '10.1234567',
+            from: VALID_ACCOUNT,
+            to: VALID_ACCOUNT,
+          },
+        ],
+      },
       _links: {
         next: { href: '/next' },
         prev: { href: '/prev' },
@@ -67,7 +83,21 @@ describe('GET /accounts/:account/payments', () => {
     const res = await request(buildApp()).get(`/accounts/${VALID_ACCOUNT}/payments?limit=10&order=asc`);
     expect(res.status).toBe(200);
     expect(res.body).toEqual({
-      records: [{ id: 'p1' }],
+      records: [
+        {
+          id: 'p1',
+          paging_token: 'p1',
+          type: 'payment',
+          transaction_hash: 'abc123',
+          network: 'testnet',
+          asset_type: 'credit_alphanum4',
+          asset_code: 'USDC',
+          asset_issuer: 'GISSUER',
+          amount: '10.1234567',
+          from: VALID_ACCOUNT,
+          to: VALID_ACCOUNT,
+        },
+      ],
       next: '/next',
       prev: '/prev',
       limit: '10',
@@ -86,6 +116,41 @@ describe('GET /accounts/:account/payments', () => {
     const res = await request(buildApp()).get(`/accounts/${VALID_ACCOUNT}/payments`);
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ records: [], next: null, prev: null });
+  });
+
+  it('preserves exact decimal amounts as strings without float coercion', async () => {
+    mockFetchPaymentsForAccount.mockResolvedValue({
+      _embedded: {
+        records: [
+          { id: 'p1', amount: '0.0000001', asset_type: 'native', network: 'pubnet' },
+          { id: 'p2', amount: '922337203685.4775807', asset_type: 'native', network: 'pubnet' },
+        ],
+      },
+      _links: {},
+    });
+
+    const res = await request(buildApp()).get(`/accounts/${VALID_ACCOUNT}/payments`);
+    expect(res.status).toBe(200);
+    expect(res.body.records[0].amount).toBe('0.0000001');
+    expect(res.body.records[1].amount).toBe('922337203685.4775807');
+    expect(typeof res.body.records[0].amount).toBe('string');
+  });
+
+  it('keeps same-hash records distinct across networks', async () => {
+    mockFetchPaymentsForAccount.mockResolvedValue({
+      _embedded: {
+        records: [
+          { id: 'p1', transaction_hash: 'deadbeef', network: 'pubnet', amount: '1.0000000' },
+          { id: 'p2', transaction_hash: 'deadbeef', network: 'testnet', amount: '1.0000000' },
+        ],
+      },
+      _links: {},
+    });
+
+    const res = await request(buildApp()).get(`/accounts/${VALID_ACCOUNT}/payments`);
+    expect(res.status).toBe(200);
+    expect(res.body.records).toHaveLength(2);
+    expect(res.body.records.map((r) => r.network)).toEqual(['pubnet', 'testnet']);
   });
 
   it('maps Horizon 404 to NOT_FOUND', async () => {

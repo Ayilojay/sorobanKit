@@ -139,7 +139,13 @@ const revokeApiKeyBodySchema = z
   })
   .loose();
 
-/** POST /auth/api-keys/:id/rotate - rotate an API key */
+/**
+ * POST /auth/api-keys/:id/rotate - rotate an API key with a bounded overlap window.
+ *
+ * The predecessor key remains valid until `overlap_hours` elapse (or until it is
+ * explicitly revoked). `grace_period_hours` is retained as a backwards-compatible
+ * alias for `overlap_hours`; when both are supplied they must agree.
+ */
 const rotateApiKeyBodySchema = z
   .object({
     name: sanitized(
@@ -149,14 +155,138 @@ const rotateApiKeyBodySchema = z
         .min(1, 'name cannot be empty')
         .max(100, 'name must be 100 characters or less'),
     ).optional(),
+    overlap_hours: z
+      .number({ error: 'overlap_hours must be a number' })
+      .int('overlap_hours must be an integer')
+      .min(0, 'overlap_hours must be at least 0')
+      .max(24, 'overlap_hours must be at most 24')
+      .optional(),
     grace_period_hours: z
       .number({ error: 'grace_period_hours must be a number' })
-      .int()
+      .int('grace_period_hours must be an integer')
       .min(0, 'grace_period_hours must be at least 0')
       .max(24, 'grace_period_hours must be at most 24')
-      .default(1)
       .optional(),
+    revoked_by: sanitized(
+      z
+        .string()
+        .trim()
+        .min(1, 'revoked_by cannot be empty')
+        .max(256, 'revoked_by must be 256 characters or less'),
+    ).optional(),
+    rotated_by: sanitized(
+      z
+        .string()
+        .trim()
+        .min(1, 'rotated_by cannot be empty')
+        .max(256, 'rotated_by must be 256 characters or less'),
+    ).optional(),
+  })
+  .loose()
+  .refine(
+    (value) =>
+      value.overlap_hours === undefined ||
+      value.grace_period_hours === undefined ||
+      value.overlap_hours === value.grace_period_hours,
+    { error: 'overlap_hours and grace_period_hours must agree when both are provided', path: ['overlap_hours'] },
+  )
+  .transform((value) => ({
+    ...value,
+    overlap_hours: value.overlap_hours ?? value.grace_period_hours ?? 1,
+  }));
+
+/** Step-up protected administrative actions. */
+const STEP_UP_ACTIONS = ['contract_upgrade', 'treasury_change', 'bulk_export'];
+
+/** Payload hash: lowercase hex SHA-256 digest. */
+const payloadHashSchema = z
+  .string({ error: 'payload_hash is required' })
+  .trim()
+  .regex(/^[a-f0-9]{64}$/, 'payload_hash must be a 64-character lowercase hex SHA-256 digest');
+
+/**
+ * POST /admin/step-up/challenges - issue a short-lived, single-use step-up challenge.
+ *
+ * Either `payload_hash` (precomputed digest) or `payload` (raw JSON body that the
+ * server hashes) must be supplied so the challenge is bound to the exact action.
+ */
+const stepUpChallengeBodySchema = z
+  .object({
+    action: z.enum(STEP_UP_ACTIONS, { error: `action must be one of: ${STEP_UP_ACTIONS.join(', ')}` }),
+    payload_hash: payloadHashSchema.optional(),
+    payload: z.record(z.string(), z.unknown()).optional(),
+    reason: sanitized(
+      z
+        .string()
+        .trim()
+        .min(1, 'reason cannot be empty')
+        .max(500, 'reason must be 500 characters or less'),
+    ).optional(),
+  })
+  .loose()
+  .refine((value) => value.payload_hash !== undefined || value.payload !== undefined, {
+    error: 'either payload_hash or payload is required',
+    path: ['payload_hash'],
+  });
+
+/** POST /admin/step-up/confirm - confirm a step-up challenge. */
+const stepUpConfirmBodySchema = z
+  .object({
+    challenge_id: sanitized(
+      z
+        .string({ error: 'challenge_id is required' })
+        .trim()
+        .min(1, 'challenge_id cannot be empty')
+        .max(128, 'challenge_id must be 128 characters or less'),
+    ),
+    payload_hash: payloadHashSchema,
+    action: z.enum(STEP_UP_ACTIONS, { error: `action must be one of: ${STEP_UP_ACTIONS.join(', ')}` }).optional(),
   })
   .loose();
 
-module.exports = { exportQuerySchema, adminBlockBodySchema, adminExportQuerySchema, adminRoutingStatsQuerySchema, createApiKeyBodySchema, revokeApiKeyBodySchema, rotateApiKeyBodySchema };
+/** POST /admin/contracts/upgrade - contract upgrade (step-up protected). */
+const contractUpgradeBodySchema = z
+  .object({
+    contract_id: sanitized(
+      z
+        .string({ error: 'contract_id is required' })
+        .trim()
+        .min(1, 'contract_id cannot be empty')
+        .max(128, 'contract_id must be 128 characters or less'),
+    ),
+    wasm_hash: z
+      .string({ error: 'wasm_hash is required' })
+      .trim()
+      .regex(/^[a-f0-9]{64}$/, 'wasm_hash must be a 64-character lowercase hex SHA-256 digest'),
+    step_up_challenge_id: sanitized(
+      z
+        .string({ error: 'step_up_challenge_id is required' })
+        .trim()
+        .min(1, 'step_up_challenge_id cannot be empty')
+        .max(128, 'step_up_challenge_id must be 128 characters or less'),
+    ),
+    payload_hash: payloadHashSchema,
+    reason: sanitized(
+      z
+        .string()
+        .trim()
+        .min(1, 'reason cannot be empty')
+        .max(500, 'reason must be 500 characters or less'),
+    ).optional(),
+  })
+  .loose();
+
+module.exports = {
+  exportQuerySchema,
+  adminBlockBodySchema,
+  adminExportQuerySchema,
+  adminRoutingStatsQuerySchema,
+  createApiKeyBodySchema,
+  revokeApiKeyBodySchema,
+  rotateApiKeyBodySchema,
+  STEP_UP_ACTIONS,
+  payloadHashSchema,
+  stepUpChallengeBodySchema,
+  stepUpConfirmBodySchema,
+  contractUpgradeBodySchema,
+};

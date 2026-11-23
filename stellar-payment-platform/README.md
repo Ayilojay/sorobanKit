@@ -8,6 +8,10 @@ A payment platform built on the Stellar network.
 - [Database Setup](#database-setup)
 - [Migrations](#migrations)
 - [Configuration](#configuration)
+- [Graceful Shutdown](#graceful-shutdown)
+- [Audit Integrity](#audit-integrity)
+- [Horizon Stream Cursors](#horizon-stream-cursors)
+- [Authentication and Ownership](#authentication-and-ownership)
 - [Testing](#testing)
 
 ## Getting Started
@@ -75,6 +79,51 @@ Under `MIGRATION_POLICY=strict`, when drift is detected the migration check flus
 ## Configuration
 
 Configuration is provided via environment variables. See `.env.example` for the full list.
+
+## Graceful Shutdown
+
+On `SIGTERM`/`SIGINT` the server performs an ordered, idempotent shutdown:
+
+1. Stop accepting new HTTP connections and stop scheduling new background work.
+2. Allow bounded in-flight requests and jobs to finish.
+3. Close workers, then Redis, then Prisma, in that order.
+
+Shutdown is idempotent: repeated signals or concurrent triggers run the sequence once. A configurable deadline bounds the whole sequence; if it expires, remaining resources are force-closed and the process exits non-zero.
+
+| Variable                     | Default | Description                                                        |
+| ---------------------------- | ------- | ------------------------------------------------------------------ |
+| `SHUTDOWN_TIMEOUT_MS`        | `30000` | Maximum time to wait for in-flight work before force-closing.      |
+| `SHUTDOWN_DRAIN_GRACE_MS`    | `5000`  | Grace period for in-flight HTTP requests to complete.              |
+
+## Audit Integrity
+
+Administrative audit events are canonicalized and integrity-linked: each record stores a keyed digest over its canonical form plus the previous record's digest, forming a verifiable chain. Redaction rules are applied before hashing, and existing query behaviour is unchanged.
+
+| Variable                     | Default | Description                                                        |
+| ---------------------------- | ------- | ------------------------------------------------------------------ |
+| `AUDIT_HMAC_KEY`             | —       | Current key used to compute audit digests. Required in production. |
+| `AUDIT_HMAC_KEY_ID`          | —       | Identifier recorded alongside each digest for rotation.            |
+| `AUDIT_HMAC_PREVIOUS_KEYS`   | —       | JSON map of `keyId -> key` accepted during verification/rotation.  |
+
+Key rotation: add the new key as `AUDIT_HMAC_KEY` with a new `AUDIT_HMAC_KEY_ID`, move the old key into `AUDIT_HMAC_PREVIOUS_KEYS`, and run the verification tooling to confirm the chain still validates across the rotation boundary. Verification tooling recomputes digests for a range of records and reports the first break, if any.
+
+## Horizon Stream Cursors
+
+Per-network stream cursors are persisted atomically **after** a page is fully processed, so a crash resumes from the last committed point rather than replaying or skipping pages. Duplicate pages are idempotent.
+
+Processing is split into two modes:
+
+- **Backfill** — scans historical pages from a configured starting cursor up to the live head.
+- **Live-tail** — follows new pages from the last committed cursor.
+
+| Variable                          | Default | Description                                                    |
+| --------------------------------- | ------- | -------------------------------------------------------------- |
+| `HORIZON_BACKFILL_START_CURSOR`   | `now`   | Starting cursor for initial backfill (`now` or a paging token). |
+| `HORIZON_STREAM_MODE`             | `auto`  | `backfill`, `live`, or `auto` (backfill then live-tail).        |
+
+## Authentication and Ownership
+
+Requests carry a typed principal derived from the authenticated session. Resource ownership checks are centralized in routes and services and compare against the principal — never against caller-supplied usernames or addresses. Public federation reads remain unauthenticated and are unaffected by ownership checks.
 
 ## Testing
 

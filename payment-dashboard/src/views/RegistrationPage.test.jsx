@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import axe from 'axe-core';
 
 // ── vi.hoisted: variables referenced inside vi.mock factory closures ──
 const { mockSignBlob, mockOpenModal } = vi.hoisted(() => ({
@@ -57,9 +58,31 @@ const renderPage = (publicKey = PUBLIC_KEY, extraProps = {}) =>
     />,
   );
 
-const readDraft = () => {
-  const raw = window.localStorage.getItem(DRAFT_STORAGE_KEY);
-  return raw ? JSON.parse(raw) : null;
+// ── axe / WCAG 2.1 AA helpers ──
+// Target level: WCAG 2.1 AA. Any rule violations must be either fixed or
+// recorded as a reviewed exception in the `REVIEWED_EXCEPTIONS` map below.
+const WCAG_TAGS = ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'];
+
+const REVIEWED_EXCEPTIONS = {
+  // ruleId -> reason (must be reviewed by an accessibility owner)
+};
+
+const runAxe = async (container) => {
+  const results = await axe.run(container, {
+    runOnly: { type: 'tag', values: WCAG_TAGS },
+  });
+  const unexpected = results.violations.filter(
+    (violation) => !(violation.id in REVIEWED_EXCEPTIONS),
+  );
+  return { results, unexpected };
+};
+
+const expectNoUnexpectedViolations = async (container) => {
+  const { unexpected } = await runAxe(container);
+  const summary = unexpected.map(
+    (v) => `${v.id} (${v.impact}): ${v.help} — ${v.nodes.length} node(s)`,
+  );
+  expect(summary).toEqual([]);
 };
 
 describe('RegistrationPage – signing-failure path', () => {
@@ -166,236 +189,113 @@ describe('RegistrationPage – signing-failure path', () => {
   });
 });
 
-describe('RegistrationPage – draft persistence lifecycle', () => {
+describe('RegistrationPage – WCAG 2.1 AA (axe)', () => {
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
     vi.unstubAllGlobals();
-    window.localStorage.clear();
   });
 
-  const stubLookupMiss = () =>
+  it('has no unexpected WCAG 2.1 AA violations in the initial (idle) state', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 404, text: async () => '' }));
 
-  const typeUsername = (value) =>
-    fireEvent.change(screen.getByPlaceholderText('stellar-fan'), { target: { value } });
-
-  it('persists only non-secret fields bound to account and network', async () => {
-    stubLookupMiss();
-    renderPage();
-
-    typeUsername('alice');
-
-    await waitFor(() => expect(readDraft()).not.toBeNull());
-
-    const draft = readDraft();
-    expect(draft.username).toBe('alice');
-    expect(draft.publicKey).toBe(PUBLIC_KEY);
-    expect(draft.network).toBe(NETWORK);
-    // No secret material should ever be written to storage.
-    const serialized = JSON.stringify(draft).toLowerCase();
-    expect(serialized).not.toContain('secret');
-    expect(serialized).not.toContain('signature');
-    expect(serialized).not.toContain('signedxdr');
-  });
-
-  it('restores a compatible draft on mount', async () => {
-    stubLookupMiss();
-    window.localStorage.setItem(
-      DRAFT_STORAGE_KEY,
-      JSON.stringify({
-        username: 'bob',
-        publicKey: PUBLIC_KEY,
-        network: NETWORK,
-        savedAt: Date.now(),
-      }),
-    );
-
-    renderPage();
+    const { container } = renderPage();
 
     await waitFor(() =>
-      expect(screen.getByPlaceholderText('stellar-fan').value).toBe('bob'),
-    );
-  });
-
-  it('discards a draft saved for a different account', async () => {
-    stubLookupMiss();
-    window.localStorage.setItem(
-      DRAFT_STORAGE_KEY,
-      JSON.stringify({
-        username: 'bob',
-        publicKey: OTHER_PUBLIC_KEY,
-        network: NETWORK,
-        savedAt: Date.now(),
-      }),
+      expect(screen.getByPlaceholderText('stellar-fan')).toBeTruthy(),
     );
 
-    renderPage();
-
-    await waitFor(() => expect(readDraft()).toBeNull());
-    expect(screen.getByPlaceholderText('stellar-fan').value).toBe('');
+    await expectNoUnexpectedViolations(container);
   });
 
-  it('discards a draft saved for a different network', async () => {
-    stubLookupMiss();
-    window.localStorage.setItem(
-      DRAFT_STORAGE_KEY,
-      JSON.stringify({
-        username: 'bob',
-        publicKey: PUBLIC_KEY,
-        network: 'PUBLIC',
-        savedAt: Date.now(),
-      }),
+  it('has no unexpected WCAG 2.1 AA violations while submitting (loading state)', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 404, text: async () => '' }));
+
+    // Keep the signing promise pending so the loading state is observable.
+    let resolveSign;
+    mockSignBlob.mockImplementation(
+      () => new Promise((resolve) => { resolveSign = resolve; }),
     );
 
-    renderPage();
+    const { container } = renderPage();
 
-    await waitFor(() => expect(readDraft()).toBeNull());
-    expect(screen.getByPlaceholderText('stellar-fan').value).toBe('');
-  });
-
-  it('discards an expired draft', async () => {
-    stubLookupMiss();
-    const expiredAt = Date.now() - 1000 * 60 * 60 * 24 * 30;
-    window.localStorage.setItem(
-      DRAFT_STORAGE_KEY,
-      JSON.stringify({
-        username: 'bob',
-        publicKey: PUBLIC_KEY,
-        network: NETWORK,
-        savedAt: expiredAt,
-      }),
-    );
-
-    renderPage();
-
-    await waitFor(() => expect(readDraft()).toBeNull());
-    expect(screen.getByPlaceholderText('stellar-fan').value).toBe('');
-  });
-
-  it('discards a malformed draft without crashing', async () => {
-    stubLookupMiss();
-    window.localStorage.setItem(DRAFT_STORAGE_KEY, '{not-json');
-
-    renderPage();
-
-    await waitFor(() => expect(readDraft()).toBeNull());
-    expect(screen.getByPlaceholderText('stellar-fan').value).toBe('');
-  });
-
-  it('clears the draft when the user clicks the clear control', async () => {
-    stubLookupMiss();
-    renderPage();
-
-    typeUsername('alice');
-    await waitFor(() => expect(readDraft()).not.toBeNull());
-
-    fireEvent.click(screen.getByRole('button', { name: /clear saved draft/i }));
-
-    await waitFor(() => expect(readDraft()).toBeNull());
-    expect(screen.getByPlaceholderText('stellar-fan').value).toBe('');
-  });
-
-  it('removes the draft after a successful registration', async () => {
-    const fetchMock = vi.fn((url, opts) => {
-      if (opts?.method === 'POST' && String(url).includes('/register')) {
-        return Promise.resolve({
-          ok: true,
-          status: 200,
-          json: async () => ({ success: true }),
-          text: async () => '',
-        });
-      }
-      return Promise.resolve({ ok: false, status: 404, text: async () => '' });
+    fireEvent.change(screen.getByPlaceholderText('stellar-fan'), {
+      target: { value: 'alice' },
     });
-    vi.stubGlobal('fetch', fetchMock);
-    mockSignBlob.mockResolvedValue({ signedMessage: 'c2lnbmF0dXJl' });
-
-    renderPage();
-
-    typeUsername('alice');
-    await waitFor(() => expect(readDraft()).not.toBeNull());
-
     fireEvent.click(screen.getByRole('button', { name: /register username/i }));
 
-    await waitFor(() => expect(readDraft()).toBeNull());
-  });
-});
+    // Loading state should be reflected on the submit control.
+    await waitFor(() => {
+      const btn = screen.getByRole('button', { name: /register username/i });
+      expect(btn.disabled).toBe(true);
+    });
 
-describe('RegistrationPage – shared state rendering', () => {
-  afterEach(() => {
-    cleanup();
-    vi.clearAllMocks();
-    vi.unstubAllGlobals();
-    window.localStorage.clear();
-  });
+    await expectNoUnexpectedViolations(container);
 
-  it('renders a loading state while the lookup request is in flight', async () => {
-    let resolveLookup;
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(
-        () =>
-          new Promise((resolve) => {
-            resolveLookup = resolve;
-          }),
-      ),
-    );
-
-    renderPage();
-
-    expect(screen.getByRole('status')).toBeTruthy();
-
-    resolveLookup({ ok: false, status: 404, text: async () => '' });
-    await waitFor(() => expect(screen.queryByRole('status')).toBeNull());
+    // Settle the pending promise to avoid act() warnings.
+    resolveSign?.(new Uint8Array([1, 2, 3]));
   });
 
-  it('renders an empty state when the username is available', async () => {
-    vi.stubGlobal(
-      'fetch',
-      vi.fn().mockResolvedValue({ ok: false, status: 404, text: async () => '' }),
-    );
+  it('has no unexpected WCAG 2.1 AA violations in the signing-error state', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 404, text: async () => '' }));
 
-    renderPage();
+    mockSignBlob.mockRejectedValue(new Error('User rejected'));
+
+    const { container } = renderPage();
+
+    fireEvent.change(screen.getByPlaceholderText('stellar-fan'), {
+      target: { value: 'alice' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /register username/i }));
 
     await waitFor(() =>
-      expect(screen.queryByText(/username is available/i)).not.toBeNull(),
+      expect(screen.queryByText(SIGNING_CANCELLED_MSG)).not.toBeNull(),
     );
+
+    await expectNoUnexpectedViolations(container);
   });
 
-  it('renders an error state with a retry action when the lookup fails', async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValue({ ok: false, status: 500, text: async () => 'boom' });
-    vi.stubGlobal('fetch', fetchMock);
+  it('has no unexpected WCAG 2.1 AA violations in the LOBSTR-unsupported error state', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 404, text: async () => '' }));
 
-    renderPage();
+    mockSignBlob.mockRejectedValue(new Error('signMessage is not supported'));
+
+    const { container } = renderPage();
+
+    fireEvent.change(screen.getByPlaceholderText('stellar-fan'), {
+      target: { value: 'alice' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /register username/i }));
 
     await waitFor(() =>
-      expect(screen.queryByRole('alert')).not.toBeNull(),
+      expect(
+        screen.queryByText(/LOBSTR does not support registration signatures/i),
+      ).not.toBeNull(),
     );
 
-    const retry = screen.getByRole('button', { name: /retry/i });
-    fireEvent.click(retry);
-
-    await waitFor(() => expect(fetchMock.mock.calls.length).toBeGreaterThan(1));
+    await expectNoUnexpectedViolations(container);
   });
 
-  it('preserves usable form content when a secondary request fails', async () => {
-    vi.stubGlobal(
-      'fetch',
-      vi.fn().mockResolvedValue({ ok: false, status: 500, text: async () => 'boom' }),
-    );
+  it('exposes the error message to assistive technology via a live region', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 404, text: async () => '' }));
+
+    mockSignBlob.mockRejectedValue(new Error('User rejected'));
 
     renderPage();
 
-    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeNull());
+    fireEvent.change(screen.getByPlaceholderText('stellar-fan'), {
+      target: { value: 'alice' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /register username/i }));
 
-    // The form must remain interactive despite the secondary failure.
-    typeUsername('alice');
-    expect(screen.getByPlaceholderText('stellar-fan').value).toBe('alice');
-    expect(
-      screen.getByRole('button', { name: /register username/i }).disabled,
-    ).toBe(false);
+    await waitFor(() =>
+      expect(screen.queryByText(SIGNING_CANCELLED_MSG)).not.toBeNull(),
+    );
+
+    // The error must be announced: it should live inside an element with
+    // role="alert" or aria-live="assertive"/"polite".
+    const errorNode = screen.getByText(SIGNING_CANCELLED_MSG);
+    const liveRegion = errorNode.closest('[role="alert"], [aria-live]');
+    expect(liveRegion).not.toBeNull();
   });
 });

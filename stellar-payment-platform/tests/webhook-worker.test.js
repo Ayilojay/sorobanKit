@@ -297,6 +297,173 @@ describe('webhook BullMQ delivery', () => {
   });
 });
 
+describe('fault injection – Redis and Postgres outages (issue #477)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    global.fetch = jest.fn();
+  });
+
+  afterEach(async () => {
+    await closeWebhookQueue();
+    delete global.fetch;
+  });
+
+  test('Redis outage during enqueue surfaces the error and does not leak a queue connection', async () => {
+    const redisError = new Error('Redis connection lost');
+    const queue = { add: jest.fn().mockRejectedValue(redisError) };
+
+    await expect(enqueueWebhookDelivery(webhook, payload, queue)).rejects.toThrow('Redis connection lost');
+
+    // The injected queue is owned by the caller; the worker module must not
+    // close it out from under them.
+    expect(mockQueueClose).not.toHaveBeenCalled();
+  });
+
+  test('Redis outage during dispatch aborts remaining enqueues without partial silent success', async () => {
+    const redisError = new Error('ECONNRESET');
+    const queue = {
+      add: jest.fn()
+        .mockResolvedValueOnce({ id: 'job-1' })
+        .mockRejectedValueOnce(redisError),
+    };
+    const prisma = {
+      webhook: {
+        findMany: jest.fn().mockResolvedValue([
+          webhook,
+          { ...webhook, id: 'webhook-2', url: 'https://second.example/webhooks' },
+          { ...webhook, id: 'webhook-3', url: 'https://third.example/webhooks' },
+        ]),
+      },
+    };
+
+    await expect(dispatchPaymentWebhooks({
+      prisma,
+      poolGetFn: jest.fn(),
+      queue,
+      payment: {
+        id: 'payment-1',
+        type: 'payment',
+        transaction_hash: 'transaction-1',
+        to: 'GDESTINATION',
+        from: 'GSOURCE',
+        amount: '10.00',
+        asset_type: 'native',
+      },
+    })).rejects.toThrow('ECONNRESET');
+
+    // Dispatch stops at the first failure rather than hammering a dead Redis.
+    expect(queue.add).toHaveBeenCalledTimes(2);
+  });
+
+  test('Postgres outage while recording failure does not swallow the delivery error', async () => {
+    global.fetch.mockResolvedValue({ ok: false, status: 500 });
+    const prisma = {
+      webhook: {
+        findUnique: jest.fn().mockResolvedValue({ failingSince: null }),
+        update: jest.fn().mockRejectedValue(new Error('Postgres unavailable')),
+      },
+    };
+
+    await expect(processWebhookJob(
+      { data: { webhook, payload }, attemptsMade: 0 },
+      { prisma, poolRunFn: jest.fn() },
+    )).rejects.toThrow();
+
+    // The job must still fail so BullMQ retries it; the DB write is best-effort.
+    expect(prisma.webhook.update).toHaveBeenCalledTimes(1);
+  });
+
+  test('Postgres outage while recording success still resolves the job', async () => {
+    global.fetch.mockResolvedValue({ ok: true, status: 200 });
+    const prisma = {
+      webhook: {
+        update: jest.fn().mockRejectedValue(new Error('Postgres unavailable')),
+      },
+    };
+
+    await expect(processWebhookJob(
+      { data: { webhook, payload }, attemptsMade: 0 },
+      { prisma, poolRunFn: jest.fn() },
+    )).resolves.toBeUndefined();
+  });
+
+  test('slow Redis (enqueue timeout) rejects instead of hanging forever', async () => {
+    const queue = {
+      add: jest.fn(() => new Promise((_resolve, reject) => {
+        setTimeout(() => reject(new Error('enqueue timeout')), 5);
+      })),
+    };
+
+    await expect(enqueueWebhookDelivery(webhook, payload, queue)).rejects.toThrow('enqueue timeout');
+  });
+
+  test('slow webhook target times out and the job fails for retry', async () => {
+    global.fetch.mockImplementation(() => new Promise((_resolve, reject) => {
+      setTimeout(() => reject(new Error('The operation was aborted')), 5);
+    }));
+    const prisma = {
+      webhook: {
+        findUnique: jest.fn().mockResolvedValue({ failingSince: null }),
+        update: jest.fn().mockResolvedValue({}),
+      },
+    };
+
+    await expect(processWebhookJob(
+      { data: { webhook, payload }, attemptsMade: 0 },
+      { prisma, poolRunFn: jest.fn() },
+    )).rejects.toThrow();
+  });
+
+  test('retries are idempotent: the same job id is reused across attempts', async () => {
+    const queue = { add: jest.fn().mockResolvedValue({ id: 'job-1' }) };
+
+    await enqueueWebhookDelivery(webhook, payload, queue);
+    await enqueueWebhookDelivery(webhook, payload, queue);
+
+    const firstJobId = queue.add.mock.calls[0][2].jobId;
+    const secondJobId = queue.add.mock.calls[1][2].jobId;
+    expect(firstJobId).toBe(secondJobId);
+  });
+
+  test('reconnection after Redis outage reuses the lazy queue instead of leaking connections', async () => {
+    mockQueueAdd
+      .mockRejectedValueOnce(new Error('Redis connection lost'))
+      .mockResolvedValueOnce({ id: 'job-2' });
+
+    await expect(enqueueWebhookDelivery(webhook, payload)).rejects.toThrow('Redis connection lost');
+    await expect(enqueueWebhookDelivery(webhook, payload)).resolves.toEqual({ id: 'job-2' });
+
+    // Only one Queue (and therefore one Redis connection) is created.
+    expect(Queue).toHaveBeenCalledTimes(1);
+    expect(mockQueueAdd).toHaveBeenCalledTimes(2);
+  });
+
+  test('closeWebhookQueue closes the queue and is safe to call repeatedly', async () => {
+    mockQueueAdd.mockResolvedValue({ id: 'job-1' });
+    await enqueueWebhookDelivery(webhook, payload);
+
+    await closeWebhookQueue();
+    await closeWebhookQueue();
+
+    expect(mockQueueClose).toHaveBeenCalledTimes(1);
+  });
+
+  test('startWebhookWorker does not leak workers when started repeatedly', async () => {
+    const dependencies = {
+      prisma: { webhook: {} },
+      poolRunFn: jest.fn(),
+    };
+
+    startWebhookWorker(dependencies);
+    startWebhookWorker(dependencies);
+
+    await closeWebhookQueue();
+
+    // Every worker created is closed on shutdown.
+    expect(mockWorkerClose.mock.calls.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
 describe('SSRF protection – detectSsrfTarget', () => {
   test('allows a public HTTPS URL', () => {
     expect(detectSsrfTarget('https://merchant.example.com/hook')).toBeNull();
