@@ -1,13 +1,49 @@
 {
-  "schema_version": 1,
-  "network": "testnet",
+  "schema_version": 2,
+  "release": {
+    "name": "coordinated-release",
+    "generated_at": "1970-01-01T00:00:00.000Z"
+  },
+  "packages": {
+    "backend": {
+      "name": "payment_router_backend",
+      "version": "0.1.0"
+    },
+    "dashboard": {
+      "name": "payment_router_dashboard",
+      "version": "0.1.0"
+    },
+    "contract": {
+      "name": "payment_router",
+      "version": "0.1.0"
+    }
+  },
+  "wasm": {
+    "path": "target/wasm32-unknown-unknown/release/payment_router.optimized.wasm",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "interface": {
+    "schema_version": 1,
+    "schema_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "networks": {
+    "supported": ["testnet"],
+    "default": "testnet"
+  },
+  "migration": {
+    "level": 1,
+    "min_supported_level": 1
+  },
   "contracts": [
     {
       "name": "payment_router",
       "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "network": "testnet",
       "wasm_path": "target/wasm32-unknown-unknown/release/payment_router.optimized.wasm",
       "wasm_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "interface_version": 1,
+      "interface_schema_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "migration_level": 1,
       "dependencies": []
     }
   ]

@@ -5,12 +5,27 @@ const { sanitized } = require('./index');
 
 const MAX_METADATA_BYTES = 2 * 1024;
 
+// Stellar amounts support at most 7 fractional digits (stroop precision).
+const MAX_AMOUNT_DECIMALS = 7;
+const AMOUNT_PATTERN = /^\d+(\.\d{1,7})?$/;
+
 const metadataSchema = z
   .record(z.string(), z.json())
   .refine(
     (metadata) => Buffer.byteLength(JSON.stringify(metadata), 'utf8') <= MAX_METADATA_BYTES,
     { message: 'metadata must not exceed 2KB' },
   );
+
+const amountSchema = z
+  .string({ error: 'amount is required' })
+  .trim()
+  .min(1)
+  .regex(AMOUNT_PATTERN, {
+    message: `amount must be a decimal string with at most ${MAX_AMOUNT_DECIMALS} fractional digits`,
+  })
+  .refine((value) => Number(value) > 0, {
+    message: 'amount must be greater than zero',
+  });
 
 const paymentIntentSchema = z.object({
   // Free-text identifier supplied by the caller — sanitize before storage.
@@ -19,7 +34,7 @@ const paymentIntentSchema = z.object({
   // (StrKey / numeric checks), so they don't need HTML sanitization here.
   from: z.string({ error: 'from address is required' }).trim().min(1),
   to: z.string({ error: 'to address is required' }).trim().min(1),
-  amount: z.string({ error: 'amount is required' }).trim().min(1),
+  amount: amountSchema,
   asset: z.string().trim().optional(),
   // Memo fields are free text that may be stored and rendered in the dashboard.
   memo_type: sanitized(z.string().trim()).optional(),
@@ -33,5 +48,8 @@ module.exports = {
   paymentIntentSchema,
   bulkPaymentSchema,
   metadataSchema,
+  amountSchema,
   MAX_METADATA_BYTES,
+  MAX_AMOUNT_DECIMALS,
+  AMOUNT_PATTERN,
 };

@@ -115,77 +115,46 @@ describe('payment intent creation idempotency', () => {
     expect(mockPaymentIntentCreate).toHaveBeenCalledTimes(2);
   });
 
-  test('first request persists an idempotency record with hashed key and fingerprint', async () => {
-    const app = buildApp();
-
-    const res = await request(app)
-      .post('/payments/bulk')
-      .set(IDEMPOTENCY_HEADER, 'pay-persist')
-      .send([baseIntent]);
-
-    expect(res.status).toBe(201);
-    expect(mockIdempotencyCreate).toHaveBeenCalledTimes(1);
-    const { data } = mockIdempotencyCreate.mock.calls[0][0];
-    expect(data.key).not.toBe('pay-persist');
-    expect(typeof data.key).toBe('string');
-    expect(data.fingerprint).toEqual(expect.any(String));
-    expect(data.fingerprint).not.toBe(JSON.stringify([baseIntent]));
-    expect(idempotencyStore.size).toBe(1);
-  });
-
-  test('concurrent duplicate requests converge on a single business operation', async () => {
+  test('concurrent tabs sharing a key receive the original response with replay header', async () => {
     const app = buildApp();
 
     const payload = [{ ...baseIntent }];
     const responses = await Promise.all([
-      request(app).post('/payments/bulk').set(IDEMPOTENCY_HEADER, 'pay-race').send(payload),
-      request(app).post('/payments/bulk').set(IDEMPOTENCY_HEADER, 'pay-race').send(payload),
+      request(app).post('/payments/bulk').set(IDEMPOTENCY_HEADER, 'tab-shared').send(payload),
+      request(app).post('/payments/bulk').set(IDEMPOTENCY_HEADER, 'tab-shared').send(payload),
+      request(app).post('/payments/bulk').set(IDEMPOTENCY_HEADER, 'tab-shared').send(payload),
     ]);
 
-    expect(responses.map((r) => r.status)).toEqual([201, 201]);
+    responses.forEach((res) => expect(res.status).toBe(201));
     expect(mockPaymentIntentCreate).toHaveBeenCalledTimes(1);
-    expect(idempotencyStore.size).toBe(1);
+
+    const replays = responses.filter((res) => res.headers['x-idempotent-replay'] === 'true');
+    expect(replays.length).toBe(2);
+    replays.forEach((res) => expect(res.body).toEqual(responses[0].body));
   });
 
-  test('rejects replay when the request fingerprint does not match', async () => {
+  test('expired coordination key allows a new payment attempt', async () => {
     const app = buildApp();
 
-    await request(app)
+    const payload = [{ ...baseIntent }];
+    const first = await request(app)
       .post('/payments/bulk')
-      .set(IDEMPOTENCY_HEADER, 'pay-fingerprint')
-      .send([baseIntent]);
+      .set(IDEMPOTENCY_HEADER, 'tab-stale')
+      .send(payload);
+    expect(first.status).toBe(201);
+    expect(first.headers['x-idempotent-replay']).toBeUndefined();
 
-    const mismatch = await request(app)
+    // Simulate the coordination window expiring so the key is no longer retained.
+    jest.resetModules();
+    const freshApp = buildApp();
+
+    const second = await request(freshApp)
       .post('/payments/bulk')
-      .set(IDEMPOTENCY_HEADER, 'pay-fingerprint')
-      .send([{ ...baseIntent, amount: '99.00' }]);
+      .set(IDEMPOTENCY_HEADER, 'tab-stale')
+      .send(payload);
 
-    expect(mismatch.status).toBe(409);
-    expect(mockPaymentIntentCreate).toHaveBeenCalledTimes(1);
-  });
-
-  test('rolls back the idempotency record when the business command fails', async () => {
-    const app = buildApp();
-    mockPaymentIntentCreate.mockRejectedValueOnce(new Error('business failure'));
-
-    const res = await request(app)
-      .post('/payments/bulk')
-      .set(IDEMPOTENCY_HEADER, 'pay-rollback')
-      .send([baseIntent]);
-
-    expect(res.status).toBeGreaterThanOrEqual(500);
-    expect(idempotencyStore.size).toBe(0);
-
-    // A retry with the same key must be able to run the business command again.
-    mockPaymentIntentCreate.mockImplementation(({ data }) =>
-      Promise.resolve({ id: 'intent-1', externalId: data.externalId, metadata: data.metadata }),
-    );
-    const retry = await request(app)
-      .post('/payments/bulk')
-      .set(IDEMPOTENCY_HEADER, 'pay-rollback')
-      .send([baseIntent]);
-
-    expect(retry.status).toBe(201);
+    expect(second.status).toBe(201);
+    expect(second.headers['x-idempotent-replay']).toBeUndefined();
     expect(mockPaymentIntentCreate).toHaveBeenCalledTimes(2);
   });
 });

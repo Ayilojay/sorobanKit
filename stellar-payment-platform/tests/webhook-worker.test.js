@@ -302,171 +302,170 @@ describe('webhook BullMQ delivery', () => {
   });
 });
 
-describe('transactional outbox dispatch (issue #391)', () => {
-  const makeOutboxRow = (overrides = {}) => ({
-    id: 'outbox-1',
-    event_type: 'payment.received',
-    aggregate_type: 'payment',
-    aggregate_id: 'payment-1',
-    payload,
-    version: 1,
-    status: 'pending',
-    attempts: 0,
-    next_attempt_at: new Date('2026-08-25T12:00:00.000Z'),
-    last_error: null,
-    processed_at: null,
-    created_at: new Date('2026-08-25T12:00:00.000Z'),
-    updated_at: new Date('2026-08-25T12:00:00.000Z'),
-    ...overrides,
-  });
-
-  const makeOutboxPrisma = (rows = []) => ({
-    outboxEvent: {
-      findMany: jest.fn().mockResolvedValue(rows),
-      update: jest.fn().mockResolvedValue({}),
-      updateMany: jest.fn().mockResolvedValue({ count: 1 }),
-    },
-    webhook: {
-      findMany: jest.fn().mockResolvedValue([webhook]),
-      update: jest.fn().mockResolvedValue({}),
-    },
-  });
-
+describe('fault injection – Redis and Postgres outages (issue #477)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     global.fetch = jest.fn();
   });
 
-  afterAll(() => {
+  afterEach(async () => {
+    await closeWebhookQueue();
     delete global.fetch;
   });
 
-  test('reads pending events from the outbox and enqueues one delivery per webhook', async () => {
-    const prisma = makeOutboxPrisma([makeOutboxRow()]);
-    const queue = { add: jest.fn().mockResolvedValue({ id: 'job-1' }) };
+  test('Redis outage during enqueue surfaces the error and does not leak a queue connection', async () => {
+    const redisError = new Error('Redis connection lost');
+    const queue = { add: jest.fn().mockRejectedValue(redisError) };
 
-    const result = await dispatchOutboxEvents({ prisma, queue, now: new Date('2026-08-25T12:00:00.000Z') });
+    await expect(enqueueWebhookDelivery(webhook, payload, queue)).rejects.toThrow('Redis connection lost');
 
-    expect(prisma.outboxEvent.findMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: expect.objectContaining({
-        status: 'pending',
-        next_attempt_at: expect.objectContaining({ lte: expect.any(Date) }),
-      }),
-      orderBy: expect.objectContaining({ created_at: 'asc' }),
-    }));
-    expect(queue.add).toHaveBeenCalledTimes(1);
-    expect(queue.add).toHaveBeenCalledWith(
-      'deliver',
-      expect.objectContaining({
-        outboxEventId: 'outbox-1',
-        payload: expect.objectContaining({ event_id: payload.event_id }),
-      }),
-      expect.objectContaining({ attempts: MAX_WEBHOOK_ATTEMPTS }),
-    );
-    expect(result).toEqual(expect.objectContaining({ dispatched: 1, failed: 0 }));
+    // The injected queue is owned by the caller; the worker module must not
+    // close it out from under them.
+    expect(mockQueueClose).not.toHaveBeenCalled();
   });
 
-  test('skips events that were already processed (idempotent consumers)', async () => {
-    const prisma = makeOutboxPrisma([
-      makeOutboxRow({ id: 'outbox-done', status: 'processed', processed_at: new Date() }),
-    ]);
-    const queue = { add: jest.fn().mockResolvedValue({ id: 'job-1' }) };
+  test('Redis outage during dispatch aborts remaining enqueues without partial silent success', async () => {
+    const redisError = new Error('ECONNRESET');
+    const queue = {
+      add: jest.fn()
+        .mockResolvedValueOnce({ id: 'job-1' })
+        .mockRejectedValueOnce(redisError),
+    };
+    const prisma = {
+      webhook: {
+        findMany: jest.fn().mockResolvedValue([
+          webhook,
+          { ...webhook, id: 'webhook-2', url: 'https://second.example/webhooks' },
+          { ...webhook, id: 'webhook-3', url: 'https://third.example/webhooks' },
+        ]),
+      },
+    };
 
-    const result = await dispatchOutboxEvents({ prisma, queue });
+    await expect(dispatchPaymentWebhooks({
+      prisma,
+      poolGetFn: jest.fn(),
+      queue,
+      payment: {
+        id: 'payment-1',
+        type: 'payment',
+        transaction_hash: 'transaction-1',
+        to: 'GDESTINATION',
+        from: 'GSOURCE',
+        amount: '10.00',
+        asset_type: 'native',
+      },
+    })).rejects.toThrow('ECONNRESET');
 
-    expect(queue.add).not.toHaveBeenCalled();
-    expect(result).toEqual(expect.objectContaining({ dispatched: 0, skipped: expect.any(Number) }));
+    // Dispatch stops at the first failure rather than hammering a dead Redis.
+    expect(queue.add).toHaveBeenCalledTimes(2);
   });
 
-  test('does not re-dispatch an event whose next_attempt_at is in the future', async () => {
-    const prisma = makeOutboxPrisma([
-      makeOutboxRow({ next_attempt_at: new Date(Date.now() + 60_000) }),
-    ]);
-    const queue = { add: jest.fn().mockResolvedValue({ id: 'job-1' }) };
+  test('Postgres outage while recording failure does not swallow the delivery error', async () => {
+    global.fetch.mockResolvedValue({ ok: false, status: 500 });
+    const prisma = {
+      webhook: {
+        findUnique: jest.fn().mockResolvedValue({ failingSince: null }),
+        update: jest.fn().mockRejectedValue(new Error('Postgres unavailable')),
+      },
+    };
 
-    const result = await dispatchOutboxEvents({ prisma, queue });
+    await expect(processWebhookJob(
+      { data: { webhook, payload }, attemptsMade: 0 },
+      { prisma, poolRunFn: jest.fn() },
+    )).rejects.toThrow();
 
-    expect(queue.add).not.toHaveBeenCalled();
-    expect(result.dispatched).toBe(0);
+    // The job must still fail so BullMQ retries it; the DB write is best-effort.
+    expect(prisma.webhook.update).toHaveBeenCalledTimes(1);
   });
 
-  test('bounded retries: marks the event failed once OUTBOX_MAX_ATTEMPTS is reached', async () => {
-    const prisma = makeOutboxPrisma([
-      makeOutboxRow({ attempts: OUTBOX_MAX_ATTEMPTS - 1 }),
-    ]);
-    const queue = { add: jest.fn().mockRejectedValue(new Error('redis down')) };
-
-    const result = await dispatchOutboxEvents({ prisma, queue });
-
-    expect(prisma.outboxEvent.update).toHaveBeenCalledWith(expect.objectContaining({
-      where: { id: 'outbox-1' },
-      data: expect.objectContaining({
-        status: 'failed',
-        attempts: OUTBOX_MAX_ATTEMPTS,
-        last_error: expect.stringContaining('redis down'),
-      }),
-    }));
-    expect(result.failed).toBe(1);
-  });
-
-  test('bounded retries: schedules a backoff retry while attempts remain', async () => {
-    const prisma = makeOutboxPrisma([makeOutboxRow({ attempts: 1 })]);
-    const queue = { add: jest.fn().mockRejectedValue(new Error('transient')) };
-
-    await dispatchOutboxEvents({ prisma, queue });
-
-    expect(prisma.outboxEvent.update).toHaveBeenCalledWith(expect.objectContaining({
-      where: { id: 'outbox-1' },
-      data: expect.objectContaining({
-        status: 'pending',
-        attempts: 2,
-        next_attempt_at: expect.any(Date),
-      }),
-    }));
-  });
-
-  test('processOutboxEvent marks the row processed and is idempotent on replay', async () => {
-    const prisma = makeOutboxPrisma();
+  test('Postgres outage while recording success still resolves the job', async () => {
     global.fetch.mockResolvedValue({ ok: true, status: 200 });
+    const prisma = {
+      webhook: {
+        update: jest.fn().mockRejectedValue(new Error('Postgres unavailable')),
+      },
+    };
 
-    await processOutboxEvent(
-      { data: { outboxEventId: 'outbox-1', webhook, payload }, attemptsMade: 0 },
+    await expect(processWebhookJob(
+      { data: { webhook, payload }, attemptsMade: 0 },
       { prisma, poolRunFn: jest.fn() },
-    );
-
-    expect(prisma.outboxEvent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: expect.objectContaining({ id: 'outbox-1', status: { not: 'processed' } }),
-      data: expect.objectContaining({ status: 'processed', processed_at: expect.any(Date) }),
-    }));
-
-    // Replaying the same event must not send a duplicate webhook.
-    prisma.outboxEvent.updateMany.mockResolvedValue({ count: 0 });
-    global.fetch.mockClear();
-
-    await processOutboxEvent(
-      { data: { outboxEventId: 'outbox-1', webhook, payload }, attemptsMade: 0 },
-      { prisma, poolRunFn: jest.fn() },
-    );
-
-    expect(global.fetch).not.toHaveBeenCalled();
+    )).resolves.toBeUndefined();
   });
 
-  test('findStuckOutboxEvents reports pending rows older than the stuck threshold', async () => {
-    const stuck = makeOutboxRow({
-      id: 'outbox-stuck',
-      created_at: new Date(Date.now() - OUTBOX_STUCK_AFTER_MS - 60_000),
-    });
-    const prisma = makeOutboxPrisma([stuck]);
+  test('slow Redis (enqueue timeout) rejects instead of hanging forever', async () => {
+    const queue = {
+      add: jest.fn(() => new Promise((_resolve, reject) => {
+        setTimeout(() => reject(new Error('enqueue timeout')), 5);
+      })),
+    };
 
-    const rows = await findStuckOutboxEvents({ prisma, now: new Date() });
+    await expect(enqueueWebhookDelivery(webhook, payload, queue)).rejects.toThrow('enqueue timeout');
+  });
 
-    expect(prisma.outboxEvent.findMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: expect.objectContaining({
-        status: { in: expect.arrayContaining(['pending']) },
-        created_at: expect.objectContaining({ lte: expect.any(Date) }),
-      }),
+  test('slow webhook target times out and the job fails for retry', async () => {
+    global.fetch.mockImplementation(() => new Promise((_resolve, reject) => {
+      setTimeout(() => reject(new Error('The operation was aborted')), 5);
     }));
-    expect(rows).toEqual([stuck]);
+    const prisma = {
+      webhook: {
+        findUnique: jest.fn().mockResolvedValue({ failingSince: null }),
+        update: jest.fn().mockResolvedValue({}),
+      },
+    };
+
+    await expect(processWebhookJob(
+      { data: { webhook, payload }, attemptsMade: 0 },
+      { prisma, poolRunFn: jest.fn() },
+    )).rejects.toThrow();
+  });
+
+  test('retries are idempotent: the same job id is reused across attempts', async () => {
+    const queue = { add: jest.fn().mockResolvedValue({ id: 'job-1' }) };
+
+    await enqueueWebhookDelivery(webhook, payload, queue);
+    await enqueueWebhookDelivery(webhook, payload, queue);
+
+    const firstJobId = queue.add.mock.calls[0][2].jobId;
+    const secondJobId = queue.add.mock.calls[1][2].jobId;
+    expect(firstJobId).toBe(secondJobId);
+  });
+
+  test('reconnection after Redis outage reuses the lazy queue instead of leaking connections', async () => {
+    mockQueueAdd
+      .mockRejectedValueOnce(new Error('Redis connection lost'))
+      .mockResolvedValueOnce({ id: 'job-2' });
+
+    await expect(enqueueWebhookDelivery(webhook, payload)).rejects.toThrow('Redis connection lost');
+    await expect(enqueueWebhookDelivery(webhook, payload)).resolves.toEqual({ id: 'job-2' });
+
+    // Only one Queue (and therefore one Redis connection) is created.
+    expect(Queue).toHaveBeenCalledTimes(1);
+    expect(mockQueueAdd).toHaveBeenCalledTimes(2);
+  });
+
+  test('closeWebhookQueue closes the queue and is safe to call repeatedly', async () => {
+    mockQueueAdd.mockResolvedValue({ id: 'job-1' });
+    await enqueueWebhookDelivery(webhook, payload);
+
+    await closeWebhookQueue();
+    await closeWebhookQueue();
+
+    expect(mockQueueClose).toHaveBeenCalledTimes(1);
+  });
+
+  test('startWebhookWorker does not leak workers when started repeatedly', async () => {
+    const dependencies = {
+      prisma: { webhook: {} },
+      poolRunFn: jest.fn(),
+    };
+
+    startWebhookWorker(dependencies);
+    startWebhookWorker(dependencies);
+
+    await closeWebhookQueue();
+
+    // Every worker created is closed on shutdown.
+    expect(mockWorkerClose.mock.calls.length).toBeGreaterThanOrEqual(1);
   });
 });
 

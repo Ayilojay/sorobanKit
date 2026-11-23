@@ -8,15 +8,10 @@ const {
   VALID_TRANSITIONS,
 } = require('./services/paymentIntentStateMachine');
 const {
-  OUTBOX_STATUS,
-  MAX_OUTBOX_ATTEMPTS,
-  enqueueOutboxEvent,
-  claimOutboxBatch,
-  markOutboxProcessed,
-  markOutboxFailed,
-  findStuckOutboxEvents,
-  dispatchOutboxBatch,
-} = require('./outbox');
+  recordWebhookAttempt,
+  observeWebhookDeliveryLatency,
+  refreshWebhookQueueHealth,
+} = require('./services/webhookQueueHealth');
 
 const WEBHOOK_TIMEOUT_MS = 10_000;
 const WEBHOOK_QUEUE_NAME = 'webhook-deliveries';
@@ -333,6 +328,17 @@ const applyWebhookPaymentIntentStatus = async ({
 const processWebhookJob = async (job, { prisma, poolRunFn }) => {
   const { webhook, payload } = job.data;
   const now = new Date();
+  const attemptNumber = (job.attemptsMade || 0) + 1;
+  const startedAt = Date.now();
+
+  // Metric updates are best-effort: a Redis/DB outage must never break delivery.
+  const safeRecordAttempt = async (outcome) => {
+    try {
+      await recordWebhookAttempt({ attempt: attemptNumber, outcome });
+    } catch (metricError) {
+      logger.warn(`[webhook-worker] Failed to record attempt metric: ${metricError.message}`);
+    }
+  };
 
   try {
     await sendWebhook(webhook.url, payload, webhook.secret);
@@ -344,8 +350,16 @@ const processWebhookJob = async (job, { prisma, poolRunFn }) => {
         `[webhook-worker] Failed to mark failure for webhook ${webhook.id}: ${databaseError.message}`,
       );
     }
+    await safeRecordAttempt('failure');
     throw error;
   }
+
+  try {
+    await observeWebhookDeliveryLatency(Date.now() - startedAt);
+  } catch (metricError) {
+    logger.warn(`[webhook-worker] Failed to record latency metric: ${metricError.message}`);
+  }
+  await safeRecordAttempt('success');
 
   try {
     await markWebhookSuccess(prisma, poolRunFn, webhook.id, now);
@@ -424,10 +438,26 @@ const startWebhookWorker = ({ prisma, poolRunFn }) => {
         `retry scheduled in ${nextDelayMs}ms (${attemptsMade}/${maxAttempts})`,
       );
     }
+
+    // Refresh queue-health gauges (oldest pending, DLQ age). Best-effort only.
+    try {
+      await refreshWebhookQueueHealth({ prisma, poolRunFn, queue: webhookQueue });
+    } catch (metricError) {
+      logger.warn(`[webhook-worker] Failed to refresh queue health metrics: ${metricError.message}`);
+    }
   });
 
   webhookWorker.on('error', (error) => {
     logger.error(`[webhook-worker] Redis error: ${error.message}`);
+  });
+
+  webhookWorker.on('completed', async () => {
+    // Keep gauges fresh after successful deliveries as well. Best-effort only.
+    try {
+      await refreshWebhookQueueHealth({ prisma, poolRunFn, queue: webhookQueue });
+    } catch (metricError) {
+      logger.warn(`[webhook-worker] Failed to refresh queue health metrics: ${metricError.message}`);
+    }
   });
 
   logger.info(

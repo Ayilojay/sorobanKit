@@ -16,15 +16,24 @@ jest.mock('../prismaClient', () => ({
   prisma: {},
 }));
 
+jest.mock('../src/metrics', () => ({
+  webhookQueueOldestPendingAgeSeconds: { set: jest.fn() },
+  webhookQueueAttemptDistribution: { reset: jest.fn(), observe: jest.fn() },
+  webhookDeliveryLatencySeconds: { observe: jest.fn() },
+  webhookDLQOldestAgeSeconds: { set: jest.fn() },
+  recordWebhookQueueHealth: jest.fn(),
+}));
+
 const webhookWorker = require('../src/webhookWorker');
 const {
   getWebhooksExhaustedRetries,
   moveToDLQ,
   listDLQEntries,
   replayFromDLQ,
-  promoteExhaustedOutboxEvents,
-  replayOutboxEvent,
+  emitQueueHealthMetrics,
 } = webhookWorker;
+
+const metrics = require('../src/metrics');
 
 const { prisma } = require('../prismaClient');
 
@@ -62,6 +71,165 @@ beforeEach(() => {
     updateMany: jest.fn().mockResolvedValue({ count: 0 }),
     count: jest.fn().mockResolvedValue(0),
   };
+});
+
+describe('emitQueueHealthMetrics', () => {
+  const now = new Date('2024-06-01T12:00:00.000Z');
+
+  beforeEach(() => {
+    jest.useFakeTimers().setSystemTime(now);
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('emits oldest pending age, attempt distribution, latency and DLQ age on success', async () => {
+    const oldestPending = new Date(now.getTime() - 90 * 1000); // 90s ago
+    const oldestDLQ = new Date(now.getTime() - 3600 * 1000); // 1h ago
+
+    prisma.webhook = {
+      findFirst: jest.fn().mockResolvedValue({ id: 'wh-1', createdAt: oldestPending }),
+      groupBy: jest.fn().mockResolvedValue([
+        { deliveryAttempts: 0, _count: { _all: 3 } },
+        { deliveryAttempts: 1, _count: { _all: 2 } },
+        { deliveryAttempts: 5, _count: { _all: 1 } },
+      ]),
+      aggregate: jest.fn().mockResolvedValue({ _avg: { deliveryLatencyMs: 250 } }),
+    };
+    prisma.webhookDLQ = {
+      findFirst: jest.fn().mockResolvedValue({ id: 'dlq-1', movedAt: oldestDLQ }),
+    };
+
+    const result = await emitQueueHealthMetrics(prisma);
+
+    expect(result).toEqual({
+      oldestPendingAgeSeconds: 90,
+      attemptDistribution: { 0: 3, 1: 2, 5: 1 },
+      averageDeliveryLatencySeconds: 0.25,
+      oldestDLQAgeSeconds: 3600,
+    });
+
+    expect(metrics.webhookQueueOldestPendingAgeSeconds.set).toHaveBeenCalledWith(90);
+    expect(metrics.webhookQueueAttemptDistribution.reset).toHaveBeenCalled();
+    expect(metrics.webhookQueueAttemptDistribution.observe).toHaveBeenCalledWith({ attempts: '0' }, 3);
+    expect(metrics.webhookQueueAttemptDistribution.observe).toHaveBeenCalledWith({ attempts: '1' }, 2);
+    expect(metrics.webhookQueueAttemptDistribution.observe).toHaveBeenCalledWith({ attempts: '5+' }, 1);
+    expect(metrics.webhookDeliveryLatencySeconds.observe).toHaveBeenCalledWith(0.25);
+    expect(metrics.webhookDLQOldestAgeSeconds.set).toHaveBeenCalledWith(3600);
+  });
+
+  it('emits zero-valued metrics when the queues are empty', async () => {
+    prisma.webhook = {
+      findFirst: jest.fn().mockResolvedValue(null),
+      groupBy: jest.fn().mockResolvedValue([]),
+      aggregate: jest.fn().mockResolvedValue({ _avg: { deliveryLatencyMs: null } }),
+    };
+    prisma.webhookDLQ = {
+      findFirst: jest.fn().mockResolvedValue(null),
+    };
+
+    const result = await emitQueueHealthMetrics(prisma);
+
+    expect(result).toEqual({
+      oldestPendingAgeSeconds: 0,
+      attemptDistribution: {},
+      averageDeliveryLatencySeconds: 0,
+      oldestDLQAgeSeconds: 0,
+    });
+
+    expect(metrics.webhookQueueOldestPendingAgeSeconds.set).toHaveBeenCalledWith(0);
+    expect(metrics.webhookQueueAttemptDistribution.reset).toHaveBeenCalled();
+    expect(metrics.webhookQueueAttemptDistribution.observe).not.toHaveBeenCalled();
+    expect(metrics.webhookDeliveryLatencySeconds.observe).toHaveBeenCalledWith(0);
+    expect(metrics.webhookDLQOldestAgeSeconds.set).toHaveBeenCalledWith(0);
+  });
+
+  it('clamps negative ages to zero when clocks skew', async () => {
+    const future = new Date(now.getTime() + 60 * 1000);
+
+    prisma.webhook = {
+      findFirst: jest.fn().mockResolvedValue({ id: 'wh-1', createdAt: future }),
+      groupBy: jest.fn().mockResolvedValue([]),
+      aggregate: jest.fn().mockResolvedValue({ _avg: { deliveryLatencyMs: null } }),
+    };
+    prisma.webhookDLQ = {
+      findFirst: jest.fn().mockResolvedValue({ id: 'dlq-1', movedAt: future }),
+    };
+
+    const result = await emitQueueHealthMetrics(prisma);
+
+    expect(result.oldestPendingAgeSeconds).toBe(0);
+    expect(result.oldestDLQAgeSeconds).toBe(0);
+  });
+
+  it('buckets high attempt counts into a bounded 5+ label', async () => {
+    prisma.webhook = {
+      findFirst: jest.fn().mockResolvedValue(null),
+      groupBy: jest.fn().mockResolvedValue([
+        { deliveryAttempts: 4, _count: { _all: 1 } },
+        { deliveryAttempts: 5, _count: { _all: 2 } },
+        { deliveryAttempts: 42, _count: { _all: 7 } },
+      ]),
+      aggregate: jest.fn().mockResolvedValue({ _avg: { deliveryLatencyMs: 0 } }),
+    };
+    prisma.webhookDLQ = {
+      findFirst: jest.fn().mockResolvedValue(null),
+    };
+
+    const result = await emitQueueHealthMetrics(prisma);
+
+    expect(result.attemptDistribution).toEqual({ 4: 1, '5+': 9 });
+    expect(metrics.webhookQueueAttemptDistribution.observe).toHaveBeenCalledWith({ attempts: '4' }, 1);
+    expect(metrics.webhookQueueAttemptDistribution.observe).toHaveBeenCalledWith({ attempts: '5+' }, 9);
+  });
+
+  it('does not throw and skips emission when the database is unavailable', async () => {
+    prisma.webhook = {
+      findFirst: jest.fn().mockRejectedValue(new Error('connection refused')),
+      groupBy: jest.fn().mockResolvedValue([]),
+      aggregate: jest.fn().mockResolvedValue({ _avg: { deliveryLatencyMs: null } }),
+    };
+    prisma.webhookDLQ = {
+      findFirst: jest.fn().mockResolvedValue(null),
+    };
+
+    await expect(emitQueueHealthMetrics(prisma)).rejects.toThrow('connection refused');
+    expect(metrics.webhookQueueOldestPendingAgeSeconds.set).not.toHaveBeenCalled();
+    expect(metrics.webhookDLQOldestAgeSeconds.set).not.toHaveBeenCalled();
+  });
+
+  it('updates DLQ age after a webhook is moved to the DLQ on retry exhaustion', async () => {
+    const failingSinceDate = new Date(now.getTime() - 5 * 24 * 60 * 60 * 1000);
+    const webhook = {
+      id: 'wh-1',
+      username: 'alice',
+      url: 'https://example.com/hook',
+      secret: 'secret-abc',
+      failingSince: failingSinceDate,
+    };
+
+    prisma.webhookDLQ.create.mockResolvedValue({ id: 'dlq-1', webhookId: 'wh-1' });
+    prisma.webhook.update.mockResolvedValue({});
+
+    await moveToDLQ(prisma, async () => {}, webhook);
+
+    // After the move, the DLQ now holds an entry and the health emitter reflects its age.
+    prisma.webhook = {
+      findFirst: jest.fn().mockResolvedValue(null),
+      groupBy: jest.fn().mockResolvedValue([]),
+      aggregate: jest.fn().mockResolvedValue({ _avg: { deliveryLatencyMs: null } }),
+    };
+    prisma.webhookDLQ.findFirst = jest.fn().mockResolvedValue({
+      id: 'dlq-1',
+      movedAt: new Date(now.getTime() - 120 * 1000),
+    });
+
+    const result = await emitQueueHealthMetrics(prisma);
+
+    expect(result.oldestDLQAgeSeconds).toBe(120);
+    expect(metrics.webhookDLQOldestAgeSeconds.set).toHaveBeenCalledWith(120);
+  });
 });
 
 describe('getWebhooksExhaustedRetries', () => {

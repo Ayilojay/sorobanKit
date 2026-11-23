@@ -62,6 +62,10 @@ const {
   createBreaker,
   HORIZON_BASE,
   BREAKER_THRESHOLD,
+  observeSubmissionToFinality,
+  getConfirmationLagSnapshot,
+  resetConfirmationLagMetrics,
+  CONFIRMATION_LAG_OBJECTIVE_MS,
 } = require('../src/services/stellarService');
 
 describe('StellarService — Circuit Breaker', () => {
@@ -262,6 +266,194 @@ describe('StellarService — Circuit Breaker', () => {
     });
   });
 
+  describe('ledger confirmation lag instrumentation', () => {
+    beforeEach(() => {
+      resetConfirmationLagMetrics();
+    });
+
+    it('exports a documented confirmation lag objective', () => {
+      expect(typeof CONFIRMATION_LAG_OBJECTIVE_MS).toBe('number');
+      expect(CONFIRMATION_LAG_OBJECTIVE_MS).toBeGreaterThan(0);
+    });
+
+    it('records submission-to-finality observations labeled by network and outcome', () => {
+      observeSubmissionToFinality({
+        network: 'testnet',
+        outcome: 'success',
+        submittedAt: 1000,
+        finalizedAt: 3500,
+      });
+
+      const snapshot = getConfirmationLagSnapshot();
+      const series = snapshot.series.find(
+        (s) => s.network === 'testnet' && s.outcome === 'success'
+      );
+
+      expect(series).toBeDefined();
+      expect(series.count).toBe(1);
+      expect(series.lagMs).toBe(2500);
+    });
+
+    it('never includes user identifiers in metric labels', () => {
+      observeSubmissionToFinality({
+        network: 'testnet',
+        outcome: 'success',
+        submittedAt: 0,
+        finalizedAt: 1000,
+        account: 'GABCDEF1234567890',
+        intentId: 'intent-42',
+        txHash: 'deadbeef',
+      });
+
+      const snapshot = getConfirmationLagSnapshot();
+      const serialized = JSON.stringify(snapshot);
+
+      expect(serialized).not.toContain('GABCDEF1234567890');
+      expect(serialized).not.toContain('intent-42');
+      expect(serialized).not.toContain('deadbeef');
+
+      for (const series of snapshot.series) {
+        expect(Object.keys(series.labels).sort()).toEqual(['network', 'outcome']);
+      }
+    });
+
+    it('aggregates percentiles across multiple observations', () => {
+      const lags = [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000];
+      lags.forEach((lag, i) => {
+        observeSubmissionToFinality({
+          network: 'mainnet',
+          outcome: 'success',
+          submittedAt: i * 10000,
+          finalizedAt: i * 10000 + lag,
+        });
+      });
+
+      const snapshot = getConfirmationLagSnapshot();
+      const series = snapshot.series.find(
+        (s) => s.network === 'mainnet' && s.outcome === 'success'
+      );
+
+      expect(series.count).toBe(10);
+      expect(series.p50).toBeGreaterThanOrEqual(500);
+      expect(series.p50).toBeLessThanOrEqual(600);
+      expect(series.p95).toBeGreaterThanOrEqual(900);
+      expect(series.p95).toBeLessThanOrEqual(1000);
+      expect(series.p99).toBeGreaterThanOrEqual(900);
+    });
+
+    it('tracks failures separately from successes', () => {
+      observeSubmissionToFinality({
+        network: 'testnet',
+        outcome: 'success',
+        submittedAt: 0,
+        finalizedAt: 1000,
+      });
+      observeSubmissionToFinality({
+        network: 'testnet',
+        outcome: 'failure',
+        submittedAt: 0,
+        finalizedAt: 5000,
+      });
+
+      const snapshot = getConfirmationLagSnapshot();
+      expect(snapshot.series).toHaveLength(2);
+      expect(
+        snapshot.series.find((s) => s.outcome === 'success').count
+      ).toBe(1);
+      expect(
+        snapshot.series.find((s) => s.outcome === 'failure').count
+      ).toBe(1);
+    });
+
+    it('flags breach when p95 exceeds the documented objective', () => {
+      for (let i = 0; i < 20; i++) {
+        observeSubmissionToFinality({
+          network: 'mainnet',
+          outcome: 'success',
+          submittedAt: 0,
+          finalizedAt: CONFIRMATION_LAG_OBJECTIVE_MS * 2,
+        });
+      }
+
+      const snapshot = getConfirmationLagSnapshot();
+      const series = snapshot.series.find(
+        (s) => s.network === 'mainnet' && s.outcome === 'success'
+      );
+
+      expect(series.objectiveBreached).toBe(true);
+    });
+
+    it('does not flag breach when p95 is within the documented objective', () => {
+      for (let i = 0; i < 20; i++) {
+        observeSubmissionToFinality({
+          network: 'mainnet',
+          outcome: 'success',
+          submittedAt: 0,
+          finalizedAt: Math.floor(CONFIRMATION_LAG_OBJECTIVE_MS / 2),
+        });
+      }
+
+      const snapshot = getConfirmationLagSnapshot();
+      const series = snapshot.series.find(
+        (s) => s.network === 'mainnet' && s.outcome === 'success'
+      );
+
+      expect(series.objectiveBreached).toBe(false);
+    });
+
+    it('ignores observations with missing or invalid timestamps', () => {
+      observeSubmissionToFinality({
+        network: 'testnet',
+        outcome: 'success',
+        submittedAt: undefined,
+        finalizedAt: 1000,
+      });
+      observeSubmissionToFinality({
+        network: 'testnet',
+        outcome: 'success',
+        submittedAt: 2000,
+        finalizedAt: 1000,
+      });
+
+      const snapshot = getConfirmationLagSnapshot();
+      expect(snapshot.series).toHaveLength(0);
+    });
+
+    it('resetConfirmationLagMetrics clears accumulated observations', () => {
+      observeSubmissionToFinality({
+        network: 'testnet',
+        outcome: 'success',
+        submittedAt: 0,
+        finalizedAt: 1000,
+      });
+      expect(getConfirmationLagSnapshot().series).toHaveLength(1);
+
+      resetConfirmationLagMetrics();
+      expect(getConfirmationLagSnapshot().series).toHaveLength(0);
+    });
+
+    it('handles concurrent observations without losing counts', async () => {
+      const observations = Array.from({ length: 50 }, (_, i) =>
+        Promise.resolve().then(() =>
+          observeSubmissionToFinality({
+            network: 'testnet',
+            outcome: 'success',
+            submittedAt: i * 1000,
+            finalizedAt: i * 1000 + 500,
+          })
+        )
+      );
+
+      await Promise.all(observations);
+
+      const snapshot = getConfirmationLagSnapshot();
+      const series = snapshot.series.find(
+        (s) => s.network === 'testnet' && s.outcome === 'success'
+      );
+      expect(series.count).toBe(50);
+    });
+  });
+
   describe('wrapPageWithBreaker', () => {
     it('wraps page.next() with circuit breaker', async () => {
       const mockNext = jest.fn().mockResolvedValue({ records: [2] });
@@ -305,6 +497,199 @@ describe('StellarService — Circuit Breaker', () => {
       } catch (err) {
         expect(err.code).toBe('EOPENBREAKER');
       }
+    });
+  });
+});
+
+describe('StellarService — fault injection (Horizon outages)', () => {
+  const originalFetch = global.fetch;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  afterEach(() => {
+    // Restore any global fetch we may have stubbed so no test leaks network access.
+    if (originalFetch === undefined) {
+      delete global.fetch;
+    } else {
+      global.fetch = originalFetch;
+    }
+  });
+
+  const makeBreaker = (fn, overrides = {}) =>
+    createBreaker(fn, {
+      timeout: 1000,
+      volumeThreshold: 2,
+      errorThresholdPercentage: 1,
+      resetTimeout: 60000,
+      ...overrides,
+    });
+
+  const tripBreaker = async (breaker, times = 2) => {
+    for (let i = 0; i < times; i++) {
+      try { await breaker.fire(); } catch (_e) { /* expected */ }
+    }
+  };
+
+  describe('disconnect', () => {
+    it('opens the breaker on repeated connection refused errors', async () => {
+      const fn = jest.fn().mockRejectedValue(
+        Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' })
+      );
+      const breaker = makeBreaker(fn);
+
+      await tripBreaker(breaker);
+
+      expect(breaker.opened).toBe(true);
+      const callsBefore = fn.mock.calls.length;
+      await expect(breaker.fire()).rejects.toMatchObject({ code: 'EOPENBREAKER' });
+      // Fast-fail must not hit the underlying transport.
+      expect(fn.mock.calls.length).toBe(callsBefore);
+    });
+
+    it('opens the breaker on DNS resolution failures', async () => {
+      const fn = jest.fn().mockRejectedValue(
+        Object.assign(new Error('getaddrinfo ENOTFOUND horizon.stellar.org'), { code: 'ENOTFOUND' })
+      );
+      const breaker = makeBreaker(fn);
+
+      await tripBreaker(breaker);
+
+      expect(breaker.opened).toBe(true);
+    });
+
+    it('does not open the breaker for a single transient disconnect', async () => {
+      const fn = jest.fn()
+        .mockRejectedValueOnce(Object.assign(new Error('ECONNRESET'), { code: 'ECONNRESET' }))
+        .mockResolvedValueOnce('ok');
+      const breaker = makeBreaker(fn, { volumeThreshold: 5 });
+
+      await expect(breaker.fire()).rejects.toThrow('ECONNRESET');
+      await expect(breaker.fire()).resolves.toBe('ok');
+      expect(breaker.opened).toBe(false);
+    });
+  });
+
+  describe('slow responses', () => {
+    it('times out slow calls and counts them toward the breaker', async () => {
+      const fn = jest.fn().mockImplementation(
+        () => new Promise((resolve) => setTimeout(() => resolve('late'), 200))
+      );
+      const breaker = makeBreaker(fn, { timeout: 20 });
+
+      await tripBreaker(breaker);
+
+      expect(breaker.opened).toBe(true);
+    });
+
+    it('does not leak pending timers after a timeout', async () => {
+      const fn = jest.fn().mockImplementation(
+        () => new Promise((resolve) => setTimeout(() => resolve('late'), 500))
+      );
+      const breaker = makeBreaker(fn, { timeout: 10 });
+
+      try { await breaker.fire(); } catch (_e) { /* expected timeout */ }
+
+      // Allow the underlying slow promise to settle; no unhandled rejection should occur.
+      await new Promise((r) => setTimeout(r, 600));
+      expect(fn).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('reconnection and partial recovery', () => {
+    it('closes the breaker after a successful half-open probe', async () => {
+      const fn = jest.fn()
+        .mockRejectedValueOnce(new Error('down'))
+        .mockRejectedValueOnce(new Error('down'))
+        .mockResolvedValueOnce('back');
+      const breaker = makeBreaker(fn, { resetTimeout: 30 });
+
+      await tripBreaker(breaker);
+      expect(breaker.opened).toBe(true);
+
+      await new Promise((r) => setTimeout(r, 60));
+
+      await expect(breaker.fire()).resolves.toBe('back');
+      expect(breaker.opened).toBe(false);
+    });
+
+    it('re-opens the breaker when the half-open probe fails', async () => {
+      const fn = jest.fn()
+        .mockRejectedValueOnce(new Error('down'))
+        .mockRejectedValueOnce(new Error('down'))
+        .mockRejectedValueOnce(new Error('still down'));
+      const breaker = makeBreaker(fn, { resetTimeout: 30 });
+
+      await tripBreaker(breaker);
+      expect(breaker.opened).toBe(true);
+
+      await new Promise((r) => setTimeout(r, 60));
+
+      await expect(breaker.fire()).rejects.toThrow('still down');
+      expect(breaker.opened).toBe(true);
+    });
+
+    it('handles partial recovery: success then failure keeps breaker closed until threshold', async () => {
+      const fn = jest.fn()
+        .mockResolvedValueOnce('ok')
+        .mockRejectedValueOnce(new Error('flaky'))
+        .mockResolvedValueOnce('ok');
+      const breaker = makeBreaker(fn, { volumeThreshold: 5 });
+
+      await expect(breaker.fire()).resolves.toBe('ok');
+      await expect(breaker.fire()).rejects.toThrow('flaky');
+      await expect(breaker.fire()).resolves.toBe('ok');
+      expect(breaker.opened).toBe(false);
+    });
+  });
+
+  describe('concurrency', () => {
+    it('counts concurrent failures toward a single open transition', async () => {
+      const fn = jest.fn().mockRejectedValue(new Error('down'));
+      const breaker = makeBreaker(fn, { volumeThreshold: 3 });
+
+      const results = await Promise.allSettled([
+        breaker.fire(),
+        breaker.fire(),
+        breaker.fire(),
+        breaker.fire(),
+      ]);
+
+      expect(results.every((r) => r.status === 'rejected')).toBe(true);
+      expect(breaker.opened).toBe(true);
+    });
+  });
+
+  describe('no production network access', () => {
+    it('never calls global fetch while exercising the breaker', async () => {
+      const fetchSpy = jest.fn(() => {
+        throw new Error('unexpected production network access');
+      });
+      global.fetch = fetchSpy;
+
+      const fn = jest.fn().mockRejectedValue(new Error('down'));
+      const breaker = makeBreaker(fn);
+
+      await tripBreaker(breaker);
+      try { await breaker.fire(); } catch (_e) { /* fast-fail */ }
+
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it('loadAccount uses the mocked Horizon server, not real network', async () => {
+      const fetchSpy = jest.fn(() => {
+        throw new Error('unexpected production network access');
+      });
+      global.fetch = fetchSpy;
+
+      __mockServer.loadAccount.mockRejectedValue(new Error('ECONNREFUSED'));
+      for (let i = 0; i < 6; i++) {
+        try { await loadAccount('GABC'); } catch (_e) { /* trip breaker */ }
+      }
+
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(__mockServer.loadAccount).toHaveBeenCalled();
     });
   });
 });

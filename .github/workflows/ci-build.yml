@@ -33,3 +33,31 @@ jobs:
         run: |
           cd payment-dashboard
           npm run build
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          set -euo pipefail
+          SOURCE_REVISION="${GITHUB_SHA}"
+          ARTIFACT_DIGEST="$(cd payment-dashboard && find dist -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')"
+          if [ -z "${ARTIFACT_DIGEST}" ]; then
+            echo "Failed to compute artifact digest for payment-dashboard dist output" >&2
+            exit 1
+          fi
+          mkdir -p sbom
+          bash scripts/generate-sbom.sh \
+            --ecosystem node \
+            --project payment-dashboard \
+            --source-revision "${SOURCE_REVISION}" \
+            --artifact-digest "${ARTIFACT_DIGEST}" \
+            --output sbom/payment-dashboard.cdx.json
+          if [ ! -s sbom/payment-dashboard.cdx.json ]; then
+            echo "SBOM generation did not produce an output file" >&2
+            exit 1
+          fi
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-payment-dashboard
+          path: sbom/payment-dashboard.cdx.json
+          if-no-files-found: error
