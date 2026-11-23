@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { API_BASE, apiErrorMessage, walletKit } from './shared'; // <-- 1. Import walletKit instead of Freighter
 import { getLookup } from '../api/client';
+import { useConnectivity } from '../hooks/useConnectivity';
 
 const USERNAME_REGEX = /^[a-zA-Z0-9]/;
 
@@ -40,6 +41,7 @@ function RegistrationPage({
   });
   const [isConnecting, setIsConnecting] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const { isOffline } = useConnectivity();
 
   const walletLabel = userPublicKey
     ? `Connected: ${userPublicKey.substring(0, 5)}...${userPublicKey.substring(51)}`
@@ -293,8 +295,8 @@ function RegistrationPage({
   };
 
   return (
-    <div className="registration">
-      <section className="hero-panel">
+    <div className="registration" data-testid="registration-page">
+      <section className="hero-panel" data-testid="registration-hero">
         <div className="brand">
           <div className="brand-mark">S</div>
           <div>
@@ -322,8 +324,8 @@ function RegistrationPage({
         </div>
       </section>
 
-      <section className="form-panel">
-        <form onSubmit={handleSubmit}>
+      <section className="form-panel" data-testid="registration-form-panel">
+        <form onSubmit={handleSubmit} data-testid="registration-form">
           <label className="field">
             <span>Username</span>
             <input
@@ -384,17 +386,43 @@ function RegistrationPage({
           <button
             type="submit"
             className="primary-button"
-            disabled={isSubmitting}
+            disabled={isSubmitting || isOffline}
             aria-busy={isSubmitting ? "true" : "false"}
+            aria-describedby={isOffline ? "registration-offline-note" : undefined}
+            data-testid="registration-submit"
           >
             {isSubmitting ? "Registering..." : "Register username"}
           </button>
 
-          {status.text && (
-            <p className={`status status-${status.tone}`}>{status.text}</p>
+          {isOffline && (
+            <p
+              id="registration-offline-note"
+              className="status status-neutral"
+              role="note"
+              data-testid="registration-offline-note"
+            >
+              You are offline. Registration is read-only until your connection
+              is restored.
+            </p>
           )}
 
-          <button type="button" className="link-button" onClick={onBack}>
+          {status.text && (
+            <p
+              className={`status status-${status.tone}`}
+              role="status"
+              aria-live="polite"
+              data-testid="registration-status"
+            >
+              {status.text}
+            </p>
+          )}
+
+          <button
+            type="button"
+            className="link-button"
+            onClick={onBack}
+            data-testid="registration-back"
+          >
             Back to dashboard
           </button>
         </form>

@@ -44,6 +44,84 @@
         }
       }
     },
+    "/health/startup": {
+      "get": {
+        "tags": ["Platform"],
+        "summary": "Check startup (initialization) completion",
+        "description": "Startup probe. Reports whether the process has finished one-time initialization (configuration loaded, database migrations verified, connection pools established). It does not depend on downstream dependency availability after initialization, so slow startup is never mistaken for a dead process. Intended for Kubernetes `startupProbe`; while it returns 503 the orchestrator must not run liveness checks or restart the container.",
+        "operationId": "getStartupHealth",
+        "responses": {
+          "200": {
+            "description": "Initialization has completed",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StartupHealthStatus" }
+              }
+            }
+          },
+          "503": {
+            "description": "Initialization is still in progress (or failed); the process is not yet ready to be probed for liveness",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StartupHealthStatus" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health/live": {
+      "get": {
+        "tags": ["Platform"],
+        "summary": "Check process liveness",
+        "description": "Liveness probe. Reports whether the process event loop is responsive and not deadlocked. It intentionally ignores dependency health (database, Redis, Horizon): a dependency outage must not cause a restart. A 503 here means the process is wedged and should be restarted by the orchestrator. Intended for Kubernetes `livenessProbe`.",
+        "operationId": "getLivenessHealth",
+        "responses": {
+          "200": {
+            "description": "Process is alive and its event loop is responsive",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/LivenessHealthStatus" }
+              }
+            }
+          },
+          "503": {
+            "description": "Process is deadlocked or its event loop is unresponsive; restart required",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/LivenessHealthStatus" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health/ready": {
+      "get": {
+        "tags": ["Platform"],
+        "summary": "Check traffic readiness",
+        "description": "Readiness probe. Reports whether the instance can serve traffic: initialization must be complete and routing-critical dependencies (database, and Redis when configured) must be reachable. Horizon is not routing-critical and does not affect readiness. A 503 removes the instance from the load balancer without restarting it. Intended for Kubernetes `readinessProbe`.",
+        "operationId": "getReadinessHealth",
+        "responses": {
+          "200": {
+            "description": "Instance is ready to receive traffic",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ReadinessHealthStatus" }
+              }
+            }
+          },
+          "503": {
+            "description": "Instance is not ready to receive traffic (initialization incomplete or a routing-critical dependency is unavailable)",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ReadinessHealthStatus" }
+              }
+            }
+          }
+        }
+      }
+    },
     "/federation": {
       "get": {
         "tags": ["Addresses"],
@@ -664,6 +742,62 @@
           "database": { "type": "string", "enum": ["up"] },
           "redis": { "type": "string", "enum": ["up", "not configured"] },
           "horizon": { "type": "string", "enum": ["up"] }
+        }
+      },
+      "StartupHealthStatus": {
+        "type": "object",
+        "description": "Result of the startup probe. `status` is `UP` once initialization has completed and `DOWN` while it is still in progress or has failed.",
+        "required": ["status", "timestamp", "initialized"],
+        "properties": {
+          "status": { "type": "string", "enum": ["UP", "DOWN"] },
+          "timestamp": { "type": "string", "format": "date-time" },
+          "initialized": { "type": "boolean" },
+          "phase": {
+            "type": "string",
+            "description": "Current initialization phase, for diagnostics only",
+            "enum": ["pending", "initializing", "completed", "failed"]
+          },
+          "durationMs": { "type": "integer", "minimum": 0 },
+          "error": { "type": "string" }
+        }
+      },
+      "LivenessHealthStatus": {
+        "type": "object",
+        "description": "Result of the liveness probe. Dependency health is deliberately excluded; only process responsiveness is reported.",
+        "required": ["status", "timestamp", "uptimeSeconds"],
+        "properties": {
+          "status": { "type": "string", "enum": ["UP", "DOWN"] },
+          "timestamp": { "type": "string", "format": "date-time" },
+          "uptimeSeconds": { "type": "number", "minimum": 0 },
+          "eventLoopResponsive": { "type": "boolean" },
+          "eventLoopLagMs": { "type": "number", "minimum": 0 },
+          "error": { "type": "string" }
+        }
+      },
+      "ReadinessHealthStatus": {
+        "type": "object",
+        "description": "Result of the readiness probe. Only routing-critical dependencies are reported; Horizon is excluded because it does not affect routing.",
+        "required": ["status", "timestamp", "initialized", "database"],
+        "properties": {
+          "status": { "type": "string", "enum": ["UP", "DOWN"] },
+          "timestamp": { "type": "string", "format": "date-time" },
+          "initialized": { "type": "boolean" },
+          "database": { "type": "string", "enum": ["up", "down"] },
+          "redis": { "type": "string", "enum": ["up", "down", "not configured"] },
+          "checks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name", "status", "critical"],
+              "properties": {
+                "name": { "type": "string" },
+                "status": { "type": "string", "enum": ["up", "down", "not configured"] },
+                "critical": { "type": "boolean" },
+                "latencyMs": { "type": "number", "minimum": 0 },
+                "error": { "type": "string" }
+              }
+            }
+          }
         }
       },
       "FederationEntry": {

@@ -5,19 +5,35 @@
 #   docker compose --profile full up         the same, plus the built frontend
 #   docker compose --profile test up         API under test + its own database
 #   docker compose --profile integration up  local standalone Stellar network
-#   docker compose --profile local up        isolated bootstrap stack (see below)
+#   docker compose --profile preview up      ephemeral per-PR preview stack
 #
 # dev and test use separate databases on separate host ports, so both can run
 # at once without colliding.
 #
-# The `local` profile is the one-command development bootstrap (scripts/dev-bootstrap.*).
-# It is deliberately isolated from dev/test/integration: its own database
-# (stellar_tags_local on host port 5434), its own Redis (host port 6380), its
-# own backend port (5002), and its own named volumes. It never references
-# production resources, uses only local credentials, and every service has a
-# healthcheck so the bootstrap can wait for readiness before applying
-# migrations. Because the ports differ, `local` can run alongside `dev` and
-# `test` without collisions.
+# ── Preview environments (one per pull request) ──────────────────────────────
+# The preview profile provisions an isolated, throwaway stack for a single PR.
+# It is driven by the preview workflow, which MUST set a per-PR project name so
+# that every resource (containers, network, volumes) is namespaced and cannot
+# collide with another PR or with dev/test:
+#
+#   COMPOSE_PROJECT_NAME=preview-pr-<number> \
+#     docker compose --profile preview up -d --build
+#
+# The cleanup job targets exactly the same resources by reusing that project
+# name, so the two must agree on the naming scheme:
+#
+#   COMPOSE_PROJECT_NAME=preview-pr-<number> \
+#     docker compose --profile preview down -v --remove-orphans
+#
+# `down -v` removes the named volumes below, which is what makes teardown
+# auditable: after it runs, no preview data survives. The cleanup job runs on
+# PR close (and on a TTL sweep) and logs the project name it tore down.
+#
+# TTL: a preview stack is expected to live for at most PREVIEW_TTL_HOURS
+# (default 24). The workflow stamps the creation time as a label so the sweep
+# can find and remove stacks older than the TTL even if the PR is never closed.
+# Nothing here holds production credentials: the preview profile only reads
+# PREVIEW_* variables, and the API is started with synthetic seed data.
 #
 # Database ports are published to 127.0.0.1 only. Binding to localhost keeps
 # the dev and test Postgres instances reachable from the host (for psql, the
@@ -151,70 +167,73 @@ services:
       retries: 5
       start_period: 10s
 
-  # ── local (one-command bootstrap) ──────────────────────────────────────────
-  # Non-production defaults only: throwaway credentials, localhost-only
-  # bindings, and no external/production endpoints. Started by
-  # scripts/dev-bootstrap.* via `docker compose --profile local up`.
-  postgres-local:
-    profiles: ["local"]
+  # ── preview ────────────────────────────────────────────────────────────────
+  # Ephemeral per-PR stack. No host port bindings: the preview workflow reaches
+  # these services over the project-scoped network only, so two previews (or a
+  # preview and dev) never fight over a port. Volumes are named per project via
+  # COMPOSE_PROJECT_NAME, so `down -v` on one PR cannot touch another's data.
+  postgres-preview:
+    profiles: ["preview"]
     image: postgres:16.9-alpine
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: stellar_tags_local
-    # 5434 on the host so dev (5432) and test (5433) can stay up. Bound to
-    # 127.0.0.1 so the local database is not reachable from the network.
-    ports:
-      - "127.0.0.1:5434:5432"
+      POSTGRES_USER: preview
+      # Preview-only credential, supplied by the workflow. Never a production
+      # secret; the stack is disposable and network-isolated.
+      POSTGRES_PASSWORD: ${PREVIEW_DB_PASSWORD:-preview}
+      POSTGRES_DB: stellar_tags_preview
     volumes:
-      - postgres_local_data:/var/lib/postgresql/data
+      # Project-scoped volume: removed by `down -v` during teardown.
+      - postgres_preview_data:/var/lib/postgresql/data
+    labels:
+      # Lets the TTL sweep find stale preview stacks by creation time.
+      com.stellar-tags.preview: "true"
+      com.stellar-tags.preview.created-at: "${PREVIEW_CREATED_AT:-unknown}"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d stellar_tags_local"]
+      test: ["CMD-SHELL", "pg_isready -U preview"]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 5
 
-  redis-local:
-    profiles: ["local"]
+  redis-preview:
+    profiles: ["preview"]
     image: redis:7.4.2-alpine
-    # 6380 on the host so the dev redis (6379) can stay up.
-    ports:
-      - "127.0.0.1:6380:6379"
+    volumes:
+      - redis_preview_data:/data
+    labels:
+      com.stellar-tags.preview: "true"
+      com.stellar-tags.preview.created-at: "${PREVIEW_CREATED_AT:-unknown}"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 5
 
-  backend-local:
-    profiles: ["local"]
+  backend-preview:
+    profiles: ["preview"]
     build:
       context: .
       dockerfile: Dockerfile
       target: backend
-    # 5002 on the host so the dev backend (5000) can stay up.
-    ports:
-      - "127.0.0.1:5002:5000"
     environment:
-      # Local-only defaults. No production URLs or secrets are referenced.
-      DATABASE_URL: postgresql://postgres:postgres@postgres-local:5432/stellar_tags_local?schema=public
-      REDIS_URL: redis://redis-local:6379
+      # Preview-only wiring. No production credentials are referenced here.
+      DATABASE_URL: postgresql://preview:${PREVIEW_DB_PASSWORD:-preview}@postgres-preview:5432/stellar_tags_preview?schema=public
+      REDIS_URL: redis://redis-preview:6379
       PORT: "5000"
       LOG_DIR: /app/logs
-      NODE_ENV: development
+      # Marks the process as a preview so it refuses to talk to real networks
+      # and seeds synthetic data instead.
+      PREVIEW_MODE: "true"
+      PREVIEW_PR_NUMBER: ${PREVIEW_PR_NUMBER:-0}
     volumes:
-      - backend_local_logs:/app/logs
+      - backend_preview_logs:/app/logs
+    labels:
+      com.stellar-tags.preview: "true"
+      com.stellar-tags.preview.created-at: "${PREVIEW_CREATED_AT:-unknown}"
     depends_on:
-      postgres-local:
+      postgres-preview:
         condition: service_healthy
-      redis-local:
+      redis-preview:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:5000/health"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 15s
 
   # ── integration ────────────────────────────────────────────────────────────
   # Standalone Stellar network (Soroban-enabled) used by the contract
@@ -246,7 +265,8 @@ volumes:
   # Dev-profile Postgres data. Persists across down/up; remove it to start fresh.
   postgres_dev_data:
   backendlogs:
-  # Local-bootstrap Postgres data. Isolated from dev so a bootstrap reset never
-  # touches dev data. Remove it to start fresh.
-  postgres_local_data:
-  backend_local_logs:
+  # Preview-profile volumes. Namespaced by COMPOSE_PROJECT_NAME, so each PR gets
+  # its own copies; `down -v` during teardown removes them.
+  postgres_preview_data:
+  redis_preview_data:
+  backend_preview_logs:

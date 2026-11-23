@@ -447,3 +447,201 @@ describe('strict-mode process.exit integration', () => {
     delete process.env.DATABASE_URL;
   });
 });
+
+// ---------------------------------------------------------------------------
+// Cold-start / dependency-recovery behaviour under deployment conditions.
+// ---------------------------------------------------------------------------
+// Models an ephemeral deployment stack where Postgres and Redis come up after
+// the application container: the migration check must tolerate delayed
+// availability, gate worker activation on migration completion, bound its
+// retries, and never leak workers when initialization ultimately fails.
+// ---------------------------------------------------------------------------
+
+describe('cold-start and dependency recovery', () => {
+  let checkMigrations;
+  let enforceMigrationPolicy;
+  let originalUrl;
+  let originalPolicy;
+  let originalRetries;
+  let originalDelay;
+
+  beforeAll(() => {
+    ({ checkMigrations, enforceMigrationPolicy } = require('../src/migrate-check'));
+    originalUrl = process.env.DATABASE_URL;
+    originalPolicy = process.env.MIGRATION_POLICY;
+    originalRetries = process.env.MIGRATION_CHECK_RETRIES;
+    originalDelay = process.env.MIGRATION_CHECK_RETRY_DELAY_MS;
+  });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    process.env.DATABASE_URL = 'postgresql://u:p@postgres:5432/db';
+    process.env.MIGRATION_POLICY = 'strict';
+    // Keep the retry loop fast and deterministic in tests.
+    process.env.MIGRATION_CHECK_RETRIES = '3';
+    process.env.MIGRATION_CHECK_RETRY_DELAY_MS = '1';
+  });
+
+  afterEach(() => {
+    delete process.env.MIGRATION_POLICY;
+    delete process.env.MIGRATION_CHECK_RETRIES;
+    delete process.env.MIGRATION_CHECK_RETRY_DELAY_MS;
+    if (originalUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = originalUrl;
+  });
+
+  afterAll(() => {
+    if (originalPolicy === undefined) delete process.env.MIGRATION_POLICY;
+    else process.env.MIGRATION_POLICY = originalPolicy;
+    if (originalRetries === undefined) delete process.env.MIGRATION_CHECK_RETRIES;
+    else process.env.MIGRATION_CHECK_RETRIES = originalRetries;
+    if (originalDelay === undefined) delete process.env.MIGRATION_CHECK_RETRY_DELAY_MS;
+    else process.env.MIGRATION_CHECK_RETRY_DELAY_MS = originalDelay;
+  });
+
+  // Simulate a Postgres that is not yet accepting connections for the first
+  // `failures` attempts, then reports the given healthy output.
+  const simulateDelayedPostgres = ({ failures, then = { code: 0, stdout: 'Status: Database schema is up to date!' } }) => {
+    let attempt = 0;
+    mockExecFile.mockImplementation((_bin, _args, _opts, cb) => {
+      attempt += 1;
+      if (attempt <= failures) {
+        cb(
+          Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:5432'), { code: 1 }),
+          '',
+          'Error: P1001: Can\'t reach database server at `postgres:5432`',
+        );
+        return;
+      }
+      if (then.code !== 0) {
+        cb(Object.assign(new Error(`exited with code ${then.code}`), { code: then.code }), then.stdout, then.stderr || '');
+      } else {
+        cb(null, then.stdout, then.stderr || '');
+      }
+    });
+    mockChild.on.mockImplementation(() => {});
+    return () => attempt;
+  };
+
+  it('retries while Postgres is still starting and succeeds once it is reachable', async () => {
+    const attempts = simulateDelayedPostgres({ failures: 2 });
+
+    const r = await checkMigrations();
+
+    expect(attempts()).toBe(3);
+    expect(r.status).toBe('up-to-date');
+    expect(r.skipped).toBe(false);
+    expect(r.attempts).toBe(3);
+  });
+
+  it('gates worker activation until migrations complete', async () => {
+    simulateDelayedPostgres({ failures: 1 });
+
+    const workerStart = jest.fn();
+    const result = await checkMigrations();
+    const { shouldExit } = enforceMigrationPolicy(result);
+
+    // Workers only start after the check resolves and the policy allows it.
+    if (!shouldExit) workerStart();
+
+    expect(result.status).toBe('up-to-date');
+    expect(workerStart).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not start workers while migrations are still pending', async () => {
+    simulateDelayedPostgres({
+      failures: 0,
+      then: {
+        code: 1,
+        stdout: 'Following migration(s) have not yet been applied:\n- 20260101_add_col',
+      },
+    });
+
+    const workerStart = jest.fn();
+    const exitSpy = jest.spyOn(process, 'exit').mockImplementation(() => {});
+
+    const result = await checkMigrations();
+    const { shouldExit } = enforceMigrationPolicy(result);
+
+    if (shouldExit) {
+      await mockLogger.flush();
+      process.exit(1);
+    } else {
+      workerStart();
+    }
+
+    expect(result.status).toBe('pending');
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(workerStart).not.toHaveBeenCalled();
+
+    exitSpy.mockRestore();
+  });
+
+  it('gives up after the bounded retry limit when Postgres never becomes available', async () => {
+    const attempts = simulateDelayedPostgres({ failures: Infinity });
+
+    const r = await checkMigrations();
+
+    // 1 initial attempt + MIGRATION_CHECK_RETRIES retries.
+    expect(attempts()).toBe(4);
+    expect(r.skipped).toBe(true);
+    expect(r.status).toBe('error');
+    expect(r.attempts).toBe(4);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.any(Error),
+      expect.stringContaining('Could not run'),
+    );
+  });
+
+  it('exits in strict mode after exhausting retries, without leaking workers', async () => {
+    simulateDelayedPostgres({ failures: Infinity });
+
+    const workerStart = jest.fn();
+    const exitSpy = jest.spyOn(process, 'exit').mockImplementation(() => {});
+
+    const result = await checkMigrations();
+    const { shouldExit } = enforceMigrationPolicy(result);
+
+    if (shouldExit) {
+      await mockLogger.flush();
+      process.exit(1);
+    } else {
+      workerStart();
+    }
+
+    expect(result.status).toBe('error');
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(workerStart).not.toHaveBeenCalled();
+
+    exitSpy.mockRestore();
+  });
+
+  it('honours a zero retry budget (single attempt, then fail)', async () => {
+    process.env.MIGRATION_CHECK_RETRIES = '0';
+    const attempts = simulateDelayedPostgres({ failures: Infinity });
+
+    const r = await checkMigrations();
+
+    expect(attempts()).toBe(1);
+    expect(r.status).toBe('error');
+    expect(r.attempts).toBe(1);
+  });
+
+  it('does not leak workers when concurrent cold-start checks race', async () => {
+    simulateDelayedPostgres({ failures: 1 });
+
+    const workerStart = jest.fn();
+    const runs = [checkMigrations(), checkMigrations()];
+    const results = await Promise.all(runs);
+
+    for (const result of results) {
+      const { shouldExit } = enforceMigrationPolicy(result);
+      if (!shouldExit) workerStart();
+    }
+
+    // Both checks converge on a healthy database and start workers exactly
+    // once each; no check resolves into an error state that would leak.
+    expect(results.every((r) => r.status === 'up-to-date')).toBe(true);
+    expect(workerStart).toHaveBeenCalledTimes(2);
+  });
+});
