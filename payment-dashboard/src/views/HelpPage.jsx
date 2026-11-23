@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import ScrollToTop from '../ScrollToTop';
 import MobileNav from './MobileNav';
 import { NAV_STORAGE_KEY, useNavState } from './shared';
+import { fetchCachedResource } from '../offlineCache';
 
 /**
  * @typedef {Object} HelpPageProps
@@ -32,6 +33,8 @@ function HelpPage({
   const [faqItems, setFaqItems] = useState([]);
   const [isFaqLoading, setIsFaqLoading] = useState(true);
   const [faqError, setFaqError] = useState(null);
+  /** @type {[import('../offlineCache').CacheFreshness | null, (value: import('../offlineCache').CacheFreshness | null) => void]} */
+  const [faqFreshness, setFaqFreshness] = useState(null);
 
   useEffect(() => {
     let isCancelled = false;
@@ -40,13 +43,13 @@ function HelpPage({
       setIsFaqLoading(true);
       setFaqError(null);
       try {
-        const response = await fetch('/faq.json');
-        if (!response.ok) {
-          throw new Error(`Failed to load FAQ (status ${response.status})`);
-        }
-        const data = await response.json();
+        const result = await fetchCachedResource('/faq.json', {
+          cacheKey: 'faq',
+          parse: (data) => (Array.isArray(data) ? data : []),
+        });
         if (!isCancelled) {
-          setFaqItems(Array.isArray(data) ? data : []);
+          setFaqItems(result.data);
+          setFaqFreshness(result.freshness);
         }
       } catch (error) {
         if (!isCancelled) {
@@ -169,7 +172,7 @@ function HelpPage({
       </aside>
 
       <main className="main">
-        <section className="help-hero">
+        <section className="help-hero" data-testid="help-hero">
           <button
             type="button"
             className="hamburger"
@@ -184,17 +187,19 @@ function HelpPage({
           <div className="help-hero-content">
             <p className="help-eyebrow">Help Center</p>
             <h2 className="help-title">System Clarity</h2>
-            <div className="help-search" role="search">
+            <div className="help-search" role="search" data-testid="help-search">
               <input
                 type="search"
                 placeholder="Search identities, routing, or transactions"
                 aria-label="Search the help center"
+                data-testid="help-search-input"
               />
               <div className="help-search-glow" aria-hidden="true" />
             </div>
-            <div className="help-actions">
+            <div className="help-actions" data-testid="help-actions">
               <button
                 type="button"
+                data-testid="help-action-identity"
                 className={activeHelpAction === "identity" ? "is-active" : ""}
                 onClick={() =>
                   setActiveHelpAction((prev) =>
@@ -204,9 +209,12 @@ function HelpPage({
               >
                 Claim Identity
               </button>
-              <button type="button">Smart Routing</button>
+              <button type="button" data-testid="help-action-routing">
+                Smart Routing
+              </button>
               <button
                 type="button"
+                data-testid="help-action-troubleshooting"
                 className={
                   activeHelpAction === "troubleshooting" ? "is-active" : ""
                 }
@@ -234,13 +242,14 @@ function HelpPage({
                 </div>
               )}
               {!isFaqLoading && !faqError && (
-                <div className="help-action-content">
+                <div className="help-action-content" data-testid="help-faq-list">
                   {faqItems.length === 0 ? (
                     <p>No help content available yet.</p>
                   ) : (
                     faqItems.map((item, index) => (
                       <div
                         className="help-action-block"
+                        data-testid="help-faq-item"
                         key={`${item.question}-${index}`}
                       >
                         <strong>{item.question}</strong>
@@ -251,6 +260,18 @@ function HelpPage({
                 </div>
               )}
             </div>
+            {faqFreshness && (
+              <div
+                className="help-freshness"
+                data-testid="help-freshness"
+                data-freshness={faqFreshness.state}
+                role="status"
+              >
+                {faqFreshness.state === 'cached'
+                  ? `Showing cached help content${faqFreshness.cachedAt ? ` from ${new Date(faqFreshness.cachedAt).toLocaleString()}` : ''}`
+                  : 'Help content is up to date'}
+              </div>
+            )}
             <div className="help-status">
               <span className="status-dot" aria-hidden="true" />
               Stellar Testnet: Operational

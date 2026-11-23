@@ -22,8 +22,63 @@ jobs:
       - name: Verify lockfile-reproducible installs
         run: node scripts/ci/check-lockfile-installs.js
       - run: npm run build
+      - name: Check per-route bundle budgets
+        run: npm run test:budget
       - run: npm run lint
       - run: npm run typecheck
+      - name: Install SBOM tooling
+        run: npm install --no-save @cyclonedx/cyclonedx-npm
+      - name: Resolve artifact digest
+        id: digest
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ]; then
+            DIGEST="$(sha256sum package-lock.json | awk '{print $1}')"
+          else
+            DIGEST="$(sha256sum package.json | awk '{print $1}')"
+          fi
+          echo "digest=sha256:${DIGEST}" >> "$GITHUB_OUTPUT"
+      - name: Generate Node SBOM
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          ARTIFACT_DIGEST: ${{ steps.digest.outputs.digest }}
+        run: npm run sbom:node -- --source-revision "$GITHUB_SHA" --artifact-digest "$ARTIFACT_DIGEST"
+      - name: Validate SBOM
+        run: npm run sbom:validate
+      - name: Upload SBOM artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-node
+          path: |
+            sbom/**
+            .sbom/**
+          if-no-files-found: error
+          retention-days: 30
+
+  visual-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps
+      - name: Run visual regression tests
+        run: npm run test:visual
+      - name: Upload visual diff artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-regression-diffs
+          path: |
+            test-results
+            playwright-report
+          if-no-files-found: ignore
+          retention-days: 7
 
   abi-compat:
     runs-on: ubuntu-latest
@@ -46,3 +101,162 @@ jobs:
         run: npm run test:abi-fixture
       - name: Run ABI compatibility tests
         run: npm run test:abi
+
+  preview-up:
+    if: github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.action == 'reopened')
+    runs-on: ubuntu-latest
+    concurrency:
+      group: preview-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PREVIEW_PROJECT: preview-pr-${{ github.event.pull_request.number }}
+      PREVIEW_TTL_HOURS: '72'
+      PREVIEW_DB_NAME: preview_pr_${{ github.event.pull_request.number }}
+      PREVIEW_DB_USER: preview_user
+      PREVIEW_DB_PASSWORD: preview_password
+      PREVIEW_REDIS_PASSWORD: preview_redis_password
+      PREVIEW_API_TOKEN: preview_only_token
+      PREVIEW_ENV: preview
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Compute TTL expiry
+        id: ttl
+        run: |
+          EXPIRES_AT=$(date -u -d "+${PREVIEW_TTL_HOURS} hours" +%Y-%m-%dT%H:%M:%SZ)
+          echo "expires_at=${EXPIRES_AT}" >> "$GITHUB_OUTPUT"
+          echo "Preview TTL expires at ${EXPIRES_AT}"
+      - name: Provision isolated Postgres/Redis
+        run: |
+          docker compose \
+            -p "${PREVIEW_PROJECT}" \
+            -f docker-compose.preview.yml \
+            up -d --wait
+          docker compose -p "${PREVIEW_PROJECT}" ps
+      - name: Tag preview resources with PR number and TTL
+        run: |
+          docker compose -p "${PREVIEW_PROJECT}" ps -q | while read -r cid; do
+            [ -z "$cid" ] && continue
+            docker update \
+              --label "preview.pr=${PR_NUMBER}" \
+              --label "preview.ttl_hours=${PREVIEW_TTL_HOURS}" \
+              --label "preview.expires_at=${{ steps.ttl.outputs.expires_at }}" \
+              "$cid"
+          done
+      - name: Wait for Postgres readiness
+        run: |
+          for i in $(seq 1 30); do
+            if docker compose -p "${PREVIEW_PROJECT}" exec -T postgres pg_isready -U "${PREVIEW_DB_USER}" -d "${PREVIEW_DB_NAME}" >/dev/null 2>&1; then
+              echo "Postgres ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Postgres did not become ready in time" >&2
+          exit 1
+      - name: Run migrations
+        env:
+          DATABASE_URL: postgres://${PREVIEW_DB_USER}:${PREVIEW_DB_PASSWORD}@localhost:5432/${PREVIEW_DB_NAME}
+          REDIS_URL: redis://:${PREVIEW_REDIS_PASSWORD}@localhost:6379/0
+          NODE_ENV: preview
+        run: npm run db:migrate
+      - name: Seed synthetic data
+        env:
+          DATABASE_URL: postgres://${PREVIEW_DB_USER}:${PREVIEW_DB_PASSWORD}@localhost:5432/${PREVIEW_DB_NAME}
+          REDIS_URL: redis://:${PREVIEW_REDIS_PASSWORD}@localhost:6379/0
+          NODE_ENV: preview
+          SEED_PROFILE: synthetic
+        run: npm run db:seed
+      - name: Deploy backend with preview-only secrets
+        env:
+          DATABASE_URL: postgres://${PREVIEW_DB_USER}:${PREVIEW_DB_PASSWORD}@localhost:5432/${PREVIEW_DB_NAME}
+          REDIS_URL: redis://:${PREVIEW_REDIS_PASSWORD}@localhost:6379/0
+          API_TOKEN: ${PREVIEW_API_TOKEN}
+          NODE_ENV: preview
+          PREVIEW_ENV: ${PREVIEW_ENV}
+          PREVIEW_PR: ${PR_NUMBER}
+          PREVIEW_TTL_HOURS: ${PREVIEW_TTL_HOURS}
+        run: |
+          # Preview deployments must never receive production credentials.
+          # All values above are ephemeral, preview-scoped, and non-production.
+          npm run deploy:preview -- \
+            --project "${PREVIEW_PROJECT}" \
+            --pr "${PR_NUMBER}" \
+            --ttl-hours "${PREVIEW_TTL_HOURS}" \
+            --expires-at "${{ steps.ttl.outputs.expires_at }}"
+      - name: Record preview metadata
+        run: |
+          mkdir -p .preview
+          cat > .preview/metadata.json <<EOF
+          {
+            "pr": ${PR_NUMBER},
+            "project": "${PREVIEW_PROJECT}",
+            "ttlHours": ${PREVIEW_TTL_HOURS},
+            "expiresAt": "${{ steps.ttl.outputs.expires_at }}",
+            "createdAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: preview-metadata-pr-${{ github.event.pull_request.number }}
+          path: .preview/metadata.json
+          retention-days: 7
+
+  preview-down:
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: preview-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PREVIEW_PROJECT: preview-pr-${{ github.event.pull_request.number }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tear down preview compose project
+        run: |
+          mkdir -p .preview-audit
+          DESTROYED="[]"
+          if docker compose -p "${PREVIEW_PROJECT}" ps -q 2>/dev/null | grep -q .; then
+            DESTROYED=$(docker compose -p "${PREVIEW_PROJECT}" ps -q | while read -r cid; do
+              [ -z "$cid" ] && continue
+              docker inspect --format '{{.Name}}' "$cid" | sed 's#^/##'
+            done | jq -R . | jq -s .)
+          fi
+          docker compose -p "${PREVIEW_PROJECT}" down -v --remove-orphans || true
+          echo "${DESTROYED}" > .preview-audit/destroyed.json
+      - name: Verify teardown
+        run: |
+          REMAINING=$(docker compose -p "${PREVIEW_PROJECT}" ps -q 2>/dev/null | grep -c . || true)
+          if [ "${REMAINING}" -ne 0 ]; then
+            echo "Teardown verification failed: ${REMAINING} container(s) still running" >&2
+            exit 1
+          fi
+          echo "Teardown verified: no containers remain for ${PREVIEW_PROJECT}"
+      - name: Write audit record
+        run: |
+          mkdir -p .preview-audit
+          jq -n \
+            --argjson pr "${PR_NUMBER}" \
+            --arg project "${PREVIEW_PROJECT}" \
+            --argjson resources "$(cat .preview-audit/destroyed.json)" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{pr: $pr, project: $project, resourcesDestroyed: $resources, timestamp: $timestamp}' \
+            > .preview-audit/audit.json
+          cat .preview-audit/audit.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: preview-teardown-audit-pr-${{ github.event.pull_request.number }}
+          path: .preview-audit/audit.json
+          retention-days: 90

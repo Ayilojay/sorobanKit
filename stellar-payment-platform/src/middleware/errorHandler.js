@@ -88,6 +88,8 @@ const buildErrorHandler = (isPrismaConnectionError) =>
     }
 
     if (statusCode >= 500) {
+      // Always mint a safe reference id so the response can be tied to the
+      // logged stack without exposing server internals to the client.
       const referenceId = crypto.randomUUID();
       if (process.env.NODE_ENV !== 'test') {
         console.warn(`[Correlation ID: ${req.correlationId}] [Error ID: ${referenceId}]`, err);
@@ -99,13 +101,17 @@ const buildErrorHandler = (isPrismaConnectionError) =>
           details: expected ? details : undefined,
           correlationId: req.correlationId,
           referenceId,
-          retryable,
+          retryable: Boolean(retryable),
         }),
       );
     }
 
     return res.status(statusCode).json(
-      errorBody(code, message, { details, correlationId: req.correlationId, retryable }),
+      errorBody(code, message, {
+        details,
+        correlationId: req.correlationId,
+        retryable: Boolean(retryable),
+      }),
     );
   };
 
@@ -114,6 +120,7 @@ const notFoundHandler = (req, res) =>
   res.status(404).json(
     errorBody('NOT_FOUND', `Cannot ${req.method} ${req.path}`, {
       correlationId: req.correlationId,
+      retryable: false,
     }),
   );
 

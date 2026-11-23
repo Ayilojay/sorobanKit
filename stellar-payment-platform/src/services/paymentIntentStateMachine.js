@@ -18,6 +18,27 @@ const VALID_TRANSITIONS = Object.freeze({
 const ALL_STATUSES = Object.freeze(Object.keys(VALID_TRANSITIONS));
 
 /**
+ * Statuses that represent an intent which has been submitted but not yet
+ * reconciled (i.e. not in a terminal state).
+ */
+const UNRECONCILED_STATUSES = Object.freeze(['PENDING', 'PROCESSING']);
+
+/**
+ * Statuses that represent a terminal (final) outcome.
+ */
+const TERMINAL_STATUSES = Object.freeze(['COMPLETED', 'FAILED', 'CANCELLED']);
+
+/**
+ * Returns true if `status` is a terminal state.
+ *
+ * @param {string} status
+ * @returns {boolean}
+ */
+function isTerminalStatus(status) {
+  return TERMINAL_STATUSES.includes(status);
+}
+
+/**
  * Returns true if transitioning from `from` to `to` is allowed.
  *
  * @param {string} from
@@ -153,12 +174,85 @@ async function updatePaymentIntentStatusTx(prisma, { id, to, data = {} }) {
   });
 }
 
+/**
+ * Computes the age (in milliseconds) of the oldest unreconciled payment intent
+ * per network. Only PENDING/PROCESSING intents are considered. The returned
+ * map is keyed by network and contains no user identifiers.
+ *
+ * @param {object} prisma - Prisma client
+ * @param {object} [options]
+ * @param {Date} [options.now] - Reference time (defaults to `new Date()`)
+ * @returns {Promise<Object<string, {oldestIntentId: string, oldestSubmittedAt: Date, ageMs: number}>>}
+ */
+async function getOldestUnreconciledIntentAgeByNetwork(prisma, { now = new Date() } = {}) {
+  const intents = await prisma.paymentIntent.findMany({
+    where: { status: { in: UNRECONCILED_STATUSES } },
+    select: { id: true, network: true, submittedAt: true, createdAt: true },
+  });
+
+  const result = {};
+  for (const intent of intents) {
+    const submittedAt = intent.submittedAt || intent.createdAt;
+    if (!submittedAt) {
+      continue;
+    }
+    const submittedMs = new Date(submittedAt).getTime();
+    if (Number.isNaN(submittedMs)) {
+      continue;
+    }
+    const existing = result[intent.network];
+    if (!existing || submittedMs < existing.oldestSubmittedAt.getTime()) {
+      result[intent.network] = {
+        oldestIntentId: intent.id,
+        oldestSubmittedAt: new Date(submittedMs),
+        ageMs: Math.max(0, now.getTime() - submittedMs),
+      };
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Records the submission-to-finality duration for an intent that has just
+ * reached a terminal state. Labels are limited to `network` and `outcome`.
+ *
+ * @param {object} metrics - Metrics sink exposing `observeFinalityDuration(labels, ms)`
+ * @param {object} params
+ * @param {string} params.network
+ * @param {string} params.outcome - Terminal status (COMPLETED/FAILED/CANCELLED)
+ * @param {Date|string} params.submittedAt
+ * @param {Date} [params.finalizedAt]
+ * @returns {number|null} The recorded duration in ms, or null if not recordable
+ */
+function recordFinalityDuration(metrics, { network, outcome, submittedAt, finalizedAt = new Date() }) {
+  if (!metrics || typeof metrics.observeFinalityDuration !== 'function') {
+    return null;
+  }
+  if (!isTerminalStatus(outcome) || !submittedAt) {
+    return null;
+  }
+  const submittedMs = new Date(submittedAt).getTime();
+  const finalizedMs = new Date(finalizedAt).getTime();
+  if (Number.isNaN(submittedMs) || Number.isNaN(finalizedMs)) {
+    return null;
+  }
+  const durationMs = Math.max(0, finalizedMs - submittedMs);
+  metrics.observeFinalityDuration({ network, outcome }, durationMs);
+  return durationMs;
+}
+
 module.exports = {
   VALID_TRANSITIONS,
   ALL_STATUSES,
+  UNRECONCILED_STATUSES,
+  TERMINAL_STATUSES,
   isValidTransition,
+  isTerminalStatus,
   assertValidTransition,
   buildGuardedWhere,
   updatePaymentIntentStatus,
   updatePaymentIntentStatusTx,
+  getOldestUnreconciledIntentAgeByNetwork,
+  recordFinalityDuration,
 };

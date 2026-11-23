@@ -1,9 +1,63 @@
-import { Fragment, useCallback, useEffect, useState } from 'react';
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
 import NetworkBadge from '../NetworkBadge';
 import ScrollToTop from '../ScrollToTop';
 import LoadingSpinner from '../LoadingSpinner';
 import MobileNav from './MobileNav';
 import { NAV_STORAGE_KEY, formatShortAddress, useNavState, useWalletMenu } from './shared';
+import { useFocusAnnouncement } from '../focusAnnouncement';
+import { getApiErrorMessage } from '../apiErrorCatalog';
+
+const HISTORY_CACHE_KEY = 'stellar-history-cache';
+
+/**
+ * @param {string} key
+ * @returns {{ entries: HistoryEntry[], fetchedAt: string } | null}
+ */
+function readHistoryCache(key) {
+  try {
+    const raw = sessionStorage.getItem(`${HISTORY_CACHE_KEY}:${key}`);
+    if (!raw) {
+      return null;
+    }
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.entries) || !parsed.fetchedAt) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * @param {string} key
+ * @param {HistoryEntry[]} entries
+ * @param {string} fetchedAt
+ */
+function writeHistoryCache(key, entries, fetchedAt) {
+  try {
+    sessionStorage.setItem(
+      `${HISTORY_CACHE_KEY}:${key}`,
+      JSON.stringify({ entries, fetchedAt }),
+    );
+  } catch {
+    // Cache is best-effort; ignore quota or serialization failures.
+  }
+}
+
+/**
+ * @param {string | null} value
+ */
+function formatFreshness(value) {
+  if (!value) {
+    return 'Not yet loaded';
+  }
+  const timestamp = new Date(value);
+  if (Number.isNaN(timestamp.getTime())) {
+    return 'Not yet loaded';
+  }
+  return timestamp.toLocaleString();
+}
 
 /**
  * @typedef {Object} HistoryEntry
@@ -81,6 +135,11 @@ function HistoryPage({
   const [isConnecting, setIsConnecting] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [historyError, setHistoryError] = useState("");
+  const headingRef = useRef(null);
+  const { announce, liveRegion } = useFocusAnnouncement({
+    routeKey: "history",
+    headingRef,
+  });
   /** @type {[HistoryEntry[], (value: HistoryEntry[] | ((prev: HistoryEntry[]) => HistoryEntry[])) => void]} */
   const [history, setHistory] = useState([]);
   /** @type {[string | null, (value: string | null | ((prev: string | null) => string | null)) => void]} */
@@ -88,6 +147,12 @@ function HistoryPage({
   const [refreshIndex, setRefreshIndex] = useState(0);
   const [page, setPage] = useState(1);
   const [hasMore, setHasMore] = useState(false);
+  const [isOffline, setIsOffline] = useState(
+    () => typeof navigator !== 'undefined' && navigator.onLine === false,
+  );
+  /** @type {[string | null, (value: string | null) => void]} */
+  const [lastFetchedAt, setLastFetchedAt] = useState(null);
+  const [isFromCache, setIsFromCache] = useState(false);
   const {
     menuRef,
     isOpen: isWalletMenuOpen,
@@ -104,6 +169,9 @@ function HistoryPage({
   };
 
   const handleConnect = async () => {
+    if (isOffline) {
+      return;
+    }
     setIsConnecting(true);
     try {
       const result = await onConnectWallet();
@@ -115,6 +183,9 @@ function HistoryPage({
     }
   };
   const handleDisconnect = () => {
+    if (isOffline) {
+      return;
+    }
     onDisconnectWallet();
   };
 
@@ -129,11 +200,16 @@ function HistoryPage({
       setHistory([]);
       setHasMore(false);
       setHistoryError("");
+      setIsFromCache(false);
       try {
         const url = `${HORIZON_BASE}/transactions/export?account=${encodeURIComponent(userPublicKey)}&page=${pageNumber}&limit=${PAGE_LIMIT}`;
         const response = await fetch(url, { signal, cache: "no-store" });
         if (!response.ok) {
-          throw new Error(`Export error (${response.status}).`);
+          throw new Error(
+            getApiErrorMessage(response.status, {
+              fallback: "Unable to load transaction history.",
+            }),
+          );
         }
 
         const data = await response.json();
@@ -253,17 +329,30 @@ function HistoryPage({
 
         setHasMore(records.length >= PAGE_LIMIT);
         setHistory(formatted);
+        const fetchedAt = new Date().toISOString();
+        setLastFetchedAt(fetchedAt);
+        setIsFromCache(false);
+        writeHistoryCache(userPublicKey, formatted, fetchedAt);
       } catch (error) {
         if (error instanceof Error && error.name !== "AbortError") {
-          setHistoryError(
-            error.message || "Unable to load transaction history.",
-          );
+          const cached = readHistoryCache(userPublicKey);
+          if (cached) {
+            setHistory(cached.entries);
+            setLastFetchedAt(cached.fetchedAt);
+            setIsFromCache(true);
+            setHasMore(false);
+            setHistoryError("");
+          } else {
+            setHistoryError(
+              error.message || "Unable to load transaction history.",
+            );
+          }
         }
       } finally {
         setIsLoading(false);
       }
     },
-    [onRefreshBalance, userPublicKey, PAGE_LIMIT],
+    [announce, onRefreshBalance, userPublicKey, PAGE_LIMIT],
   );
 
   const handlePreviousPage = () => {
@@ -296,6 +385,18 @@ function HistoryPage({
 
     window.addEventListener("stellar:tx-update", handleUpdate);
     return () => window.removeEventListener("stellar:tx-update", handleUpdate);
+  }, []);
+
+  useEffect(() => {
+    const handleOnline = () => setIsOffline(false);
+    const handleOffline = () => setIsOffline(true);
+
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
   }, []);
   return (
     <div className={`dashboard ${isNavOpen ? "nav-open" : ""}`}>
@@ -342,6 +443,7 @@ function HistoryPage({
             type="button"
             className="disconnect-button"
             onClick={onDisconnectWallet}
+            disabled={isOffline}
           >
             Disconnect wallet
           </button>
@@ -362,7 +464,9 @@ function HistoryPage({
             <span />
           </button>
           <div>
-            <h2 className="headline">Transaction history</h2>
+            <h2 className="headline" ref={headingRef} tabIndex={-1}>
+              Transaction history
+            </h2>
             <p className="subtle">
               Connect your wallet to review recent transactions.
             </p>
@@ -381,7 +485,7 @@ function HistoryPage({
                     handleConnect();
                   }
                 }}
-                disabled={isConnecting}
+                disabled={isConnecting || isOffline}
                 aria-expanded={isWalletMenuOpen}
               >
                 {userPublicKey
@@ -392,7 +496,11 @@ function HistoryPage({
               </button>
               {userPublicKey && isWalletMenuOpen && (
                 <div className="wallet-dropdown">
-                  <button type="button" onClick={handleDisconnect}>
+                  <button
+                    type="button"
+                    onClick={handleDisconnect}
+                    disabled={isOffline}
+                  >
                     Disconnect wallet
                   </button>
                 </div>
@@ -406,12 +514,21 @@ function HistoryPage({
             <h2>Recent transactions</h2>
             <div className="history-actions">
               <span className="chip">Latest</span>
+              <span
+                className="chip history-freshness"
+                data-testid="history-freshness"
+                title={lastFetchedAt || undefined}
+              >
+                {isFromCache ? "Cached: " : "Updated: "}
+                {formatFreshness(lastFetchedAt)}
+              </span>
               <button
                 type="button"
                 className={`refresh-button ${isLoading ? "is-loading" : ""}`}
                 onClick={() => setRefreshIndex((value) => value + 1)}
-                disabled={!userPublicKey || isLoading}
+                disabled={!userPublicKey || isLoading || isOffline}
                 aria-label="Refresh history"
+                data-testid="history-refresh"
               >
                 <svg viewBox="0 0 24 24" aria-hidden="true">
                   <path d="M20 12a8 8 0 1 1-2.34-5.66" />
@@ -420,13 +537,23 @@ function HistoryPage({
               </button>
             </div>
           </div>
+          {isOffline && (
+            <div
+              className="wallet-status offline-notice"
+              role="status"
+              data-testid="history-offline-notice"
+            >
+              You are offline. Showing read-only cached data; actions are
+              disabled until your connection returns.
+            </div>
+          )}
           {!userPublicKey && (
-            <div className="wallet-status">
+            <div className="wallet-status" data-testid="history-connect-prompt">
               Connect your wallet to view your transaction history.
               <button
                 type="button"
                 onClick={handleConnect}
-                disabled={isConnecting}
+                disabled={isConnecting || isOffline}
               >
                 {isConnecting ? "Connecting..." : "Connect wallet"}
               </button>
@@ -438,13 +565,15 @@ function HistoryPage({
             </div>
           )}
           {userPublicKey && historyError && (
-            <div className="wallet-status">{historyError}</div>
+            <div className="wallet-status" data-testid="history-error">
+              {historyError}
+            </div>
           )}
           {userPublicKey &&
             !isLoading &&
             !historyError &&
             history.length === 0 && (
-              <div className="wallet-status">
+              <div className="wallet-status" data-testid="history-empty">
                 No transactions found for this wallet.
               </div>
             )}
@@ -452,7 +581,7 @@ function HistoryPage({
             !isLoading &&
             !historyError &&
             history.length > 0 && (
-              <table className="history-table">
+              <table className="history-table" data-testid="history-table">
                 <thead>
                   <tr>
                     <th>Counterparty</th>
@@ -465,7 +594,7 @@ function HistoryPage({
                 <tbody>
                   {history.map((entry) => (
                     <Fragment key={entry.id}>
-                      <tr>
+                      <tr data-testid="history-row" data-entry-id={entry.id}>
                         <td>{formatShortAddress(entry.counterparty)}</td>
                         <td>{entry.direction}</td>
                         <td>{entry.amount}</td>
@@ -528,12 +657,13 @@ function HistoryPage({
               </table>
             )}
           {userPublicKey && !historyError && (
-            <div className="pagination-controls">
+            <div className="pagination-controls" data-testid="history-pagination">
               <button
                 type="button"
                 className="pagination-button"
                 onClick={handlePreviousPage}
-                disabled={isLoading || page <= 1}
+                disabled={isLoading || page <= 1 || isOffline}
+                data-testid="history-prev"
               >
                 Previous
               </button>
@@ -544,7 +674,8 @@ function HistoryPage({
                 type="button"
                 className="pagination-button"
                 onClick={handleNextPage}
-                disabled={isLoading || !hasMore}
+                disabled={isLoading || !hasMore || isOffline}
+                data-testid="history-next"
               >
                 Next
               </button>
@@ -562,6 +693,7 @@ function HistoryPage({
         canRegister={canRegister}
       />
       <ScrollToTop />
+      {liveRegion}
     </div>
   );
 }
