@@ -297,6 +297,177 @@ describe('webhook BullMQ delivery', () => {
   });
 });
 
+describe('graceful shutdown coordinator (issue #380)', () => {
+  const SIGNALS = ['SIGTERM', 'SIGINT'];
+  let shutdown;
+  let originalHandlers;
+
+  const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+  const buildDeps = (overrides = {}) => {
+    const order = [];
+    const deps = {
+      order,
+      server: {
+        close: jest.fn((cb) => {
+          order.push('server.close');
+          if (cb) cb();
+        }),
+      },
+      stopAcceptingWork: jest.fn(() => order.push('stopAcceptingWork')),
+      drainBackgroundWork: jest.fn(async () => {
+        order.push('drainBackgroundWork');
+      }),
+      closeWorkers: jest.fn(async () => {
+        order.push('closeWorkers');
+      }),
+      closeRedis: jest.fn(async () => {
+        order.push('closeRedis');
+      }),
+      closePrisma: jest.fn(async () => {
+        order.push('closePrisma');
+      }),
+      logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn() },
+      ...overrides,
+    };
+    return deps;
+  };
+
+  beforeEach(() => {
+    jest.resetModules();
+    originalHandlers = {};
+    for (const signal of SIGNALS) {
+      originalHandlers[signal] = process.listeners(signal);
+      process.removeAllListeners(signal);
+    }
+    delete process.env.SHUTDOWN_TIMEOUT_MS;
+    shutdown = require('../src/shutdown');
+  });
+
+  afterEach(() => {
+    shutdown.resetShutdownStateForTests();
+    for (const signal of SIGNALS) {
+      process.removeAllListeners(signal);
+      for (const handler of originalHandlers[signal]) {
+        process.on(signal, handler);
+      }
+    }
+    delete process.env.SHUTDOWN_TIMEOUT_MS;
+  });
+
+  test.each(SIGNALS)('%s triggers an orderly shutdown', async (signal) => {
+    const deps = buildDeps();
+    shutdown.registerShutdownHandlers(deps);
+
+    process.emit(signal);
+    await shutdown.whenShutdownComplete();
+
+    expect(deps.stopAcceptingWork).toHaveBeenCalledTimes(1);
+    expect(deps.server.close).toHaveBeenCalledTimes(1);
+    expect(deps.drainBackgroundWork).toHaveBeenCalledTimes(1);
+    expect(deps.closeWorkers).toHaveBeenCalledTimes(1);
+    expect(deps.closeRedis).toHaveBeenCalledTimes(1);
+    expect(deps.closePrisma).toHaveBeenCalledTimes(1);
+  });
+
+  test('refuses new requests while in-flight requests finish', async () => {
+    let finishInFlight;
+    const inFlight = new Promise((resolve) => {
+      finishInFlight = resolve;
+    });
+    const deps = buildDeps();
+    deps.server.close = jest.fn((cb) => {
+      deps.order.push('server.close');
+      inFlight.then(() => cb());
+    });
+
+    shutdown.registerShutdownHandlers(deps);
+    process.emit('SIGTERM');
+    await flush();
+
+    // New work is refused immediately, but teardown waits for in-flight work.
+    expect(deps.stopAcceptingWork).toHaveBeenCalledTimes(1);
+    expect(deps.closePrisma).not.toHaveBeenCalled();
+    expect(deps.closeRedis).not.toHaveBeenCalled();
+
+    finishInFlight();
+    await shutdown.whenShutdownComplete();
+
+    expect(deps.closePrisma).toHaveBeenCalledTimes(1);
+  });
+
+  test('drains background work before closing workers, Redis and Prisma', async () => {
+    const deps = buildDeps();
+    shutdown.registerShutdownHandlers(deps);
+
+    process.emit('SIGTERM');
+    await shutdown.whenShutdownComplete();
+
+    expect(deps.order).toEqual([
+      'stopAcceptingWork',
+      'server.close',
+      'drainBackgroundWork',
+      'closeWorkers',
+      'closeRedis',
+      'closePrisma',
+    ]);
+  });
+
+  test('SHUTDOWN_TIMEOUT_MS forces closure of remaining resources', async () => {
+    process.env.SHUTDOWN_TIMEOUT_MS = '20';
+    jest.resetModules();
+    shutdown = require('../src/shutdown');
+
+    const deps = buildDeps();
+    // Simulate a hung drain that never resolves.
+    deps.drainBackgroundWork = jest.fn(() => new Promise(() => {}));
+
+    shutdown.registerShutdownHandlers(deps);
+    process.emit('SIGTERM');
+    await shutdown.whenShutdownComplete();
+
+    expect(deps.closeWorkers).toHaveBeenCalledTimes(1);
+    expect(deps.closeRedis).toHaveBeenCalledTimes(1);
+    expect(deps.closePrisma).toHaveBeenCalledTimes(1);
+    expect(deps.logger.warn).toHaveBeenCalled();
+  });
+
+  test('repeated signals are idempotent no-ops', async () => {
+    const deps = buildDeps();
+    shutdown.registerShutdownHandlers(deps);
+
+    process.emit('SIGTERM');
+    process.emit('SIGTERM');
+    process.emit('SIGINT');
+    await shutdown.whenShutdownComplete();
+    process.emit('SIGINT');
+    await flush();
+
+    expect(deps.stopAcceptingWork).toHaveBeenCalledTimes(1);
+    expect(deps.server.close).toHaveBeenCalledTimes(1);
+    expect(deps.drainBackgroundWork).toHaveBeenCalledTimes(1);
+    expect(deps.closeWorkers).toHaveBeenCalledTimes(1);
+    expect(deps.closeRedis).toHaveBeenCalledTimes(1);
+    expect(deps.closePrisma).toHaveBeenCalledTimes(1);
+  });
+
+  test('continues teardown when a step fails and reports the error', async () => {
+    const deps = buildDeps();
+    deps.closeWorkers = jest.fn(async () => {
+      deps.order.push('closeWorkers');
+      throw new Error('worker close failed');
+    });
+
+    shutdown.registerShutdownHandlers(deps);
+    process.emit('SIGTERM');
+    await shutdown.whenShutdownComplete();
+
+    expect(deps.closeRedis).toHaveBeenCalledTimes(1);
+    expect(deps.closePrisma).toHaveBeenCalledTimes(1);
+    expect(deps.logger.error).toHaveBeenCalled();
+  });
+});
+
 describe('SSRF protection – detectSsrfTarget', () => {
   test('allows a public HTTPS URL', () => {
     expect(detectSsrfTarget('https://merchant.example.com/hook')).toBeNull();

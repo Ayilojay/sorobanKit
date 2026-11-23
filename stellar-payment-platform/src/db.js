@@ -28,6 +28,86 @@ pool.on('error', (err) => {
   logger.error(err, 'Unexpected error on idle PostgreSQL client');
 });
 
+// Readiness-aware connection state. The shutdown coordinator flips this to
+// 'draining' once HTTP and background work have stopped accepting new work so
+// health checks can report the process as not-ready while in-flight operations
+// finish, then to 'closed' once the pool and Prisma client are released.
+const connectionState = {
+  status: 'ready',
+  prismaClosed: false,
+  poolClosed: false,
+};
+
+const getConnectionState = () => ({ ...connectionState });
+
+const isReady = () => connectionState.status === 'ready';
+
+const setConnectionState = (status) => {
+  if (status !== 'ready' && status !== 'draining' && status !== 'closed') {
+    throw new Error(`Invalid connection state: ${status}`);
+  }
+  connectionState.status = status;
+  return getConnectionState();
+};
+
+// Lazily resolve the Prisma client so this module stays usable in contexts
+// (tests, scripts) that never touch Prisma. Returns null when unavailable.
+const resolvePrismaClient = () => {
+  try {
+    // eslint-disable-next-line global-require
+    const prismaModule = require('./prisma');
+    return prismaModule && (prismaModule.prisma || prismaModule.default) ? (prismaModule.prisma || prismaModule.default) : null;
+  } catch (err) {
+    return null;
+  }
+};
+
+let prismaClosePromise = null;
+
+// Close the Prisma client exactly once. Idempotent: repeated calls return the
+// same promise so the shutdown coordinator can await it safely.
+const closePrisma = () => {
+  if (prismaClosePromise) return prismaClosePromise;
+  prismaClosePromise = (async () => {
+    const client = resolvePrismaClient();
+    if (client && typeof client.$disconnect === 'function') {
+      await client.$disconnect();
+    }
+    connectionState.prismaClosed = true;
+    return true;
+  })().catch((err) => {
+    // Allow a retry on failure rather than caching a rejected promise.
+    prismaClosePromise = null;
+    throw err;
+  });
+  return prismaClosePromise;
+};
+
+let poolClosePromise = null;
+
+// Close the pg Pool exactly once. Idempotent for the same reason as above.
+const closePool = () => {
+  if (poolClosePromise) return poolClosePromise;
+  poolClosePromise = (async () => {
+    await pool.end();
+    connectionState.poolClosed = true;
+    return true;
+  })().catch((err) => {
+    poolClosePromise = null;
+    throw err;
+  });
+  return poolClosePromise;
+};
+
+// Close database resources in a defined order: Prisma first (it may hold
+// connections through the pool), then the pg Pool itself.
+const closeDatabase = async () => {
+  await closePrisma();
+  await closePool();
+  connectionState.status = 'closed';
+  return getConnectionState();
+};
+
 (async () => {
   let retries = 5;
   while (retries > 0) {
@@ -117,4 +197,10 @@ module.exports = {
   USER_DATABASE,
   normalizeNameTag,
   etagCache,
+  closePrisma,
+  closePool,
+  closeDatabase,
+  getConnectionState,
+  setConnectionState,
+  isReady,
 };

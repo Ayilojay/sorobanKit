@@ -5,6 +5,7 @@ const { prisma } = require('../../../prismaClient');
 const { logger } = require('../../logger');
 const { ApiError } = require('../../errors');
 const { HORIZON_BASE } = require('../../services/stellarService');
+const { isReady } = require('../../shutdown');
 
 const DEFAULT_HORIZON_TIMEOUT_MS = 3000;
 
@@ -28,6 +29,18 @@ module.exports = (redisClient) => {
   const router = express.Router();
 
   router.get('/health', async (req, res, next) => {
+    // Once the shutdown coordinator flips readiness to false, report DRAINING so
+    // load balancers stop routing new traffic while in-flight requests finish.
+    if (!isReady()) {
+      return res.status(503).json({
+        status: 'DRAINING',
+        timestamp: new Date().toISOString(),
+        database: null,
+        redis: null,
+        horizon: null,
+      });
+    }
+
     const checks = { database: null, redis: null, horizon: null };
     const failures = [];
 

@@ -62,6 +62,8 @@ const {
   createBreaker,
   HORIZON_BASE,
   BREAKER_THRESHOLD,
+  createCursorStore,
+  scanPayments,
 } = require('../src/services/stellarService');
 
 describe('StellarService — Circuit Breaker', () => {
@@ -259,6 +261,189 @@ describe('StellarService — Circuit Breaker', () => {
 
       const nextPage = await result.next();
       expect(nextPage).toEqual({ records: [] });
+    });
+  });
+
+  describe('createCursorStore', () => {
+    it('returns the committed cursor for a network', async () => {
+      const store = createCursorStore();
+      await store.commit('testnet', 'cursor-1');
+
+      await expect(store.get('testnet')).resolves.toBe('cursor-1');
+    });
+
+    it('returns null for a network with no committed cursor', async () => {
+      const store = createCursorStore();
+      await expect(store.get('mainnet')).resolves.toBeNull();
+    });
+
+    it('keeps cursors isolated per network', async () => {
+      const store = createCursorStore();
+      await store.commit('testnet', 'cursor-t');
+      await store.commit('mainnet', 'cursor-m');
+
+      await expect(store.get('testnet')).resolves.toBe('cursor-t');
+      await expect(store.get('mainnet')).resolves.toBe('cursor-m');
+    });
+
+    it('leaves the cursor unchanged when the atomic commit fails', async () => {
+      const store = createCursorStore();
+      await store.commit('testnet', 'cursor-1');
+
+      const failingStore = createCursorStore({
+        persist: jest.fn().mockRejectedValue(new Error('disk full')),
+      });
+      await failingStore.commit('testnet', 'cursor-1');
+
+      await expect(failingStore.commit('testnet', 'cursor-2')).rejects.toThrow('disk full');
+      await expect(failingStore.get('testnet')).resolves.toBe('cursor-1');
+    });
+
+    it('serializes concurrent commits so the last write wins', async () => {
+      const store = createCursorStore();
+      await Promise.all([
+        store.commit('testnet', 'cursor-a'),
+        store.commit('testnet', 'cursor-b'),
+        store.commit('testnet', 'cursor-c'),
+      ]);
+
+      await expect(store.get('testnet')).resolves.toBe('cursor-c');
+    });
+  });
+
+  describe('scanPayments — cursor persistence', () => {
+    const makePage = (records, next) => ({ records, next });
+
+    it('resumes from the last committed cursor on restart', async () => {
+      const store = createCursorStore();
+      await store.commit('testnet', 'committed-cursor');
+
+      const fetchPage = jest.fn().mockResolvedValue(makePage([{ id: 'p1' }]));
+      const onRecord = jest.fn();
+
+      await scanPayments({
+        network: 'testnet',
+        cursorStore: store,
+        fetchPage,
+        onRecord,
+        isCaughtUp: () => true,
+      });
+
+      expect(fetchPage).toHaveBeenCalledWith(expect.objectContaining({ cursor: 'committed-cursor' }));
+      expect(onRecord).toHaveBeenCalledWith({ id: 'p1' });
+    });
+
+    it('starts from the beginning when no cursor is committed', async () => {
+      const store = createCursorStore();
+      const fetchPage = jest.fn().mockResolvedValue(makePage([]));
+
+      await scanPayments({
+        network: 'testnet',
+        cursorStore: store,
+        fetchPage,
+        onRecord: jest.fn(),
+        isCaughtUp: () => true,
+      });
+
+      expect(fetchPage).toHaveBeenCalledWith(expect.objectContaining({ cursor: 'now' }));
+    });
+
+    it('commits the cursor after processing each page', async () => {
+      const store = createCursorStore();
+      const fetchPage = jest.fn()
+        .mockResolvedValueOnce(makePage([{ id: 'p1' }], 'cursor-1'))
+        .mockResolvedValueOnce(makePage([], 'cursor-2'));
+
+      await scanPayments({
+        network: 'testnet',
+        cursorStore: store,
+        fetchPage,
+        onRecord: jest.fn(),
+        isCaughtUp: () => true,
+      });
+
+      await expect(store.get('testnet')).resolves.toBe('cursor-2');
+    });
+
+    it('does not advance the cursor when processing a page fails', async () => {
+      const store = createCursorStore();
+      await store.commit('testnet', 'cursor-0');
+
+      const fetchPage = jest.fn().mockResolvedValue(makePage([{ id: 'p1' }], 'cursor-1'));
+      const onRecord = jest.fn().mockRejectedValue(new Error('processing failed'));
+
+      await expect(scanPayments({
+        network: 'testnet',
+        cursorStore: store,
+        fetchPage,
+        onRecord,
+        isCaughtUp: () => true,
+      })).rejects.toThrow('processing failed');
+
+      await expect(store.get('testnet')).resolves.toBe('cursor-0');
+    });
+
+    it('treats duplicate pages idempotently', async () => {
+      const store = createCursorStore();
+      const page = makePage([{ id: 'p1' }, { id: 'p2' }], 'cursor-1');
+      const fetchPage = jest.fn()
+        .mockResolvedValueOnce(page)
+        .mockResolvedValueOnce(page)
+        .mockResolvedValueOnce(makePage([], 'cursor-1'));
+
+      const onRecord = jest.fn();
+
+      await scanPayments({
+        network: 'testnet',
+        cursorStore: store,
+        fetchPage,
+        onRecord,
+        isCaughtUp: () => true,
+      });
+
+      expect(onRecord).toHaveBeenCalledTimes(2);
+      expect(onRecord).toHaveBeenNthCalledWith(1, { id: 'p1' });
+      expect(onRecord).toHaveBeenNthCalledWith(2, { id: 'p2' });
+      await expect(store.get('testnet')).resolves.toBe('cursor-1');
+    });
+
+    it('transitions from backfill to live-tail once caught up', async () => {
+      const store = createCursorStore();
+      const fetchPage = jest.fn()
+        .mockResolvedValueOnce(makePage([{ id: 'p1' }], 'cursor-1'))
+        .mockResolvedValueOnce(makePage([{ id: 'p2' }], 'cursor-2'))
+        .mockResolvedValueOnce(makePage([{ id: 'p3' }], 'cursor-3'));
+
+      const phases = [];
+      const onRecord = jest.fn();
+      let caughtUp = false;
+
+      await scanPayments({
+        network: 'testnet',
+        cursorStore: store,
+        fetchPage,
+        onRecord,
+        isCaughtUp: () => caughtUp,
+        onPhaseChange: (phase) => phases.push(phase),
+        maxPages: 3,
+      });
+
+      expect(phases).toEqual(['backfill']);
+      expect(onRecord).toHaveBeenCalledTimes(3);
+
+      caughtUp = true;
+      await scanPayments({
+        network: 'testnet',
+        cursorStore: store,
+        fetchPage,
+        onRecord,
+        isCaughtUp: () => caughtUp,
+        onPhaseChange: (phase) => phases.push(phase),
+        maxPages: 1,
+      });
+
+      expect(phases).toEqual(['backfill', 'live']);
+      await expect(store.get('testnet')).resolves.toBe('cursor-3');
     });
   });
 

@@ -3,7 +3,7 @@
   "info": {
     "title": "Stellar Tags API",
     "version": "1.0.0",
-    "description": "OpenAPI specification for the Stellar Tags API. Covers the documented endpoints for tags, addresses, activity, and stats. API errors use a stable envelope with a machine-readable code and retryable flag; validation details contain only field names and safe messages.\n\n## Soft-delete, restore, and username reuse semantics\n\n- **Reservation window**: when a tag (username) is soft-deleted, its name is reserved for a fixed `SOFT_DELETE_RESERVATION_DAYS` (default 30 days) from `deletedAt`. During this window the name cannot be claimed by any other owner.\n- **Restoration proof**: restoring a soft-deleted tag requires the original owner's authenticated identity (bearer token whose subject matches the tag's `ownerId`). The restore request must reference the tag id and the `deletedAt` value observed at deletion time; a mismatch (stale or already-restored) is rejected with `409 Conflict`.\n- **Post-expiry reuse**: once the reservation window elapses, the name becomes reusable. A new registration may claim it; the prior soft-deleted record is retained for audit but can no longer be restored (`410 Gone`).\n- **Transactional transitions**: delete, restore, and registration are enforced transactionally (row-level lock on the name). Concurrent delete/restore/registration cannot produce multiple active owners; losers receive `409 Conflict`.",
+    "description": "OpenAPI specification for the Stellar Tags API. Covers the documented endpoints for tags, addresses, activity, and stats. API errors use a stable envelope with a machine-readable code and retryable flag; validation details contain only field names and safe messages.\n\n## Authentication and ownership\n\n- Protected endpoints derive the caller's identity exclusively from the `Authorization: Bearer <JWT>` token. The token subject is the authenticated principal; caller-supplied usernames, addresses, or owner ids in the path, query, or body never grant access.\n- Resource ownership checks are centralized: a request may only mutate or restore a resource owned by the authenticated principal. Mismatches are rejected with `403 Forbidden`.\n- Public federation reads (`/federation`, `/lookup`, `/api/addresses/{address}`) remain unauthenticated and never expose private owner data.\n\n## Graceful shutdown\n\n- On termination the server stops accepting new requests and scheduling background work, drains bounded in-flight operations, then closes Prisma, Redis, and workers in order. Shutdown is idempotent and bounded by a configurable deadline.\n- While draining, `/health` reports `status: DRAINING` with `503 Service Unavailable` so load balancers stop routing traffic.\n\n## Audit integrity\n\n- Administrative audit events are canonicalized and integrity-linked with a keyed digest (HMAC) over the canonical event payload plus the previous event digest, forming a verifiable hash chain.\n- Signing keys are versioned; each audit record records the `keyId` used so keys can be rotated without invalidating history. Verification tooling can re-walk the chain and report the first broken link.\n- Redaction is preserved: sensitive fields are redacted before canonicalization, and existing audit query behavior is unchanged.\n\n## Soft-delete, restore, and username reuse semantics\n\n- **Reservation window**: when a tag (username) is soft-deleted, its name is reserved for a fixed `SOFT_DELETE_RESERVATION_DAYS` (default 30 days) from `deletedAt`. During this window the name cannot be claimed by any other owner.\n- **Restoration proof**: restoring a soft-deleted tag requires the original owner's authenticated identity (bearer token whose subject matches the tag's `ownerId`). The restore request must reference the tag id and the `deletedAt` value observed at deletion time; a mismatch (stale or already-restored) is rejected with `409 Conflict`.\n- **Post-expiry reuse**: once the reservation window elapses, the name becomes reusable. A new registration may claim it; the prior soft-deleted record is retained for audit but can no longer be restored (`410 Gone`).\n- **Transactional transitions**: delete, restore, and registration are enforced transactionally (row-level lock on the name). Concurrent delete/restore/registration cannot produce multiple active owners; losers receive `409 Conflict`.",
     "license": {
       "name": "MIT"
     }
@@ -40,7 +40,19 @@
               }
             }
           },
-          "503": { "$ref": "#/components/responses/ApiErrorResponse" }
+          "503": {
+            "description": "A dependency is unhealthy, or the server is draining during graceful shutdown",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    { "$ref": "#/components/schemas/HealthStatus" },
+                    { "$ref": "#/components/schemas/Error" }
+                  ]
+                }
+              }
+            }
+          }
         }
       }
     },
@@ -143,7 +155,8 @@
         "tags": ["Tags"],
         "summary": "Create a tag",
         "operationId": "createTag",
-        "description": "Registers a new tag (username). If the name was soft-deleted and its reservation window has not expired, registration is rejected with `409 Conflict`. Once the window expires the name is reusable.",
+        "description": "Registers a new tag (username) owned by the authenticated principal. The owner is derived from the bearer token subject; any caller-supplied owner/username identity fields are ignored for authorization. If the name was soft-deleted and its reservation window has not expired, registration is rejected with `409 Conflict`. Once the window expires the name is reusable.",
+        "security": [{ "bearerAuth": [] }],
         "requestBody": {
           "required": true,
           "content": {
@@ -191,6 +204,8 @@
         "tags": ["Tags"],
         "summary": "Update a tag",
         "operationId": "updateTag",
+        "description": "Updates a tag owned by the authenticated principal. Ownership is derived from the bearer token subject; caller-supplied identity fields never grant access. Non-owners receive `403 Forbidden`.",
+        "security": [{ "bearerAuth": [] }],
         "requestBody": {
           "required": true,
           "content": {
@@ -210,6 +225,7 @@
           },
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" }
         }
       },
@@ -217,10 +233,12 @@
         "tags": ["Tags"],
         "summary": "Soft-delete a tag",
         "operationId": "deleteTag",
-        "description": "Soft-deletes the tag and starts the reservation window (`SOFT_DELETE_RESERVATION_DAYS`, default 30 days) during which the name cannot be reused. The transition is transactional; concurrent deletes/restores/registrations cannot create multiple owners.",
+        "description": "Soft-deletes the tag and starts the reservation window (`SOFT_DELETE_RESERVATION_DAYS`, default 30 days) during which the name cannot be reused. Only the authenticated owner (bearer token subject) may delete; caller-supplied identity fields never grant access. The transition is transactional; concurrent deletes/restores/registrations cannot create multiple owners.",
+        "security": [{ "bearerAuth": [] }],
         "responses": {
           "204": { "description": "Tag soft-deleted" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" },
           "409": { "$ref": "#/components/responses/Conflict" }
         }
@@ -234,7 +252,7 @@
         "tags": ["Tags"],
         "summary": "Restore a soft-deleted tag",
         "operationId": "restoreTag",
-        "description": "Restores a soft-deleted tag within its reservation window. Requires the original owner's authenticated identity and the `deletedAt` value observed at deletion time as restoration proof. Fails with `409 Conflict` on stale/already-restored state and `410 Gone` after the reservation window expires.",
+        "description": "Restores a soft-deleted tag within its reservation window. Requires the original owner's authenticated identity (bearer token subject; caller-supplied usernames or addresses never grant access) and the `deletedAt` value observed at deletion time as restoration proof. Fails with `409 Conflict` on stale/already-restored state and `410 Gone` after the reservation window expires.",
         "security": [{ "bearerAuth": [] }],
         "requestBody": {
           "required": true,
@@ -339,6 +357,36 @@
               }
             }
           },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/api/admin/audit/verify": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Verify the audit integrity chain",
+        "description": "Re-walks the administrative audit hash chain and verifies each keyed digest against the recorded `keyId`. Returns the first broken link, if any. Verification is read-only and preserves redaction.",
+        "operationId": "verifyAuditIntegrity",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AuditVerifyInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Verification result",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AuditVerifyResult" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "$ref": "#/components/responses/Forbidden" }
         }
@@ -538,6 +586,41 @@
         "description": "Aggregate metrics and the refresh watermark for the reporting read model.",
         "additionalProperties": true
       },
+      "AuditVerifyInput": {
+        "type": "object",
+        "properties": {
+          "fromId": { "type": "string", "description": "Optional audit record id to start verification from" },
+          "toId": { "type": "string", "description": "Optional audit record id to stop verification at" }
+        }
+      },
+      "AuditVerifyResult": {
+        "type": "object",
+        "required": ["valid", "checked"],
+        "properties": {
+          "valid": { "type": "boolean" },
+          "checked": { "type": "integer", "description": "Number of audit records verified" },
+          "firstBrokenId": { "type": "string", "description": "Id of the first record whose digest failed verification" },
+          "keyIds": {
+            "type": "array",
+            "description": "Signing key ids encountered while walking the chain",
+            "items": { "type": "string" }
+          }
+        }
+      },
+      "AuditEvent": {
+        "type": "object",
+        "required": ["id", "action", "createdAt", "keyId", "digest"],
+        "properties": {
+          "id": { "type": "string" },
+          "action": { "type": "string" },
+          "actorId": { "type": "string" },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "keyId": { "type": "string", "description": "Signing key version used for this record's digest" },
+          "digest": { "type": "string", "description": "Keyed digest (HMAC) over the canonical payload and previous digest" },
+          "prevDigest": { "type": "string", "description": "Digest of the preceding audit record, linking the chain" },
+          "details": { "type": "object", "additionalProperties": true, "description": "Redacted event details" }
+        }
+      },
       "StatsRefreshStatus": {
         "type": "object",
         "required": ["status"],
@@ -600,11 +683,11 @@
         "type": "object",
         "required": ["status", "timestamp", "database", "redis", "horizon"],
         "properties": {
-          "status": { "type": "string", "enum": ["UP"] },
+          "status": { "type": "string", "enum": ["UP", "DRAINING"] },
           "timestamp": { "type": "string", "format": "date-time" },
-          "database": { "type": "string", "enum": ["up"] },
-          "redis": { "type": "string", "enum": ["up", "not configured"] },
-          "horizon": { "type": "string", "enum": ["up"] }
+          "database": { "type": "string", "enum": ["up", "draining", "down"] },
+          "redis": { "type": "string", "enum": ["up", "draining", "down", "not configured"] },
+          "horizon": { "type": "string", "enum": ["up", "draining", "down"] }
         }
       },
       "FederationEntry": {

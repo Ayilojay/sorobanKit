@@ -13,6 +13,11 @@ const { prisma } = require('../prismaClient');
 const { HORIZON_BASE } = require('../src/services/stellarService');
 const healthRoutes = require('../src/routes/v1/healthRoutes');
 const { buildErrorHandler } = require('../src/middleware/errorHandler');
+const {
+  beginShutdown,
+  resetShutdownState,
+  isShuttingDown,
+} = require('../src/lifecycle/shutdownState');
 
 const buildApp = (redisClient = null) => {
   const app = express();
@@ -25,6 +30,7 @@ let redisClient;
 
 beforeEach(() => {
   jest.clearAllMocks();
+  resetShutdownState();
   prisma.$queryRaw.mockResolvedValue([{ 1: 1 }]);
   redisClient = { ping: jest.fn().mockResolvedValue('PONG') };
   global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 });
@@ -32,6 +38,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  resetShutdownState();
   delete process.env.HEALTH_HORIZON_TIMEOUT_MS;
 });
 
@@ -222,6 +229,71 @@ describe('GET /health', () => {
     expect(probedUrl).toBe('https://horizon-testnet.stellar.org');
 
     jest.resetModules();
+  });
+});
+
+// ── Readiness / draining behaviour ───────────────────────────────────────────
+
+describe('GET /health — readiness and draining', () => {
+  test('reports ready (200) before shutdown starts', async () => {
+    expect(isShuttingDown()).toBe(false);
+
+    const res = await request(buildApp(redisClient)).get('/health');
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('UP');
+  });
+
+  test('returns a non-200 DRAINING response once shutdown has started', async () => {
+    beginShutdown();
+
+    const res = await request(buildApp(redisClient)).get('/health');
+
+    expect(res.status).not.toBe(200);
+    expect(res.status).toBe(503);
+    expect(res.body).toMatchObject({
+      status: 'DRAINING',
+      database: 'up',
+      redis: 'up',
+      horizon: 'up',
+    });
+  });
+
+  test('DRAINING response is retryable and carries a correlation id', async () => {
+    const { correlationId } = require('../middleware/correlation');
+    const app = express();
+    app.use(correlationId);
+    app.use(healthRoutes(redisClient));
+    app.use(buildErrorHandler(() => false));
+
+    beginShutdown();
+
+    const res = await request(app).get('/health');
+
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe('DRAINING');
+    expect(res.headers['x-correlation-id']).toBeDefined();
+  });
+
+  test('DRAINING response does not probe dependencies', async () => {
+    beginShutdown();
+
+    await request(buildApp(redisClient)).get('/health');
+
+    expect(prisma.$queryRaw).not.toHaveBeenCalled();
+    expect(redisClient.ping).not.toHaveBeenCalled();
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  test('readiness flag is reset between tests', async () => {
+    beginShutdown();
+    expect(isShuttingDown()).toBe(true);
+
+    resetShutdownState();
+    expect(isShuttingDown()).toBe(false);
+
+    const res = await request(buildApp(redisClient)).get('/health');
+    expect(res.status).toBe(200);
   });
 });
 

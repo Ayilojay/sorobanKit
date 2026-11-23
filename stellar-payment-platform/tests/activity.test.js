@@ -229,6 +229,57 @@ describe('serializeActivity', () => {
   });
 });
 
+describe('recordActivity inside a stream-cursor transaction', () => {
+  test('writes through the caller-supplied transaction client', async () => {
+    const tx = mockPrisma();
+    await recordActivity(tx, {
+      username: 'ada*localhost',
+      action: ACTIVITY_ACTIONS.USER_REGISTERED,
+      metadata: { cursor: '12345-0' },
+      tx,
+    });
+
+    expect(tx.activityLog.create).toHaveBeenCalledTimes(1);
+    expect(tx.activityLog.create.mock.calls[0][0].data).toMatchObject({
+      username: 'ada*localhost',
+      action: 'user.registered',
+      metadata: { cursor: '12345-0' },
+    });
+  });
+
+  test('propagates a failure so the surrounding transaction rolls back', async () => {
+    const tx = mockPrisma();
+    tx.activityLog.create.mockRejectedValue(new Error('activity write failed'));
+
+    await expect(
+      recordActivity(tx, {
+        username: 'ada*localhost',
+        action: ACTIVITY_ACTIONS.USER_REGISTERED,
+        tx,
+      }),
+    ).rejects.toThrow('activity write failed');
+  });
+
+  test('does not swallow errors when the caller owns the transaction', async () => {
+    const tx = mockPrisma();
+    tx.activityLog.create.mockRejectedValue(new Error('constraint violation'));
+
+    let caught;
+    try {
+      await recordActivity(tx, {
+        username: 'ada*localhost',
+        action: ACTIVITY_ACTIONS.USER_REGISTERED,
+        tx,
+      });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught.message).toBe('constraint violation');
+  });
+});
+
 describe('ACTIVITY_ACTIONS', () => {
   test('covers the events the issue asks to be logged', () => {
     expect(Object.values(ACTIVITY_ACTIONS)).toEqual(

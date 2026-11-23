@@ -142,9 +142,70 @@ function getJwks() {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Request principal
+// ---------------------------------------------------------------------------
+
+/**
+ * @typedef {object} RequestPrincipal
+ * @property {string}   userId   - Stable subject identifier from the token (`sub`).
+ * @property {string}   username - Username claim from the token.
+ * @property {string}   address  - Stellar address claim from the token.
+ * @property {string[]} roles    - Roles granted by the token.
+ */
+
+/**
+ * Build a typed RequestPrincipal from a *verified* JWT payload.
+ *
+ * Only claims from the verified token are trusted here. Caller-supplied
+ * identity fields (body/query/params) must never be used to construct a
+ * principal or to authorize access.
+ *
+ * @param {object} payload - Decoded, verified JWT payload.
+ * @returns {RequestPrincipal}
+ * @throws {ApiError} UNAUTHENTICATED when the token lacks a usable subject.
+ */
+function buildPrincipal(payload) {
+  const claims = payload && typeof payload === 'object' ? payload : {};
+
+  const userId = claims.sub || claims.userId || claims.id;
+  if (!userId || typeof userId !== 'string') {
+    throw new ApiError('UNAUTHENTICATED', 'Token is missing a subject claim.');
+  }
+
+  const username =
+    typeof claims.username === 'string' ? claims.username : null;
+  const address =
+    typeof claims.address === 'string'
+      ? claims.address
+      : typeof claims.stellarAddress === 'string'
+        ? claims.stellarAddress
+        : null;
+
+  let roles = claims.roles;
+  if (typeof roles === 'string') {
+    roles = roles.split(/[\s,]+/).filter(Boolean);
+  }
+  if (!Array.isArray(roles)) {
+    roles = [];
+  }
+  roles = roles.filter((role) => typeof role === 'string');
+
+  return Object.freeze({
+    userId,
+    username,
+    address,
+    roles: Object.freeze(roles),
+  });
+}
+
 /**
  * Express middleware: extract and verify a Bearer JWT from the Authorization
- * header, attaching the decoded payload to `req.user`.
+ * header, attaching the decoded payload to `req.user` and the typed
+ * `RequestPrincipal` to `req.principal`.
+ *
+ * Any caller-supplied identity fields on the request are discarded so they
+ * cannot be used to grant access.
  */
 function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization || '';
@@ -154,9 +215,9 @@ function requireAuth(req, res, next) {
     return next(new ApiError('UNAUTHENTICATED', 'Missing or malformed Authorization header.'));
   }
 
+  let payload;
   try {
-    req.user = verifyToken(token);
-    return next();
+    payload = verifyToken(token);
   } catch (err) {
     if (err.message === 'UNAUTHENTICATED' || err.code === 'UNAUTHENTICATED') {
       return next(new ApiError('UNAUTHENTICATED'));
@@ -165,12 +226,25 @@ function requireAuth(req, res, next) {
       err.name === 'TokenExpiredError' ? 'Token has expired.' : 'Invalid token.';
     return next(new ApiError('UNAUTHENTICATED', message));
   }
+
+  let principal;
+  try {
+    principal = buildPrincipal(payload);
+  } catch (err) {
+    return next(err);
+  }
+
+  // Never trust caller-supplied identity for authorization.
+  req.user = payload;
+  req.principal = principal;
+  return next();
 }
 
 module.exports = {
   signToken,
   verifyToken,
   getJwks,
+  buildPrincipal,
   requireAuth,
   DEFAULT_ISSUER,
   DEFAULT_AUDIENCE,

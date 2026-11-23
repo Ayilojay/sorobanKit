@@ -303,6 +303,149 @@ describe('authenticateUsernameOwner', () => {
   });
 });
 
+describe('centralized ownership enforcement (#383)', () => {
+  const {
+    buildRequestPrincipal,
+    assertPrincipalOwnsUsername,
+    assertPrincipalOwnsAddress,
+    assertPrincipalOwnsResource,
+    isPublicFederationRead,
+  } = require('../src/services/ownershipService');
+
+  const principalFor = (address = VALID_ADDRESS, username = 'alice') =>
+    buildRequestPrincipal({ address, username });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    clearSignerCache();
+    setSignerRedisClient(null);
+    prisma.user.findUnique.mockResolvedValue({
+      username: 'alice',
+      address: VALID_ADDRESS,
+    });
+  });
+
+  it('builds a typed principal from the authenticated session only', () => {
+    const principal = principalFor();
+
+    expect(principal).toMatchObject({
+      address: VALID_ADDRESS,
+      username: 'alice',
+      authenticated: true,
+    });
+    expect(Object.isFrozen(principal)).toBe(true);
+  });
+
+  it('rejects a principal built without an authenticated address', () => {
+    expect(() => buildRequestPrincipal({ username: 'alice' })).toThrow(
+      /authenticated address/i,
+    );
+  });
+
+  it('rejects a caller-supplied username in the body that differs from the principal', () => {
+    const principal = principalFor();
+
+    expect(() =>
+      assertPrincipalOwnsUsername(principal, { username: 'mallory' }),
+    ).toThrow(/does not own/i);
+  });
+
+  it('rejects a caller-supplied address in the query that differs from the principal', () => {
+    const principal = principalFor();
+
+    expect(() =>
+      assertPrincipalOwnsAddress(principal, { address: OTHER_ADDRESS }),
+    ).toThrow(/does not own/i);
+  });
+
+  it('allows the request when the supplied username matches the principal', () => {
+    const principal = principalFor();
+
+    expect(() =>
+      assertPrincipalOwnsUsername(principal, { username: 'alice' }),
+    ).not.toThrow();
+  });
+
+  it('denies cross-user access to another account resource', async () => {
+    const principal = principalFor();
+
+    await expect(
+      assertPrincipalOwnsResource(principal, {
+        resourceType: 'username',
+        resourceId: 'bob',
+        loadOwner: async () => ({ username: 'bob', address: OTHER_ADDRESS }),
+      }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+  });
+
+  it('allows access when the resource owner matches the principal', async () => {
+    const principal = principalFor();
+
+    await expect(
+      assertPrincipalOwnsResource(principal, {
+        resourceType: 'username',
+        resourceId: 'alice',
+        loadOwner: async () => ({ username: 'alice', address: VALID_ADDRESS }),
+      }),
+    ).resolves.toBe(true);
+  });
+
+  it('denies access when the resource does not exist', async () => {
+    const principal = principalFor();
+
+    await expect(
+      assertPrincipalOwnsResource(principal, {
+        resourceType: 'username',
+        resourceId: 'ghost',
+        loadOwner: async () => null,
+      }),
+    ).rejects.toMatchObject({ statusCode: 404 });
+  });
+
+  it('still allows public federation reads without a principal', () => {
+    expect(
+      isPublicFederationRead({ method: 'GET', path: '/federation' }),
+    ).toBe(true);
+    expect(
+      isPublicFederationRead({ method: 'GET', path: '/.well-known/stellar.toml' }),
+    ).toBe(true);
+  });
+
+  it('does not treat mutating federation routes as public reads', () => {
+    expect(
+      isPublicFederationRead({ method: 'POST', path: '/federation' }),
+    ).toBe(false);
+    expect(
+      isPublicFederationRead({ method: 'GET', path: '/webhooks' }),
+    ).toBe(false);
+  });
+
+  it('enforces ownership at the service layer even when routes are bypassed', async () => {
+    prisma.user.findUnique.mockResolvedValue({
+      username: 'bob',
+      address: OTHER_ADDRESS,
+    });
+
+    await expect(
+      authenticateUsernameOwner({
+        username: 'bob',
+        signature: BASE64_SIGNATURE,
+        publicKey: VALID_ADDRESS,
+      }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+  });
+
+  it('rejects a spoofed publicKey that does not match the registered account', async () => {
+    await expect(
+      authenticateUsernameOwner({
+        username: 'alice',
+        signature: BASE64_SIGNATURE,
+        publicKey: OTHER_ADDRESS,
+      }),
+    ).rejects.toMatchObject({ statusCode: 403 });
+  });
+});
+
 describe('Horizon signer list cache (#281)', () => {
   const SAMPLE_SIGNERS = {
     accountId: VALID_ADDRESS,

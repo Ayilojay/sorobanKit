@@ -72,20 +72,96 @@ async function runSoftDeletePurge(prisma) {
 /**
  * Schedules a daily midnight cron job that purges expired soft-deleted users.
  *
+ * The returned handle is shutdown-aware: calling `stop()` prevents any new
+ * purge runs from starting and awaits the currently in-flight run (if any),
+ * bounded by `timeoutMs`, so the caller can drain the job before closing
+ * Prisma. `stop()` is idempotent and safe to call multiple times.
+ *
  * @param {import('@prisma/client').PrismaClient} prisma
+ * @param {{ timeoutMs?: number }} [options]
+ * @returns {{ stop: (options?: { timeoutMs?: number }) => Promise<void> }}
  */
-function scheduleSoftDeletePurgeJob(prisma) {
-  cron.schedule('0 0 * * *', async () => {
-    logger.info('[soft-delete-purge] Starting soft-delete purge…');
-    try {
-      const purged = await runSoftDeletePurge(prisma);
-      logger.info('[soft-delete-purge] Soft-delete purge complete', { purged });
-    } catch (err) {
-      logger.error('[soft-delete-purge] Soft-delete purge failed', { err: err.message });
+function scheduleSoftDeletePurgeJob(prisma, options = {}) {
+  const defaultTimeoutMs =
+    Number.isInteger(options.timeoutMs) && options.timeoutMs > 0
+      ? options.timeoutMs
+      : 30_000;
+
+  let stopped = false;
+  let inFlight = null;
+
+  const task = cron.schedule('0 0 * * *', () => {
+    if (stopped) {
+      logger.info('[soft-delete-purge] Skipping purge run: job is shutting down');
+      return;
     }
+
+    logger.info('[soft-delete-purge] Starting soft-delete purge…');
+    const run = (async () => {
+      try {
+        const purged = await runSoftDeletePurge(prisma);
+        logger.info('[soft-delete-purge] Soft-delete purge complete', { purged });
+      } catch (err) {
+        logger.error('[soft-delete-purge] Soft-delete purge failed', { err: err.message });
+      }
+    })();
+
+    inFlight = run;
+    run.finally(() => {
+      if (inFlight === run) inFlight = null;
+    });
   });
 
   logger.info('[soft-delete-purge] Daily soft-delete purge job scheduled (midnight)');
+
+  async function stop(stopOptions = {}) {
+    if (stopped) {
+      // Still await any in-flight run so repeated calls remain safe.
+      if (inFlight) await inFlight;
+      return;
+    }
+    stopped = true;
+
+    try {
+      if (task && typeof task.stop === 'function') task.stop();
+      if (task && typeof task.destroy === 'function') task.destroy();
+    } catch (err) {
+      logger.error('[soft-delete-purge] Failed to stop cron task', { err: err.message });
+    }
+
+    if (!inFlight) {
+      logger.info('[soft-delete-purge] Purge job stopped (no in-flight run)');
+      return;
+    }
+
+    const timeoutMs =
+      Number.isInteger(stopOptions.timeoutMs) && stopOptions.timeoutMs > 0
+        ? stopOptions.timeoutMs
+        : defaultTimeoutMs;
+
+    logger.info('[soft-delete-purge] Waiting for in-flight purge run to drain', { timeoutMs });
+
+    let timer = null;
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => {
+        logger.warn('[soft-delete-purge] Timed out waiting for in-flight purge run', {
+          timeoutMs,
+        });
+        resolve();
+      }, timeoutMs);
+      if (typeof timer.unref === 'function') timer.unref();
+    });
+
+    try {
+      await Promise.race([inFlight, timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+
+    logger.info('[soft-delete-purge] Purge job stopped');
+  }
+
+  return { stop };
 }
 
 module.exports = {

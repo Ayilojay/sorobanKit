@@ -233,6 +233,127 @@ const httpError = (message, statusCode) => {
   return error;
 };
 
+const FORBIDDEN_CODE = 'FORBIDDEN';
+
+const forbiddenError = (message = 'You do not have permission to access this resource.') => {
+  const error = httpError(message, 403);
+  error.code = FORBIDDEN_CODE;
+  return error;
+};
+
+/**
+ * Extracts the authenticated identity from a request principal.
+ *
+ * Only server-derived principal fields are trusted.  Caller-supplied
+ * usernames or addresses carried on the request body/query are never
+ * consulted here, so they cannot be used to grant access.
+ *
+ * @param {unknown} principal
+ * @returns {{username: string|null, address: string|null}}
+ */
+const normalizePrincipal = (principal) => {
+  if (!principal || typeof principal !== 'object') {
+    return { username: null, address: null };
+  }
+  const rawUsername = principal.username;
+  const rawAddress = principal.address;
+  const username =
+    typeof rawUsername === 'string' && rawUsername.trim()
+      ? normalizeNameTag(rawUsername.trim()).toLowerCase()
+      : null;
+  const address =
+    typeof rawAddress === 'string' && rawAddress.trim() ? rawAddress.trim() : null;
+  return { username, address };
+};
+
+/**
+ * Returns true when `principal` is authenticated (has a username or address).
+ * @param {unknown} principal
+ * @returns {boolean}
+ */
+const isAuthenticated = (principal) => {
+  const { username, address } = normalizePrincipal(principal);
+  return Boolean(username || address);
+};
+
+/**
+ * Returns true when the authenticated `principal` owns `resource`.
+ *
+ * `resource` may be a username string, an address string, or an object with
+ * `username` and/or `address` fields.  Ownership is granted when the
+ * principal's username matches the resource username, or the principal's
+ * address matches the resource address.  Unauthenticated principals never
+ * own anything.
+ *
+ * @param {unknown} principal
+ * @param {unknown} resource
+ * @returns {boolean}
+ */
+const isOwner = (principal, resource) => {
+  const { username, address } = normalizePrincipal(principal);
+  if (!username && !address) return false;
+
+  let resourceUsername = null;
+  let resourceAddress = null;
+
+  if (typeof resource === 'string') {
+    const trimmed = resource.trim();
+    if (!trimmed) return false;
+    if (StrKey.isValidEd25519PublicKey(trimmed)) {
+      resourceAddress = trimmed;
+    } else {
+      resourceUsername = normalizeNameTag(trimmed).toLowerCase();
+    }
+  } else if (resource && typeof resource === 'object') {
+    if (typeof resource.username === 'string' && resource.username.trim()) {
+      resourceUsername = normalizeNameTag(resource.username.trim()).toLowerCase();
+    }
+    if (typeof resource.address === 'string' && resource.address.trim()) {
+      resourceAddress = resource.address.trim();
+    }
+  } else {
+    return false;
+  }
+
+  if (username && resourceUsername && username === resourceUsername) return true;
+  if (address && resourceAddress && address === resourceAddress) return true;
+  return false;
+};
+
+/**
+ * Returns true when the authenticated `principal` may access `resource`.
+ * Currently equivalent to ownership; kept as a separate seam so future
+ * role-based access can be layered on without changing call sites.
+ *
+ * @param {unknown} principal
+ * @param {unknown} resource
+ * @returns {boolean}
+ */
+const canAccess = (principal, resource) => isOwner(principal, resource);
+
+/**
+ * Centralized ownership enforcement shared by routes and services.
+ *
+ * Throws a consistent 403 `FORBIDDEN` error when the principal is missing,
+ * unauthenticated, or does not own the resource.  Caller-supplied usernames
+ * or addresses on the request body/query are ignored: only the principal
+ * (derived from authentication) is trusted.
+ *
+ * @param {unknown} principal
+ * @param {unknown} resource
+ * @returns {true} when access is granted
+ * @throws {Error} with `statusCode` 403 and `code` `FORBIDDEN`
+ */
+const assertOwnership = (principal, resource) => {
+  if (!isAuthenticated(principal)) {
+    throw forbiddenError('Authentication required.');
+  }
+  if (!isOwner(principal, resource)) {
+    throw forbiddenError();
+  }
+  return true;
+};
+
 const verifyFreighterSignedMessage = ({ message, signature, signerAddress, publicKey }) => {
   const claimedSigner = signerAddress || publicKey;
 
@@ -392,6 +513,12 @@ const authenticateUsernameOwner = async ({
 module.exports = {
   authenticateUsernameOwner,
   verifyFreighterSignedMessage,
+  assertOwnership,
+  canAccess,
+  isOwner,
+  isAuthenticated,
+  normalizePrincipal,
+  FORBIDDEN_CODE,
   getCachedAccountSigners,
   setSignerRedisClient,
   clearSignerCache,
