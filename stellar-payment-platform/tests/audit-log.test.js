@@ -68,6 +68,15 @@ const {
   createAuditLogMiddleware,
   SENSITIVE_KEYS,
 } = require('../src/middleware/auditLog');
+const {
+  PERMISSIONS,
+  ROLES,
+  resolveRolePermissions,
+  hasPermission,
+  requirePermission,
+  assertRoutePermissions,
+  auditPermissionDecision,
+} = require('../src/middleware/permissions');
 
 describe('Admin Audit Logging System', () => {
   beforeEach(() => {
@@ -299,6 +308,150 @@ describe('Admin Audit Logging System', () => {
           userId: 'custom-user',
         }),
       });
+    });
+  });
+
+  describe('Centralized permission model', () => {
+    it('exposes read, operational and configuration permission constants', () => {
+      expect(PERMISSIONS).toEqual(
+        expect.objectContaining({
+          ADMIN_READ: expect.any(String),
+          ADMIN_OPERATE: expect.any(String),
+          ADMIN_CONFIGURE: expect.any(String),
+        })
+      );
+      expect(new Set(Object.values(PERMISSIONS)).size).toBe(
+        Object.keys(PERMISSIONS).length
+      );
+    });
+
+    it('grants read-only roles only the read permission', () => {
+      const perms = resolveRolePermissions(ROLES.VIEWER);
+      expect(hasPermission(perms, PERMISSIONS.ADMIN_READ)).toBe(true);
+      expect(hasPermission(perms, PERMISSIONS.ADMIN_OPERATE)).toBe(false);
+      expect(hasPermission(perms, PERMISSIONS.ADMIN_CONFIGURE)).toBe(false);
+    });
+
+    it('grants operator roles read and operational permissions but not configuration', () => {
+      const perms = resolveRolePermissions(ROLES.OPERATOR);
+      expect(hasPermission(perms, PERMISSIONS.ADMIN_READ)).toBe(true);
+      expect(hasPermission(perms, PERMISSIONS.ADMIN_OPERATE)).toBe(true);
+      expect(hasPermission(perms, PERMISSIONS.ADMIN_CONFIGURE)).toBe(false);
+    });
+
+    it('grants admin roles all permissions', () => {
+      const perms = resolveRolePermissions(ROLES.ADMIN);
+      expect(hasPermission(perms, PERMISSIONS.ADMIN_READ)).toBe(true);
+      expect(hasPermission(perms, PERMISSIONS.ADMIN_OPERATE)).toBe(true);
+      expect(hasPermission(perms, PERMISSIONS.ADMIN_CONFIGURE)).toBe(true);
+    });
+
+    it('denies unknown roles and unknown permissions', () => {
+      const perms = resolveRolePermissions('nonexistent-role');
+      expect(perms).toEqual([]);
+      expect(hasPermission(perms, PERMISSIONS.ADMIN_READ)).toBe(false);
+      expect(hasPermission(resolveRolePermissions(ROLES.ADMIN), 'unknown:perm')).toBe(false);
+    });
+
+    it('requirePermission allows requests whose role holds the permission', () => {
+      const mw = requirePermission(PERMISSIONS.ADMIN_READ);
+      const req = { user: { role: ROLES.VIEWER }, headers: {}, method: 'GET', originalUrl: '/x' };
+      const res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
+      const next = jest.fn();
+
+      mw(req, res, next);
+
+      expect(next).toHaveBeenCalled();
+      expect(res.status).not.toHaveBeenCalled();
+    });
+
+    it('requirePermission denies requests whose role lacks the permission', () => {
+      const mw = requirePermission(PERMISSIONS.ADMIN_CONFIGURE);
+      const req = { user: { role: ROLES.OPERATOR }, headers: {}, method: 'POST', originalUrl: '/x' };
+      const res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
+      const next = jest.fn();
+
+      mw(req, res, next);
+
+      expect(next).not.toHaveBeenCalled();
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ success: false, error: expect.any(String) })
+      );
+    });
+
+    it('requirePermission denies requests with no authenticated role', () => {
+      const mw = requirePermission(PERMISSIONS.ADMIN_READ);
+      const req = { headers: {}, method: 'GET', originalUrl: '/x' };
+      const res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
+      const next = jest.fn();
+
+      mw(req, res, next);
+
+      expect(next).not.toHaveBeenCalled();
+      expect(res.status).toHaveBeenCalledWith(403);
+    });
+
+    it('assertRoutePermissions throws when a route omits its permission declaration', () => {
+      expect(() =>
+        assertRoutePermissions([{ method: 'GET', path: '/admin/undeclared' }])
+      ).toThrow(/permission/i);
+    });
+
+    it('assertRoutePermissions accepts routes that declare a known permission', () => {
+      expect(() =>
+        assertRoutePermissions([
+          { method: 'GET', path: '/admin/ok', permission: PERMISSIONS.ADMIN_READ },
+        ])
+      ).not.toThrow();
+    });
+
+    it('assertRoutePermissions throws when a route declares an unknown permission', () => {
+      expect(() =>
+        assertRoutePermissions([
+          { method: 'GET', path: '/admin/bad', permission: 'not:a:permission' },
+        ])
+      ).toThrow(/permission/i);
+    });
+
+    it('auditPermissionDecision records actor, permission and outcome', async () => {
+      const prismaClient = { auditLog: { create: jest.fn().mockResolvedValue({}) } };
+
+      await auditPermissionDecision(prismaClient, {
+        actor: 'admin-user-1',
+        permission: PERMISSIONS.ADMIN_CONFIGURE,
+        outcome: 'denied',
+        method: 'POST',
+        path: '/api/v1/admin/config',
+        ipAddress: '198.51.100.7',
+      });
+
+      expect(prismaClient.auditLog.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          userId: 'admin-user-1',
+          action: expect.stringContaining(PERMISSIONS.ADMIN_CONFIGURE),
+          method: 'POST',
+          path: '/api/v1/admin/config',
+          ipAddress: '198.51.100.7',
+          payload: expect.stringContaining('denied'),
+        }),
+      });
+    });
+
+    it('auditPermissionDecision never throws when persistence fails', async () => {
+      const prismaClient = {
+        auditLog: { create: jest.fn().mockRejectedValue(new Error('db down')) },
+      };
+
+      await expect(
+        auditPermissionDecision(prismaClient, {
+          actor: 'admin-user-1',
+          permission: PERMISSIONS.ADMIN_READ,
+          outcome: 'allowed',
+          method: 'GET',
+          path: '/api/v1/admin/audit-logs',
+        })
+      ).resolves.toBeUndefined();
     });
   });
 

@@ -157,6 +157,63 @@ authenticated before rate limiting and must have `read` for GET/HEAD routes,
 401; authenticated keys missing the required scope return 403. The legacy
 `ADMIN_API_KEY` remains an admin-scoped credential.
 
+#### API key rotation
+
+Keys are rotated with a bounded overlap so clients can switch over without a
+window of failed requests:
+
+1. Create the replacement key. The response is the **only** time the raw key
+   material is returned; it is stored hashed and every later read (list,
+   detail, audit log) shows a redacted form such as `sk_live_…4f2a`.
+2. Both the predecessor and the successor authenticate during the overlap
+   window. Each key carries `predecessorId` / `successorId` metadata so an
+   operator can see which key replaced which.
+3. Revoking the predecessor is immediate: the next request presenting it is
+   rejected with 401, regardless of the overlap window. Revocation is recorded
+   in the audit trail with the acting credential, timestamp, and reason.
+
+The overlap window is bounded — once it expires the predecessor stops
+authenticating even if it was never explicitly revoked. Rotate before the
+window closes, or issue a new successor.
+
+#### Administrative roles
+
+`/admin/*` routes no longer share one broad capability. Each route declares the
+permission it needs, and credentials are granted one or more roles:
+
+| Role | Grants |
+| --- | --- |
+| `admin:read` | Read-only admin endpoints (stats, audit logs, exports) |
+| `admin:operate` | Operational actions (retries, queue drains, revocations) |
+| `admin:configure` | Configuration-changing actions (treasury, limits, upgrades) |
+
+A request to an admin route without the declared permission returns 403 with
+the missing permission named in the error details. Sensitive decisions
+(role changes, revocations, configuration changes) are written to the audit
+trail with the acting credential, the permission that authorized the action,
+and the request payload hash.
+
+#### Step-up verification
+
+High-impact administrative actions require a second, short-lived confirmation
+bound to the action and the payload:
+
+- **Covered actions:** contract upgrades, treasury changes, and bulk exports.
+- **How it works:** request a step-up challenge for the action, then repeat the
+  request with the returned single-use token. The token is bound to the action
+  name and a hash of the request payload, so it cannot be replayed against a
+  different action or a modified body.
+- **Expiry:** tokens are short-lived (minutes, not hours) and single-use. An
+  expired or already-consumed token fails with 401 and the request is not
+  performed.
+- **Mismatch:** a token presented with a different action or payload hash fails
+  with 403 and is not consumed, so the operator can retry with the correct
+  payload.
+- **Audit evidence:** successful step-ups record the challenge ID, the action,
+  the payload hash, and the acting credential in the audit trail; failures are
+  recorded with the failure reason.
+=======
+
 ### Server
 
 The server uses **PostgreSQL** as its database, accessed through the
@@ -638,12 +695,18 @@ Streams transaction records from the database as a CSV or NDJSON download for ex
   - `limit` (optional) – positive integer row limit. When omitted, only the server cap applies.
   - `startDate` (optional) – `YYYY-MM-DD` inclusive lower bound on `createdAt`.
   - `endDate` (optional) – `YYYY-MM-DD` inclusive upper bound on `createdAt`.
-- **Headers:** `x-api-key` (required) – must match `ADMIN_API_KEY`.
+- **Headers:** `x-api-key` (required) – must hold the `admin:read` permission.
 - **Returns:** `text/csv` or `application/x-ndjson` with a `Content-Disposition: attachment` header.
 - **Status Codes:**
   - `200 OK`: Stream started.
   - `400 Bad Request`: Invalid date format or `startDate` after `endDate`.
   - `401 Unauthorized`: Missing or invalid API key.
+  - `403 Forbidden`: The key lacks `admin:read`, or a required step-up token is
+    missing, expired, already used, or bound to a different action/payload.
+
+Bulk exports are a high-impact action: they require a step-up token bound to
+the export's action and payload hash (see
+[Step-up verification](#step-up-verification)).
 
 Records are fetched at most 500 at a time and written directly to the response. The export stops at the lower of `limit` and `ADMIN_EXPORT_MAX_ROWS` (default `1000000`). Configure the cap as a positive integer no greater than `2147483647`; invalid configuration fails closed with HTTP 500. Invalid limits return HTTP 400. A bounded one-row probe checks for additional matching records before streaming starts, so truncated downloads include `X-Truncated: true`; exports ending exactly at the boundary omit that header. JSON output remains newline-delimited (one object per line).
 
@@ -656,12 +719,13 @@ Returns historical payment routing statistics and aggregated volumes, fees, and 
   - `interval` (optional) – Alias for `groupBy`.
   - `weekStart` (optional) – Only meaningful with `groupBy=week`. `'monday'` (default) or `'sunday'`.
   - `assetCode` (optional) – Filter transactions by asset code (e.g., `XLM`, `USDC`).
-- **Headers:** `x-api-key` (required) – must match `ADMIN_API_KEY` (or pass `api_key` in query params).
+- **Headers:** `x-api-key` (required) – must hold the `admin:read` permission (or pass `api_key` in query params).
 - **Returns:** JSON object containing `interval`, `startDate`, `endDate`, `summary` (`total_volume`, `total_fees`, `total_count`), and `data` array of periodic records (`[{ period, volume, fees, count }]`).
 - **Status Codes:**
   - `200 OK`: Statistics retrieved successfully.
   - `400 Bad Request`: Invalid date format, `startDate` after `endDate`, invalid `groupBy`, or invalid `weekStart`.
   - `401 Unauthorized`: Missing or invalid API key.
+  - `403 Forbidden`: The key lacks `admin:read`.
 
 **Week boundaries:** with `groupBy=week`, periods are ISO weeks starting on
 Monday by default. Pass `weekStart=sunday` to group into Sunday-based weeks
@@ -672,13 +736,14 @@ weeks under each convention (e.g. a Sunday) will appear in different periods.
 Retrieves recent immutable audit trail records for mutating admin actions (`POST`, `PUT`, `DELETE`, `PATCH`).
 - **Query Parameters:**
   - `limit` (optional) – Maximum number of records to return (1-100, default 50).
-- **Headers:** `x-api-key` (required) – must match `ADMIN_API_KEY` (or pass `api_key` in query params).
+- **Headers:** `x-api-key` (required) – must hold the `admin:read` permission (or pass `api_key` in query params).
 - **Returns:** JSON object with `success: true`, `count`, and `data` array of audit records containing `action`, `method`, `path`, `userId`, `ipAddress`, `userAgent`, `statusCode`, `payload` (sensitive data redacted), and `createdAt`.
 - **Status Codes:**
   - `200 OK`: Audit logs retrieved successfully.
   - `401 Unauthorized`: Missing or invalid API key.
+  - `403 Forbidden`: The key lacks `admin:read`.
 
-Mutating admin requests are intercepted by `auditLogMiddleware` and recorded asynchronously upon response completion. Sensitive keys (`password`, `secret`, `apiKey`, `token`, `signature`, `privateKey`, `seed`) are deeply redacted before persistence.
+Mutating admin requests are intercepted by `auditLogMiddleware` and recorded asynchronously upon response completion. Sensitive keys (`password`, `secret`, `apiKey`, `token`, `signature`, `privateKey`, `seed`) are deeply redacted before persistence. Raw API key material is never persisted or returned after issuance; audit records for key rotation and revocation carry the redacted key identifier, the acting credential, and the reason. Step-up decisions record the challenge ID, action, payload hash, and outcome.
 
 ### `GET /metrics`
 
@@ -830,6 +895,12 @@ the nominee must call `accept_admin` within seven days, and the current admin
 remains active until acceptance. The current admin can cancel a nomination;
 anyone can clear it after expiry. `emergency_freeze` remains immediate, while
 unfreezing requires a matured `Unfreeze` action.
+
+On the API side, queuing a contract upgrade or changing treasury settings also
+requires a step-up token bound to the action and payload hash (see
+[Step-up verification](#step-up-verification)). The timelock and the step-up are
+independent controls: the step-up proves the operator's intent at request time,
+and the timelock delays execution so it can be reviewed and cancelled.
 
 ## Architecture notes
 

@@ -35,6 +35,24 @@ jest.mock('../prismaClient', () => ({
   isPrismaConnectionError: () => false,
 }));
 
+// ── step-up verification mock (issue #374) ───────────────────────────────────
+
+const mockIssueStepUpChallenge = jest.fn();
+const mockConsumeStepUpChallenge = jest.fn();
+const mockRecordStepUpAudit = jest.fn();
+
+jest.mock('../src/step-up-verification', () => ({
+  STEP_UP_ACTIONS: {
+    CONTRACT_UPGRADE: 'contract_upgrade',
+    TREASURY_CHANGE: 'treasury_change',
+    BULK_EXPORT: 'bulk_export',
+  },
+  issueStepUpChallenge: (...args) => mockIssueStepUpChallenge(...args),
+  consumeStepUpChallenge: (...args) => mockConsumeStepUpChallenge(...args),
+  recordStepUpAudit: (...args) => mockRecordStepUpAudit(...args),
+  hashExportPayload: (query) => JSON.stringify(query),
+}));
+
 jest.mock('@stellar/stellar-sdk', () => ({
   Horizon: { Server: jest.fn().mockImplementation(() => ({ payments: jest.fn() })) },
   StrKey: { isValidEd25519PublicKey: jest.fn((v) => typeof v === 'string' && v.startsWith('G')) },
@@ -66,6 +84,10 @@ const makeRecord = (i) => ({
 describe('GET /admin/export', () => {
   beforeEach(() => {
     mockFindMany.mockReset();
+    mockIssueStepUpChallenge.mockReset();
+    mockConsumeStepUpChallenge.mockReset();
+    mockRecordStepUpAudit.mockReset();
+    mockRecordStepUpAudit.mockResolvedValue(undefined);
   });
 
   it('returns 401 without API key', async () => {
@@ -259,5 +281,150 @@ describe('GET /admin/export', () => {
     expect(res.status).toBe(200);
     const lines = res.text.trim().split('\n').filter(Boolean);
     expect(lines.length).toBe(502);
+  });
+});
+
+// ── step-up verification (issue #374) ────────────────────────────────────────
+
+const STEP_UP_HEADER = 'x-step-up-token';
+
+describe('GET /admin/export step-up verification', () => {
+  beforeEach(() => {
+    mockFindMany.mockReset();
+    mockIssueStepUpChallenge.mockReset();
+    mockConsumeStepUpChallenge.mockReset();
+    mockRecordStepUpAudit.mockReset();
+    mockRecordStepUpAudit.mockResolvedValue(undefined);
+  });
+
+  it('streams the export when a valid step-up challenge is presented', async () => {
+    mockConsumeStepUpChallenge.mockResolvedValueOnce({ ok: true, challengeId: 'chal-1' });
+    mockFindMany.mockResolvedValueOnce([makeRecord(1)]).mockResolvedValueOnce([]);
+
+    const res = await request(app)
+      .get('/api/v1/admin/export')
+      .set('x-api-key', 'test-admin-key')
+      .set(STEP_UP_HEADER, 'step-up-token-1');
+
+    expect(res.status).toBe(200);
+    expect(res.text).toMatch(/txn-1/);
+    expect(mockConsumeStepUpChallenge).toHaveBeenCalledWith(
+      expect.objectContaining({
+        token: 'step-up-token-1',
+        action: 'bulk_export',
+        payloadHash: expect.any(String),
+      }),
+    );
+  });
+
+  it('records audit evidence on successful export', async () => {
+    mockConsumeStepUpChallenge.mockResolvedValueOnce({ ok: true, challengeId: 'chal-1' });
+    mockFindMany.mockResolvedValueOnce([makeRecord(1)]).mockResolvedValueOnce([]);
+
+    await request(app)
+      .get('/api/v1/admin/export')
+      .set('x-api-key', 'test-admin-key')
+      .set(STEP_UP_HEADER, 'step-up-token-1');
+
+    expect(mockRecordStepUpAudit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'bulk_export',
+        outcome: 'success',
+        challengeId: 'chal-1',
+        payloadHash: expect.any(String),
+      }),
+    );
+  });
+
+  it('rejects the export with 401 when the step-up token is missing', async () => {
+    const res = await request(app)
+      .get('/api/v1/admin/export')
+      .set('x-api-key', 'test-admin-key');
+
+    expect(res.status).toBe(401);
+    expect(res.body.code).toBe('STEP_UP_REQUIRED');
+    expect(mockFindMany).not.toHaveBeenCalled();
+    expect(mockRecordStepUpAudit).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'bulk_export', outcome: 'failure', reason: 'missing' }),
+    );
+  });
+
+  it('rejects the export with 401 when the step-up token is expired', async () => {
+    mockConsumeStepUpChallenge.mockResolvedValueOnce({ ok: false, reason: 'expired' });
+
+    const res = await request(app)
+      .get('/api/v1/admin/export')
+      .set('x-api-key', 'test-admin-key')
+      .set(STEP_UP_HEADER, 'expired-token');
+
+    expect(res.status).toBe(401);
+    expect(res.body.code).toBe('STEP_UP_EXPIRED');
+    expect(mockFindMany).not.toHaveBeenCalled();
+    expect(mockRecordStepUpAudit).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'bulk_export', outcome: 'failure', reason: 'expired' }),
+    );
+  });
+
+  it('rejects the export with 401 when the step-up token was already used', async () => {
+    mockConsumeStepUpChallenge.mockResolvedValueOnce({ ok: false, reason: 'reused' });
+
+    const res = await request(app)
+      .get('/api/v1/admin/export')
+      .set('x-api-key', 'test-admin-key')
+      .set(STEP_UP_HEADER, 'used-token');
+
+    expect(res.status).toBe(401);
+    expect(res.body.code).toBe('STEP_UP_REUSED');
+    expect(mockFindMany).not.toHaveBeenCalled();
+    expect(mockRecordStepUpAudit).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'bulk_export', outcome: 'failure', reason: 'reused' }),
+    );
+  });
+
+  it('rejects the export with 409 when the payload hash does not match', async () => {
+    mockConsumeStepUpChallenge.mockResolvedValueOnce({ ok: false, reason: 'payload_mismatch' });
+
+    const res = await request(app)
+      .get('/api/v1/admin/export?format=json')
+      .set('x-api-key', 'test-admin-key')
+      .set(STEP_UP_HEADER, 'token-for-other-payload');
+
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe('STEP_UP_PAYLOAD_MISMATCH');
+    expect(mockFindMany).not.toHaveBeenCalled();
+    expect(mockRecordStepUpAudit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'bulk_export',
+        outcome: 'failure',
+        reason: 'payload_mismatch',
+      }),
+    );
+  });
+
+  it('allows only one of two concurrent requests to consume the same challenge', async () => {
+    // First consumer wins; the second sees the challenge as already used.
+    mockConsumeStepUpChallenge
+      .mockResolvedValueOnce({ ok: true, challengeId: 'chal-race' })
+      .mockResolvedValueOnce({ ok: false, reason: 'reused' });
+    mockFindMany.mockResolvedValueOnce([makeRecord(1)]).mockResolvedValueOnce([]);
+
+    const [first, second] = await Promise.all([
+      request(app)
+        .get('/api/v1/admin/export')
+        .set('x-api-key', 'test-admin-key')
+        .set(STEP_UP_HEADER, 'race-token'),
+      request(app)
+        .get('/api/v1/admin/export')
+        .set('x-api-key', 'test-admin-key')
+        .set(STEP_UP_HEADER, 'race-token'),
+    ]);
+
+    const statuses = [first.status, second.status].sort();
+    expect(statuses).toEqual([200, 401]);
+    const rejected = first.status === 401 ? first : second;
+    expect(rejected.body.code).toBe('STEP_UP_REUSED');
+    expect(mockRecordStepUpAudit).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'bulk_export', outcome: 'failure', reason: 'reused' }),
+    );
   });
 });

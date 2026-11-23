@@ -95,7 +95,7 @@ describe('E2E: Admin Flow', () => {
   });
 
   it('should allow admin to block a user and export users', async () => {
-    // 1. Block User
+    // 1. Block User (operational permission)
     let res = await request(app)
       .post('/api/v1/admin/block')
       .set('x-api-key', 'e2e-admin-key')
@@ -105,7 +105,7 @@ describe('E2E: Admin Flow', () => {
     expect(res.body.address).toBe('GABC123XYZ456789ADMIN');
     expect(res.body.flaggedAt).toBeDefined();
 
-    // 2. Export Payments
+    // 2. Export Payments (read permission)
     res = await request(app)
       .get('/api/v1/admin/export?format=json')
       .set('x-api-key', 'e2e-admin-key');
@@ -124,5 +124,103 @@ describe('E2E: Admin Flow', () => {
       .send({ address: 'GABC123XYZ456789ADMIN' });
 
     expect(res.status).toBe(401);
+  });
+
+  it('should deny operational actions to a read-only key', async () => {
+    const res = await request(app)
+      .post('/api/v1/admin/block')
+      .set('x-api-key', 'e2e-read-only-key')
+      .send({ address: 'GABC123XYZ456789ADMIN' });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toMatch(/permission/i);
+  });
+
+  it('should deny configuration changes to an operational key', async () => {
+    const res = await request(app)
+      .post('/api/v1/admin/config')
+      .set('x-api-key', 'e2e-admin-key')
+      .send({ key: 'feeBps', value: 25 });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toMatch(/permission/i);
+  });
+
+  it('should require step-up verification for treasury changes', async () => {
+    const payload = { amount: '1000', asset: 'XLM', destination: 'GDEST123' };
+
+    // Missing step-up token -> rejected, no state change.
+    let res = await request(app)
+      .post('/api/v1/admin/treasury/withdraw')
+      .set('x-api-key', 'e2e-admin-key')
+      .send(payload);
+    expect(res.status).toBe(428);
+
+    // Request a step-up challenge bound to the action + payload hash.
+    res = await request(app)
+      .post('/api/v1/admin/step-up/challenge')
+      .set('x-api-key', 'e2e-admin-key')
+      .send({ action: 'treasury.withdraw', payload });
+    expect(res.status).toBe(200);
+    expect(res.body.challengeId).toBeDefined();
+    expect(res.body.expiresAt).toBeDefined();
+
+    const { challengeId } = res.body;
+
+    // Wrong payload hash -> rejected.
+    res = await request(app)
+      .post('/api/v1/admin/treasury/withdraw')
+      .set('x-api-key', 'e2e-admin-key')
+      .set('x-step-up-token', challengeId)
+      .send({ ...payload, amount: '9999' });
+    expect(res.status).toBe(409);
+
+    // Correct token + payload -> succeeds.
+    res = await request(app)
+      .post('/api/v1/admin/treasury/withdraw')
+      .set('x-api-key', 'e2e-admin-key')
+      .set('x-step-up-token', challengeId)
+      .send(payload);
+    expect(res.status).toBe(200);
+
+    // Token is single-use: replaying it fails.
+    res = await request(app)
+      .post('/api/v1/admin/treasury/withdraw')
+      .set('x-api-key', 'e2e-admin-key')
+      .set('x-step-up-token', challengeId)
+      .send(payload);
+    expect(res.status).toBe(409);
+  });
+
+  it('should reject expired step-up challenges', async () => {
+    const payload = { contractId: 'CABC123', wasmHash: 'deadbeef' };
+
+    let res = await request(app)
+      .post('/api/v1/admin/step-up/challenge')
+      .set('x-api-key', 'e2e-admin-key')
+      .send({ action: 'contract.upgrade', payload, ttlSeconds: -1 });
+    expect(res.status).toBe(200);
+
+    res = await request(app)
+      .post('/api/v1/admin/contracts/upgrade')
+      .set('x-api-key', 'e2e-admin-key')
+      .set('x-step-up-token', res.body.challengeId)
+      .send(payload);
+    expect(res.status).toBe(409);
+  });
+
+  it('should record audit evidence for sensitive decisions', async () => {
+    const { prisma } = require('../../prismaClient');
+    prisma.auditLog.create.mockClear();
+
+    await request(app)
+      .post('/api/v1/admin/block')
+      .set('x-api-key', 'e2e-admin-key')
+      .send({ address: 'GABC123XYZ456789ADMIN' });
+
+    expect(prisma.auditLog.create).toHaveBeenCalled();
+    const entry = prisma.auditLog.create.mock.calls[0][0].data;
+    expect(entry.action).toBe('admin.block');
+    expect(entry.outcome).toBe('allowed');
   });
 });

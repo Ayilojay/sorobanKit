@@ -328,8 +328,10 @@
       "get": {
         "tags": ["Admin"],
         "summary": "Get admin statistics",
+        "description": "Requires the `admin:read` permission.",
         "operationId": "getAdminStats",
         "security": [{ "bearerAuth": [] }],
+        "x-required-permission": "admin:read",
         "responses": {
           "200": {
             "description": "Administrative statistics",
@@ -348,9 +350,10 @@
       "post": {
         "tags": ["Admin"],
         "summary": "Trigger a reporting read model refresh",
-        "description": "Enqueues an asynchronous refresh of the reporting read model. The refresh runs decoupled from the payment write path and records the source watermark on completion. Returns the current refresh status.",
+        "description": "Enqueues an asynchronous refresh of the reporting read model. The refresh runs decoupled from the payment write path and records the source watermark on completion. Returns the current refresh status. Requires the `admin:operate` permission.",
         "operationId": "refreshStats",
         "security": [{ "bearerAuth": [] }],
+        "x-required-permission": "admin:operate",
         "responses": {
           "202": {
             "description": "Refresh accepted and running asynchronously",
@@ -373,9 +376,10 @@
       "get": {
         "tags": ["Admin"],
         "summary": "Get reporting read model refresh status",
-        "description": "Returns the current refresh status and source watermark of the reporting read model.",
+        "description": "Returns the current refresh status and source watermark of the reporting read model. Requires the `admin:read` permission.",
         "operationId": "getStatsRefreshStatus",
         "security": [{ "bearerAuth": [] }],
+        "x-required-permission": "admin:read",
         "responses": {
           "200": {
             "description": "Current refresh status",
@@ -387,6 +391,189 @@
           },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/api/admin/api-keys/{id}/rotate": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ApiKeyIdParam" }
+      ],
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Rotate an API key with a bounded overlap window",
+        "description": "Issues a successor API key and schedules revocation of the predecessor at the end of a bounded overlap window (default 24 hours, capped by `API_KEY_ROTATION_MAX_OVERLAP_HOURS`). Both keys are accepted during the overlap; the predecessor is revoked immediately at the end of the window. The response contains the raw successor key material exactly once; subsequent reads of the key return only redacted metadata. Rotation is transactional and idempotent per predecessor: concurrent rotation attempts yield a single successor and losers receive `409 Conflict`. Requires the `admin:configure` permission and a confirmed step-up challenge bound to this action and payload hash.",
+        "operationId": "rotateApiKey",
+        "security": [{ "bearerAuth": [] }],
+        "x-required-permission": "admin:configure",
+        "x-requires-step-up": true,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RotateApiKeyInput" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successor key issued; raw key material is returned only in this response",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApiKeyRotationResult" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "428": { "$ref": "#/components/responses/StepUpRequired" }
+        }
+      }
+    },
+    "/api/admin/api-keys/{id}/revoke": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ApiKeyIdParam" }
+      ],
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Immediately revoke an API key",
+        "description": "Revokes the key immediately, including any key still inside its rotation overlap window. Revocation is auditable: the response records the actor, reason, and timestamp. Requires the `admin:configure` permission.",
+        "operationId": "revokeApiKey",
+        "security": [{ "bearerAuth": [] }],
+        "x-required-permission": "admin:configure",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RevokeApiKeyInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Key revoked",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApiKey" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/api/admin/step-up/challenges": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Issue a step-up verification challenge",
+        "description": "Issues a short-lived, single-use challenge bound to the requested action and the SHA-256 hash of the canonical request payload. The challenge expires after `STEP_UP_CHALLENGE_TTL_SECONDS` (default 300 seconds). The caller confirms the challenge out-of-band (second factor) and then submits the confirmation token with the high-impact request. Requires the `admin:operate` permission.",
+        "operationId": "createStepUpChallenge",
+        "security": [{ "bearerAuth": [] }],
+        "x-required-permission": "admin:operate",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/StepUpChallengeInput" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Challenge issued",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StepUpChallenge" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/api/admin/step-up/challenges/{challengeId}/confirm": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ChallengeIdParam" }
+      ],
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Confirm a step-up verification challenge",
+        "description": "Confirms the challenge with the second-factor code. On success the challenge becomes a single-use confirmation token bound to the original action and payload hash. Confirmation fails with `410 Gone` when the challenge has expired, `409 Conflict` when it was already used, and `422 Unprocessable Entity` when the action or payload hash does not match the request being authorized. Requires the `admin:operate` permission.",
+        "operationId": "confirmStepUpChallenge",
+        "security": [{ "bearerAuth": [] }],
+        "x-required-permission": "admin:operate",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/StepUpConfirmationInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Challenge confirmed; confirmation token issued",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StepUpConfirmation" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "410": { "$ref": "#/components/responses/Gone" },
+          "422": { "$ref": "#/components/responses/UnprocessableEntity" }
+        }
+      }
+    },
+    "/api/admin/contracts/{contractId}/upgrade": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ContractIdParam" }
+      ],
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Upgrade a contract to a new WASM hash",
+        "description": "High-impact configuration change. Requires the `admin:configure` permission and a confirmed, single-use step-up challenge bound to the `contract.upgrade` action and the SHA-256 hash of the canonical request payload. Missing step-up yields `428 Precondition Required`; expired challenges yield `410 Gone`; reused challenges yield `409 Conflict`; mismatched action or payload hash yields `422 Unprocessable Entity`. Every attempt, successful or not, is recorded in the audit log with the actor, action, payload hash, and challenge id.",
+        "operationId": "upgradeContract",
+        "security": [{ "bearerAuth": [] }],
+        "x-required-permission": "admin:configure",
+        "x-requires-step-up": true,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ContractUpgradeInput" }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Upgrade accepted for execution",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ContractUpgradeResult" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "410": { "$ref": "#/components/responses/Gone" },
+          "422": { "$ref": "#/components/responses/UnprocessableEntity" },
+          "428": { "$ref": "#/components/responses/StepUpRequired" }
         }
       }
     }
@@ -438,6 +625,27 @@
         "required": true,
         "description": "Token identifier (asset code or contract address)",
         "schema": { "type": "string" }
+      },
+      "ApiKeyIdParam": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "API key identifier",
+        "schema": { "type": "string" }
+      },
+      "ChallengeIdParam": {
+        "name": "challengeId",
+        "in": "path",
+        "required": true,
+        "description": "Step-up challenge identifier",
+        "schema": { "type": "string" }
+      },
+      "ContractIdParam": {
+        "name": "contractId",
+        "in": "path",
+        "required": true,
+        "description": "Contract identifier",
+        "schema": { "type": "string" }
       }
     },
     "responses": {
@@ -488,7 +696,19 @@
         }
       },
       "Gone": {
-        "description": "Reservation window expired; the tag can no longer be restored",
+        "description": "Reservation window expired or step-up challenge expired; the operation can no longer proceed",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+        }
+      },
+      "UnprocessableEntity": {
+        "description": "Step-up challenge action or payload hash does not match the request being authorized",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+        }
+      },
+      "StepUpRequired": {
+        "description": "A confirmed step-up challenge is required for this high-impact action",
         "content": {
           "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
         }
@@ -574,7 +794,12 @@
                   "RATE_LIMITED",
                   "INTERNAL_ERROR",
                   "UPSTREAM_ERROR",
-                  "SERVICE_UNAVAILABLE"
+                  "SERVICE_UNAVAILABLE",
+                  "INSUFFICIENT_PERMISSION",
+                  "STEP_UP_REQUIRED",
+                  "STEP_UP_CHALLENGE_EXPIRED",
+                  "STEP_UP_CHALLENGE_REUSED",
+                  "STEP_UP_CHALLENGE_MISMATCH"
                 ]
               },
               "message": { "type": "string" },
@@ -639,6 +864,127 @@
             "format": "date-time",
             "description": "The `deletedAt` value observed at deletion time; used as restoration proof. A mismatch is rejected with 409 Conflict."
           }
+        }
+      },
+      "AdminPermission": {
+        "type": "string",
+        "description": "Policy-based administrative permission. `admin:read` grants read-only access, `admin:operate` grants operational actions, and `admin:configure` grants configuration-changing actions. Higher scopes do not implicitly grant lower ones unless the role policy states so.",
+        "enum": ["admin:read", "admin:operate", "admin:configure"]
+      },
+      "ApiKey": {
+        "type": "object",
+        "required": ["id", "prefix", "status", "createdAt"],
+        "properties": {
+          "id": { "type": "string" },
+          "prefix": { "type": "string", "description": "Non-secret key prefix for identification" },
+          "status": { "type": "string", "enum": ["active", "rotating", "revoked", "expired"] },
+          "predecessorId": { "type": "string", "nullable": true, "description": "Key this key replaced, if any" },
+          "successorId": { "type": "string", "nullable": true, "description": "Key that replaced this key, if any" },
+          "overlapEndsAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "End of the rotation overlap window; the predecessor is revoked at this instant"
+          },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "revokedAt": { "type": "string", "format": "date-time" },
+          "revokedBy": { "type": "string", "description": "Actor that revoked the key" },
+          "revocationReason": { "type": "string" }
+        }
+      },
+      "RotateApiKeyInput": {
+        "type": "object",
+        "properties": {
+          "overlapHours": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 168,
+            "description": "Requested overlap window in hours. Capped by the server-side `API_KEY_ROTATION_MAX_OVERLAP_HOURS` setting."
+          },
+          "stepUpToken": {
+            "type": "string",
+            "description": "Single-use confirmation token from a confirmed step-up challenge bound to this action and payload hash"
+          }
+        }
+      },
+      "ApiKeyRotationResult": {
+        "type": "object",
+        "required": ["predecessor", "successor", "key"],
+        "properties": {
+          "predecessor": { "$ref": "#/components/schemas/ApiKey" },
+          "successor": { "$ref": "#/components/schemas/ApiKey" },
+          "key": {
+            "type": "string",
+            "description": "Raw key material. Returned exactly once at rotation time and never again; later reads are redacted."
+          },
+          "overlapEndsAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "RevokeApiKeyInput": {
+        "type": "object",
+        "required": ["reason"],
+        "properties": {
+          "reason": { "type": "string", "minLength": 1, "maxLength": 500 }
+        }
+      },
+      "StepUpChallengeInput": {
+        "type": "object",
+        "required": ["action", "payloadHash"],
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "High-impact action being authorized",
+            "enum": ["contract.upgrade", "treasury.change", "bulk.export", "api_key.rotate"]
+          },
+          "payloadHash": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "description": "SHA-256 hex digest of the canonical request payload"
+          }
+        }
+      },
+      "StepUpChallenge": {
+        "type": "object",
+        "required": ["challengeId", "action", "payloadHash", "expiresAt"],
+        "properties": {
+          "challengeId": { "type": "string" },
+          "action": { "type": "string" },
+          "payloadHash": { "type": "string" },
+          "expiresAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "StepUpConfirmationInput": {
+        "type": "object",
+        "required": ["code"],
+        "properties": {
+          "code": { "type": "string", "description": "Second-factor verification code" }
+        }
+      },
+      "StepUpConfirmation": {
+        "type": "object",
+        "required": ["stepUpToken", "action", "payloadHash", "expiresAt"],
+        "properties": {
+          "stepUpToken": { "type": "string", "description": "Single-use confirmation token to submit with the high-impact request" },
+          "action": { "type": "string" },
+          "payloadHash": { "type": "string" },
+          "expiresAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "ContractUpgradeInput": {
+        "type": "object",
+        "required": ["wasmHash", "stepUpToken"],
+        "properties": {
+          "wasmHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+          "stepUpToken": { "type": "string" }
+        }
+      },
+      "ContractUpgradeResult": {
+        "type": "object",
+        "required": ["contractId", "wasmHash", "status", "auditId"],
+        "properties": {
+          "contractId": { "type": "string" },
+          "wasmHash": { "type": "string" },
+          "status": { "type": "string", "enum": ["accepted", "in_progress", "succeeded", "failed"] },
+          "auditId": { "type": "string", "description": "Audit record correlating actor, action, payload hash, and challenge id" }
         }
       }
     }

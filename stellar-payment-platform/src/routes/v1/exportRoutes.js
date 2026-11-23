@@ -9,6 +9,8 @@ const { ApiError } = require('../../errors');
 const { logger } = require('../../logger');
 const { asyncHandler } = require('../../middleware/asyncHandler');
 const { fetchFirstPaymentsPage, wrapPageWithBreaker } = require('../../services/stellarService');
+const { requireStepUp } = require('../../services/stepUpService');
+const { hashPayload } = require('../../services/payloadHash');
 
 const router = express.Router();
 
@@ -18,6 +20,9 @@ const PAGE_SIZE = 200;
 
 // A hard page ceiling stops a single request streaming forever.
 const MAX_PAGES = Number(process.env.EXPORT_MAX_PAGES) || 500;
+
+// Step-up action identifier bound to the export challenge.
+const STEP_UP_ACTION = 'export.transactions';
 
 const COLUMNS = [
   'id',
@@ -124,6 +129,26 @@ router.get(
       return next(new ApiError('INVALID_INPUT', 'Invalid Stellar account'));
     }
 
+    // Bulk exports are a high-impact action: require a short-lived, single-use
+    // step-up challenge bound to this action and to the normalized query.
+    // Missing, expired, reused or mismatched challenges are rejected here,
+    // before any Horizon call or response bytes are produced.
+    const payloadHash = hashPayload({ address, order: order || 'asc' });
+    try {
+      await requireStepUp(req, { action: STEP_UP_ACTION, payloadHash });
+    } catch (err) {
+      logger.warn(
+        `[Correlation ID: ${req.correlationId}] Step-up verification failed for ` +
+          `${STEP_UP_ACTION} (payload ${payloadHash}): ${err?.code || 'UNKNOWN'}`,
+      );
+      return next(err);
+    }
+
+    logger.info(
+      `[Correlation ID: ${req.correlationId}] Step-up verified for ${STEP_UP_ACTION} ` +
+        `(payload ${payloadHash})`,
+    );
+
     let page;
     try {
       page = await fetchFirstPaymentsPage({ address, order, pageSize: PAGE_SIZE });
@@ -215,6 +240,7 @@ router.get(
 );
 
 module.exports = router;
+module.exports.STEP_UP_ACTION = STEP_UP_ACTION;
 module.exports.COLUMNS = COLUMNS;
 module.exports.escapeField = escapeField;
 module.exports.normalize = normalize;

@@ -348,4 +348,7 @@ module.exports = {
   sanitized,
   ...require('./userSchemas'),
   ...require('./adminSchemas'),
+  ...require('./adminRoleSchemas'),
+  ...require('./stepUpSchemas'),
+  ...require('./apiKeyRotationSchemas'),
 };

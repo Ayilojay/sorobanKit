@@ -25,6 +25,21 @@ const SENSITIVE_KEYS = Object.freeze([
   'access_token',
   'refreshtoken',
   'refresh_token',
+  'challenge',
+  'challengeid',
+  'challenge_id',
+  'challengesecret',
+  'challenge_secret',
+  'stepup',
+  'step_up',
+  'stepuptoken',
+  'step_up_token',
+  'otp',
+  'totp',
+  'rawkey',
+  'raw_key',
+  'keymaterial',
+  'key_material',
 ]);
 
 const REDACTED_PLACEHOLDER = '[REDACTED]';
@@ -105,6 +120,75 @@ const extractIpAddress = (req) => {
 };
 
 /**
+ * Extracts the resolved permission and actor role attached to the request by
+ * the authorization middleware. These are populated by policy-based role
+ * resolution (see admin authorization middleware) and are safe to persist.
+ *
+ * @param {import('express').Request} req
+ * @returns {{ permission: string|null, role: string|null }}
+ */
+const extractAuthorizationContext = (req) => {
+  const permission =
+    req.authz?.permission || req.permission || req.resolvedPermission || null;
+  const role = req.authz?.role || req.user?.role || req.adminRole || null;
+  return {
+    permission: permission ? String(permission) : null,
+    role: role ? String(role) : null,
+  };
+};
+
+/**
+ * Extracts step-up verification evidence attached to the request.
+ *
+ * Only the challenge identifier is persisted — never the challenge secret or
+ * any raw verification material.
+ *
+ * @param {import('express').Request} req
+ * @returns {{ stepUpChallengeId: string|null, stepUpVerified: boolean|null }}
+ */
+const extractStepUpContext = (req) => {
+  const stepUp = req.stepUp || req.authz?.stepUp || null;
+  const challengeId = stepUp?.challengeId || stepUp?.id || req.stepUpChallengeId || null;
+  const verified =
+    typeof stepUp?.verified === 'boolean'
+      ? stepUp.verified
+      : typeof req.stepUpVerified === 'boolean'
+        ? req.stepUpVerified
+        : null;
+  return {
+    stepUpChallengeId: challengeId ? String(challengeId) : null,
+    stepUpVerified: verified,
+  };
+};
+
+/**
+ * Derives the outcome and failure reason for an audited request.
+ *
+ * @param {import('express').Request} req
+ * @param {import('express').Response} res
+ * @returns {{ outcome: string, failureReason: string|null }}
+ */
+const extractOutcome = (req, res) => {
+  const statusCode = res.statusCode;
+  const explicitReason =
+    req.auditFailureReason || req.authz?.failureReason || req.stepUp?.failureReason || null;
+
+  if (statusCode >= 200 && statusCode < 400) {
+    return { outcome: 'success', failureReason: null };
+  }
+  if (statusCode === 401 || statusCode === 403) {
+    return { outcome: 'denied', failureReason: explicitReason ? String(explicitReason) : null };
+  }
+  if (statusCode === 409) {
+    return { outcome: 'conflict', failureReason: explicitReason ? String(explicitReason) : null };
+  }
+  if (statusCode === 429) {
+    return { outcome: 'throttled', failureReason: explicitReason ? String(explicitReason) : null };
+  }
+  return { outcome: 'failure', failureReason: explicitReason ? String(explicitReason) : null };
+};
+
+/**
  * Creates Express middleware for audit logging mutating requests.
  *
  * @param {object} [opts]
@@ -129,6 +213,8 @@ const createAuditLogMiddleware = (opts = {}) => {
     const path = req.originalUrl || req.url || req.path;
     const action = `${method} ${req.baseUrl || ''}${req.path || ''}`.trim() || `${method} ${path}`;
     const userAgent = req.headers['user-agent'] || null;
+    const { permission, role } = extractAuthorizationContext(req);
+    const { stepUpChallengeId, stepUpVerified } = extractStepUpContext(req);
 
     // Snapshot redacted body at request time
     let redactedPayload = null;
@@ -146,6 +232,10 @@ const createAuditLogMiddleware = (opts = {}) => {
       setImmediate(async () => {
         try {
           if (prisma?.auditLog?.create) {
+            const { outcome, failureReason } = extractOutcome(req, res);
+            const payloadHash =
+              req.auditPayloadHash || req.authz?.payloadHash || req.stepUp?.payloadHash || null;
+
             await prisma.auditLog.create({
               data: {
                 action,
@@ -156,6 +246,13 @@ const createAuditLogMiddleware = (opts = {}) => {
                 userAgent,
                 statusCode: res.statusCode,
                 payload: redactedPayload,
+                permission,
+                role,
+                stepUpChallengeId,
+                stepUpVerified,
+                payloadHash: payloadHash ? String(payloadHash) : null,
+                outcome,
+                failureReason,
               },
             });
           }
@@ -177,6 +274,9 @@ module.exports = {
   redactSensitiveData,
   extractUserId,
   extractIpAddress,
+  extractAuthorizationContext,
+  extractStepUpContext,
+  extractOutcome,
   SENSITIVE_KEYS,
   REDACTED_PLACEHOLDER,
 };
