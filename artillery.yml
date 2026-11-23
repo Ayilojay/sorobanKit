@@ -55,3 +55,174 @@ scenarios:
           url: "/transactions/export"
           headers:
             X-Api-Key: "{{ apiKey }}"
+
+  # Sustained-load benchmark for critical user journeys (#479).
+  # Exercises registration, federation lookup, payment initiation and history
+  # under a realistic request mix. Phases sustain load over time so tail
+  # latency, errors, memory, pool usage and upstream calls can be observed.
+  - name: "Critical journeys sustained benchmark"
+    weight: 1
+    flow:
+      # Registration journey
+      - post:
+          url: "/register"
+          json:
+            username: "bench-{{ $randomString() }}"
+            address: "GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ"
+          capture:
+            - json: "$.id"
+              as: "registrationId"
+          expect:
+            - statusCode: 201
+      # Federation lookup journey
+      - get:
+          url: "/federation"
+          qs:
+            q: "alice*localhost"
+            type: "name"
+          expect:
+            - statusCode: 200
+      # Payment initiation journey
+      - post:
+          url: "/payments"
+          json:
+            source: "GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ"
+            destination: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+            amount: "1.0000000"
+            asset: "XLM"
+          capture:
+            - json: "$.id"
+              as: "paymentId"
+          expect:
+            - statusCode: 201
+      # History journey
+      - get:
+          url: "/transactions"
+          qs:
+            address: "GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ"
+            limit: 20
+          expect:
+            - statusCode: 200
+
+config:
+  target: "http://localhost:5000"
+  phases:
+    - duration: 60
+      arrivalRate: 100
+      rampTo: 100
+      name: "Scale to 100 concurrent virtual users"
+    # Sustained-load benchmark phases (#479): hold steady load long enough to
+    # observe tail latency, error rates, memory, pool usage and upstream calls.
+    - duration: 300
+      arrivalRate: 50
+      name: "Sustained benchmark - steady state"
+    - duration: 120
+      arrivalRate: 50
+      rampTo: 150
+      name: "Sustained benchmark - ramp to peak"
+    - duration: 180
+      arrivalRate: 150
+      name: "Sustained benchmark - peak hold"
+    - duration: 120
+      arrivalRate: 150
+      rampTo: 25
+      name: "Sustained benchmark - recovery ramp down"
+  defaults:
+    headers:
+      accept: "application/json"
+  variables:
+    apiKey: "{{ $processEnvironment.TEST_API_KEY }}"
+before:
+  flow:
+    - log: "Running load tests with TEST_API_KEY from environment"
+scenarios:
+  - name: "Address lookup load"
+    weight: 3
+    flow:
+      - get:
+          url: "/lookup"
+          qs:
+            address: "GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ"
+  - name: "Federation lookup load"
+    weight: 1
+    flow:
+      - get:
+          url: "/federation"
+          qs:
+            q: "alice*localhost"
+            type: "name"
+  - name: "Health check load"
+    weight: 1
+    flow:
+      - get:
+          url: "/health"
+  - name: "Admin routing stats load"
+    weight: 1
+    flow:
+      - get:
+          url: "/admin/stats/routing"
+          headers:
+            X-Api-Key: "{{ apiKey }}"
+  - name: "Admin audit logs load"
+    weight: 1
+    flow:
+      - get:
+          url: "/admin/audit-logs"
+          headers:
+            X-Api-Key: "{{ apiKey }}"
+  - name: "Admin transactions export load"
+    weight: 1
+    flow:
+      - get:
+          url: "/transactions/export"
+          headers:
+            X-Api-Key: "{{ apiKey }}"
+
+  # Sustained-load benchmark for critical user journeys (#479).
+  # Exercises registration, federation lookup, payment initiation and history
+  # under a realistic request mix. The steady-state, peak and recovery phases
+  # above sustain load over time so tail latency, errors, memory, pool usage
+  # and upstream calls can be observed across the run.
+  - name: "Critical journeys sustained benchmark"
+    weight: 1
+    flow:
+      # Registration journey
+      - post:
+          url: "/register"
+          json:
+            username: "bench-{{ $randomString() }}"
+            address: "GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ"
+          capture:
+            - json: "$.id"
+              as: "registrationId"
+          expect:
+            - statusCode: 201
+      # Federation lookup journey
+      - get:
+          url: "/federation"
+          qs:
+            q: "alice*localhost"
+            type: "name"
+          expect:
+            - statusCode: 200
+      # Payment initiation journey
+      - post:
+          url: "/payments"
+          json:
+            source: "GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ"
+            destination: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+            amount: "1.0000000"
+            asset: "XLM"
+          capture:
+            - json: "$.id"
+              as: "paymentId"
+          expect:
+            - statusCode: 201
+      # History journey
+      - get:
+          url: "/transactions"
+          qs:
+            address: "GAPUQZH3WZUXHEMUGZN5ZYU4D4GHCFEMOGUINU6MF345GBD2QXNYYIEQ"
+            limit: 20
+          expect:
+            - statusCode: 200

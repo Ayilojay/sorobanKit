@@ -100,17 +100,37 @@ model ApprovedOrigin {
 }
 
 // Payment records for routing, statistics, and auditing.
+// #384 — Monetary values are stored as exact integer "units" (the smallest
+// indivisible unit of the asset) rather than floating point. `amountUnits`
+// and `feeUnits` are the canonical values; `assetPrecision` records how many
+// decimal places the asset uses (7 for XLM and most Stellar assets) so the
+// units can be converted back to a human-readable decimal without loss.
+// Rounding policy: values are rounded half-up to `assetPrecision` decimal
+// places before being converted to units; anything finer than one unit is
+// rejected at the API boundary rather than silently truncated.
+//
+// #385 — `network` identifies the Stellar network a transaction belongs to
+// (e.g. "testnet", "pubnet"). The same transaction hash can legitimately
+// exist on distinct networks, so uniqueness is enforced on the composite
+// (network, transactionHash) pair instead of the hash alone.
 model Payment {
   id              String   @id @default(uuid())
   createdAt       DateTime @default(now()) @map("created_at")
   fromAddress     String   @map("from_address")
   toAddress       String   @map("to_address")
-  amount          Float
-  fee             Float    @default(0)
+  amountUnits     BigInt   @map("amount_units")
+  feeUnits        BigInt   @default(0) @map("fee_units")
+  assetPrecision  Int      @default(7) @map("asset_precision")
   assetCode       String?  @map("asset_code")
   transactionHash String?  @map("transaction_hash")
+  // Backfill policy: existing rows are assigned the default network
+  // ("testnet") by the expand/backfill migration, since all pre-existing
+  // records were ingested from the testnet deployment.
+  network         String   @default("testnet")
   status          String   @default("completed")
 
+  @@unique([network, transactionHash])
+  @@index([network])
   @@index([createdAt])
   @@index([fromAddress])
   @@index([toAddress])
@@ -252,4 +272,43 @@ model ActivityLog {
 
   @@index([userId, createdAt])
   @@map("activity_logs")
+}
+
+// #375 — Durable background export jobs. Large administrative exports are
+// created as rows here and processed by a bounded-concurrency worker instead
+// of being streamed inline in the request. The row is the source of truth for
+// ownership checks, progress reporting, cancellation and the expiring
+// download artifact.
+//
+// Lifecycle: pending → running → completed | failed | cancelled
+//   - `progress` / `totalRows` drive progress reporting.
+//   - `cancelledAt` is set when an owner cancels; the worker observes it and
+//     stops streaming to the artifact.
+//   - `artifactPath` / `artifactBytes` point at the streamed artifact in
+//     artifact storage; `expiresAt` bounds how long it can be downloaded and
+//     is swept by the cleanup job.
+model ExportJob {
+  id            String    @id @default(uuid())
+  ownerId       String    @map("owner_id")
+  status        String    @default("pending")
+  format        String
+  filters       Json
+  progress      Int       @default(0)
+  totalRows     Int?      @map("total_rows")
+  artifactPath  String?   @map("artifact_path")
+  artifactBytes Int?      @map("artifact_bytes")
+  error         String?
+  cancelledAt   DateTime? @map("cancelled_at")
+  expiresAt     DateTime? @map("expires_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  @@index([ownerId])
+  @@index([status])
+  @@index([expiresAt])
+  // Ownership-scoped listing: WHERE owner_id = ? AND status = ?
+  @@index([ownerId, status])
+  // Worker polling and cleanup: WHERE status = ? ORDER BY created_at
+  @@index([status, createdAt])
+  @@map("export_jobs")
 }

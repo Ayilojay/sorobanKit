@@ -110,6 +110,160 @@
       "response": []
     },
     {
+      "name": "Admin - Create Export Job",
+      "request": {
+        "method": "POST",
+        "header": [
+          {"key": "Content-Type", "value": "application/json"},
+          {"key": "X-Admin-API-Key", "value": "{{adminApiKey}}", "description": "Admin API key identifying the job owner."}
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"address\": \"GAE2S2XKT6H2A4ZJ6K4D6K4D6K4D6K4D6K4D6K4D6K4D6K4D6K4D6K4\",\n  \"format\": \"csv\"\n}",
+          "options": {"raw": {"language": "json"}}
+        },
+        "url": {"raw": "{{baseUrl}}/admin/exports", "host": ["{{baseUrl}}"], "path": ["admin", "exports"]},
+        "description": "Creates a durable, cancellable background export job for a Stellar address.\n\nThe request returns immediately with a job id; the export is processed asynchronously by a bounded worker pool and streamed to artifact storage instead of being buffered in memory.\n\nResponses:\n- 202 Accepted: Job created. Poll `GET /admin/exports/{jobId}` for progress.\n- 400 BAD_REQUEST: Invalid address or format.\n- 401 UNAUTHORIZED: Missing or invalid admin API key.\n- 429 TOO_MANY_REQUESTS: Too many concurrent export jobs for this owner."
+      },
+      "response": [
+        {
+          "name": "202 Accepted",
+          "originalRequest": {"method": "POST", "header": [{"key": "Content-Type", "value": "application/json"}, {"key": "X-Admin-API-Key", "value": "{{adminApiKey}}"}], "url": {"raw": "{{baseUrl}}/admin/exports", "host": ["{{baseUrl}}"], "path": ["admin", "exports"]}},
+          "status": "Accepted",
+          "code": 202,
+          "_postman_previewlanguage": "json",
+          "header": [{"key": "Content-Type", "value": "application/json"}],
+          "body": "{\n  \"status\": \"success\",\n  \"data\": {\n    \"jobId\": \"exp_01HZX8Q2K7YV3M4N5P6R7S8T9V\",\n    \"state\": \"queued\",\n    \"progress\": 0,\n    \"createdAt\": \"2024-01-01T00:00:00.000Z\",\n    \"expiresAt\": null,\n    \"downloadUrl\": null\n  }\n}"
+        },
+        {
+          "name": "401 Unauthorized",
+          "originalRequest": {"method": "POST", "header": [{"key": "Content-Type", "value": "application/json"}], "url": {"raw": "{{baseUrl}}/admin/exports", "host": ["{{baseUrl}}"], "path": ["admin", "exports"]}},
+          "status": "Unauthorized",
+          "code": 401,
+          "_postman_previewlanguage": "json",
+          "header": [{"key": "Content-Type", "value": "application/json"}],
+          "body": "{\n  \"status\": \"error\",\n  \"message\": \"Missing or invalid admin API key\"\n}"
+        }
+      ]
+    },
+    {
+      "name": "Admin - Get Export Job Status",
+      "request": {
+        "method": "GET",
+        "header": [
+          {"key": "X-Admin-API-Key", "value": "{{adminApiKey}}", "description": "Must match the key that created the job (ownership check)."}
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/admin/exports/{{exportJobId}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["admin", "exports", "{{exportJobId}}"]
+        },
+        "description": "Returns the current state and progress of an export job.\n\nStates: `queued`, `running`, `completed`, `failed`, `cancelled`, `expired`.\n\nResponses:\n- 200 OK: Job status. `progress` is a percentage (0-100). When `completed`, `downloadUrl` and `expiresAt` are populated.\n- 403 FORBIDDEN: The job belongs to a different owner.\n- 404 NOT_FOUND: Unknown job id."
+      },
+      "response": [
+        {
+          "name": "200 OK (running)",
+          "originalRequest": {"method": "GET", "header": [{"key": "X-Admin-API-Key", "value": "{{adminApiKey}}"}], "url": {"raw": "{{baseUrl}}/admin/exports/{{exportJobId}}", "host": ["{{baseUrl}}"], "path": ["admin", "exports", "{{exportJobId}}"]}},
+          "status": "OK",
+          "code": 200,
+          "_postman_previewlanguage": "json",
+          "header": [{"key": "Content-Type", "value": "application/json"}],
+          "body": "{\n  \"status\": \"success\",\n  \"data\": {\n    \"jobId\": \"exp_01HZX8Q2K7YV3M4N5P6R7S8T9V\",\n    \"state\": \"running\",\n    \"progress\": 42,\n    \"createdAt\": \"2024-01-01T00:00:00.000Z\",\n    \"expiresAt\": null,\n    \"downloadUrl\": null\n  }\n}"
+        },
+        {
+          "name": "200 OK (completed)",
+          "originalRequest": {"method": "GET", "header": [{"key": "X-Admin-API-Key", "value": "{{adminApiKey}}"}], "url": {"raw": "{{baseUrl}}/admin/exports/{{exportJobId}}", "host": ["{{baseUrl}}"], "path": ["admin", "exports", "{{exportJobId}}"]}},
+          "status": "OK",
+          "code": 200,
+          "_postman_previewlanguage": "json",
+          "header": [{"key": "Content-Type", "value": "application/json"}],
+          "body": "{\n  \"status\": \"success\",\n  \"data\": {\n    \"jobId\": \"exp_01HZX8Q2K7YV3M4N5P6R7S8T9V\",\n    \"state\": \"completed\",\n    \"progress\": 100,\n    \"createdAt\": \"2024-01-01T00:00:00.000Z\",\n    \"expiresAt\": \"2024-01-01T01:00:00.000Z\",\n    \"downloadUrl\": \"{{baseUrl}}/admin/exports/exp_01HZX8Q2K7YV3M4N5P6R7S8T9V/download\"\n  }\n}"
+        },
+        {
+          "name": "403 Forbidden",
+          "originalRequest": {"method": "GET", "header": [{"key": "X-Admin-API-Key", "value": "{{adminApiKey}}"}], "url": {"raw": "{{baseUrl}}/admin/exports/{{exportJobId}}", "host": ["{{baseUrl}}"], "path": ["admin", "exports", "{{exportJobId}}"]}},
+          "status": "Forbidden",
+          "code": 403,
+          "_postman_previewlanguage": "json",
+          "header": [{"key": "Content-Type", "value": "application/json"}],
+          "body": "{\n  \"status\": \"error\",\n  \"message\": \"Export job does not belong to this owner\"\n}"
+        }
+      ]
+    },
+    {
+      "name": "Admin - Cancel Export Job",
+      "request": {
+        "method": "DELETE",
+        "header": [
+          {"key": "X-Admin-API-Key", "value": "{{adminApiKey}}", "description": "Must match the key that created the job (ownership check)."}
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/admin/exports/{{exportJobId}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["admin", "exports", "{{exportJobId}}"]
+        },
+        "description": "Requests cancellation of a queued or running export job. Cancellation is cooperative: the worker stops at the next checkpoint and any partial artifact is discarded.\n\nResponses:\n- 200 OK: Job cancelled (state becomes `cancelled`).\n- 403 FORBIDDEN: The job belongs to a different owner.\n- 404 NOT_FOUND: Unknown job id.\n- 409 CONFLICT: The job already finished (`completed`, `failed` or `expired`) and cannot be cancelled."
+      },
+      "response": [
+        {
+          "name": "200 OK",
+          "originalRequest": {"method": "DELETE", "header": [{"key": "X-Admin-API-Key", "value": "{{adminApiKey}}"}], "url": {"raw": "{{baseUrl}}/admin/exports/{{exportJobId}}", "host": ["{{baseUrl}}"], "path": ["admin", "exports", "{{exportJobId}}"]}},
+          "status": "OK",
+          "code": 200,
+          "_postman_previewlanguage": "json",
+          "header": [{"key": "Content-Type", "value": "application/json"}],
+          "body": "{\n  \"status\": \"success\",\n  \"data\": {\n    \"jobId\": \"exp_01HZX8Q2K7YV3M4N5P6R7S8T9V\",\n    \"state\": \"cancelled\",\n    \"progress\": 42,\n    \"createdAt\": \"2024-01-01T00:00:00.000Z\",\n    \"expiresAt\": null,\n    \"downloadUrl\": null\n  }\n}"
+        },
+        {
+          "name": "409 Conflict",
+          "originalRequest": {"method": "DELETE", "header": [{"key": "X-Admin-API-Key", "value": "{{adminApiKey}}"}], "url": {"raw": "{{baseUrl}}/admin/exports/{{exportJobId}}", "host": ["{{baseUrl}}"], "path": ["admin", "exports", "{{exportJobId}}"]}},
+          "status": "Conflict",
+          "code": 409,
+          "_postman_previewlanguage": "json",
+          "header": [{"key": "Content-Type", "value": "application/json"}],
+          "body": "{\n  \"status\": \"error\",\n  \"message\": \"Export job has already finished and cannot be cancelled\"\n}"
+        }
+      ]
+    },
+    {
+      "name": "Admin - Download Export Artifact",
+      "request": {
+        "method": "GET",
+        "header": [
+          {"key": "X-Admin-API-Key", "value": "{{adminApiKey}}", "description": "Must match the key that created the job (ownership check)."}
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/admin/exports/{{exportJobId}}/download",
+          "host": ["{{baseUrl}}"],
+          "path": ["admin", "exports", "{{exportJobId}}", "download"]
+        },
+        "description": "Streams the completed export artifact from artifact storage.\n\nResponses:\n- 200 OK: Streamed file body with `Content-Disposition: attachment`.\n- 403 FORBIDDEN: The job belongs to a different owner.\n- 404 NOT_FOUND: Unknown job id.\n- 409 CONFLICT: The job has not completed yet.\n- 410 GONE: The artifact has expired and been purged; create a new export job."
+      },
+      "response": [
+        {
+          "name": "200 OK",
+          "originalRequest": {"method": "GET", "header": [{"key": "X-Admin-API-Key", "value": "{{adminApiKey}}"}], "url": {"raw": "{{baseUrl}}/admin/exports/{{exportJobId}}/download", "host": ["{{baseUrl}}"], "path": ["admin", "exports", "{{exportJobId}}", "download"]}},
+          "status": "OK",
+          "code": 200,
+          "_postman_previewlanguage": "text",
+          "header": [
+            {"key": "Content-Type", "value": "text/csv"},
+            {"key": "Content-Disposition", "value": "attachment; filename=\"export-exp_01HZX8Q2K7YV3M4N5P6R7S8T9V.csv\""}
+          ],
+          "body": "id,address,amount,asset,created_at\ntx_1,GAE2S2XKT6H2A4ZJ6K4D6K4D6K4D6K4D6K4D6K4D6K4D6K4D6K4D6K4,10.0,XLM,2024-01-01T00:00:00.000Z\n"
+        },
+        {
+          "name": "410 Gone",
+          "originalRequest": {"method": "GET", "header": [{"key": "X-Admin-API-Key", "value": "{{adminApiKey}}"}], "url": {"raw": "{{baseUrl}}/admin/exports/{{exportJobId}}/download", "host": ["{{baseUrl}}"], "path": ["admin", "exports", "{{exportJobId}}", "download"]}},
+          "status": "Gone",
+          "code": 410,
+          "_postman_previewlanguage": "json",
+          "header": [{"key": "Content-Type", "value": "application/json"}],
+          "body": "{\n  \"status\": \"error\",\n  \"message\": \"Export artifact has expired\"\n}"
+        }
+      ]
+    },
+    {
       "name": "v2 - Lookup User (API-Version header)",
       "request": {
         "method": "GET",
@@ -203,6 +357,7 @@
   "variable": [
     {"key": "baseUrl", "value": "http://localhost:5000", "type": "string"},
     {"key": "adminApiKey", "value": "your-admin-api-key", "type": "string"},
+    {"key": "exportJobId", "value": "exp_01HZX8Q2K7YV3M4N5P6R7S8T9V", "type": "string"},
     {"key": "stellarSignature", "value": "your-stellar-signature", "type": "string"}
   ]
 }

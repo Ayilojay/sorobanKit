@@ -10,6 +10,52 @@ requests.
 2. Install dependencies with your package manager of choice.
 3. Make your change, keeping the diff focused on the issue you are solving.
 
+### One-command local bootstrap
+
+For a reproducible local environment, use the supported bootstrap command
+instead of wiring services up by hand:
+
+```sh
+./scripts/bootstrap.sh
+```
+
+The bootstrap path:
+
+- **Validates tool versions.** It checks that the required toolchain
+  (package manager, runtime, and database client) is installed and meets the
+  minimum versions. If a prerequisite is missing or too old, it exits with an
+  actionable message naming the tool, the version found, and the version
+  required.
+- **Starts isolated services.** It brings up local-only services (database and
+  supporting dependencies) in an isolated namespace so they do not collide
+  with other local projects.
+- **Applies migrations.** It runs the pending database migrations against the
+  local database.
+- **Reports readiness.** On success it prints a readiness summary listing each
+  service and its status, so you can confirm the environment is usable before
+  running tests.
+
+The bootstrap refuses to run against production resources. It only targets the
+local, isolated configuration; if it detects a production endpoint it stops
+without making changes. Re-running the command is safe and idempotent.
+
+If bootstrap fails, read the reported prerequisite or service error, fix the
+underlying cause, and re-run. Do not work around a failed prerequisite check by
+pointing the bootstrap at shared or production resources.
+
+## Security and operations references
+
+Before changing wallet signing, admin actions, webhooks, persistence, RPC, or
+contract governance, review the published threat model. It documents the
+assets, trust boundaries, attacker capabilities, mitigations, and owners for
+each of those areas.
+
+If you are changing payment or infrastructure behavior, also review the
+incident runbooks. They describe safe procedures for delayed settlement,
+webhook backlog, database failover, and contract pause events, including
+diagnostics, escalation, rollback, dashboard links, and tested commands. Keep
+the runbooks up to date when your change affects those procedures.
+
 ## Running checks
 
 Before opening a pull request, run the focused workspace tests and the
@@ -36,55 +82,35 @@ supported state versions, keep the following in mind:
   boundaries, expected failures (including unsupported layouts), and
   recovery or concurrency behavior where relevant.
 
-## Expand-contract migrations
+## Preview environments for pull requests
 
-Schema changes must be safe for rolling deploys, where old and new application
-versions run side by side. Follow the expand-contract workflow:
+Pull requests can be provisioned with an isolated, ephemeral preview
+environment containing the API and dashboard. Previews are meant for manual
+verification and review; they are never connected to production.
 
-1. **Expand.** Add the new schema additively: new nullable columns, new tables,
-   new indexes (created concurrently where possible). Nothing in this phase may
-   break the currently deployed version.
-2. **Dual-read/write.** Update the application to write to both the old and new
-   locations and to read from the new location with a fallback to the old one.
-   Deploy this before relying on the new schema.
-3. **Backfill.** Populate the new columns or tables from existing data in
-   bounded, resumable batches. Backfills must be idempotent and safe to rerun.
-4. **Contract.** Only after all old application versions are drained may you
-   remove the old columns, tables, or constraints. Destructive changes belong
-   in a separate, later migration.
-
-### Migration lint guard
-
-CI runs a migration lint that rejects destructive statements (for example
-`DROP COLUMN`, `DROP TABLE`, or narrowing type changes) in the same release as
-the expand step. If a destructive change is genuinely intended and the old
-versions have been drained, opt in explicitly by running the lint with
-`--allow-destructive` and explain the rollout plan in the pull request.
-
-### Example
-
-See the example migration directory for an end-to-end expand-contract walk
-through, including the rollback steps for each phase.
-
-## Primary federation username invariant
-
-Each address may have at most one active primary federation username. This is
-enforced in PostgreSQL with a partial unique index over the active primary
-rows, so concurrent writers cannot create a second primary.
-
-- **Soft deletes.** Deleting or deactivating a username is a soft delete: the
-  row is marked inactive rather than removed. Inactive rows are excluded from
-  the partial unique index, so a new primary can be created for the same
-  address after the previous one is deactivated.
-- **Repairing legacy data.** Before the constraint is applied, any legacy
-  duplicates (multiple active primaries for one address) must be repaired by
-  deactivating all but the intended primary. The migration fails rather than
-  silently dropping data if duplicates cannot be resolved.
+- **Isolation.** Each preview gets its own database and synthetic seed data.
+  Production credentials are never injected into a preview. Only the
+  preview-only secrets described below are available to the workload.
+- **Preview-only secrets.** Configure preview secrets under the preview
+  environment scope (for example `PREVIEW_DATABASE_URL`,
+  `PREVIEW_API_TOKEN`, and `PREVIEW_DASHBOARD_SESSION_SECRET`). These values
+  must be distinct from production and must not grant access to production
+  systems. Never reuse production credentials for a preview.
+- **TTL policy.** Every preview is created with a time-to-live. When the TTL
+  elapses the environment is torn down automatically, even if the pull
+  request is still open. Re-run the preview workflow to provision a fresh
+  environment.
+- **Auditable cleanup.** Closing or merging a pull request triggers cleanup of
+  the associated preview resources. Cleanup is recorded in an audit log that
+  captures what was removed, when, and by which trigger (TTL expiry or PR
+  closure). If you notice orphaned preview resources, report them in the
+  issue so the audit trail can be reconciled.
 
 ## Pull requests
 =======
 
 - Keep changes scoped to the issue being addressed.
+=======
 - Update operational, API, contract, migration, or contributor documentation
   and generated artifacts where your change affects them.
 - Describe the validation you performed, including exact commands and results.

@@ -64,6 +64,17 @@ FROM node:lts-alpine AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 
+# OCI image metadata. `revision` is the git SHA the image was built from and
+# `source` points at the repository; syft copies these labels into the
+# container SBOM so the manifest can be tied to the exact source revision and
+# (via the image digest) the artifact. Override at build time with
+#   --build-arg GIT_REVISION=$(git rev-parse HEAD) \
+#   --build-arg SOURCE_URL=https://github.com/<org>/<repo>
+ARG GIT_REVISION=unknown
+ARG SOURCE_URL=unknown
+LABEL org.opencontainers.image.revision="${GIT_REVISION}" \
+	org.opencontainers.image.source="${SOURCE_URL}"
+
 # Create a dedicated unprivileged `node` group/user and run the server as it.
 # /app stays writable for the logs/data dirs the app creates at runtime.
 # postgresql-client provides `pg_isready`, which startup.sh polls to wait for
@@ -93,8 +104,41 @@ USER node
 
 # curl is intentionally NOT installed; busybox wget ships with alpine and
 # keeps the image slim.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-	CMD wget -qO- http://127.0.0.1:${PORT:-5000}/health || exit 1
+#
+# Probe semantics (mirrored by the Kubernetes manifest in k8s/backend.yaml):
+#   - startupProbe   -> /health/startup: only flips to 200 once initialization
+#                       (DB connect, migrations, cache warmup) has completed.
+#                       A generous failureThreshold * periodSeconds budget lets
+#                       slow boots finish without the container being killed.
+#   - livenessProbe  -> /health/live: answers as long as the event loop is
+#                       responsive. It never touches dependencies, so a slow
+#                       or unavailable database cannot trigger a restart, while
+#                       a deadlocked/blocked process fails and is restarted.
+#   - readinessProbe -> /health/ready: 200 only when the process is initialized
+#                       AND routing dependencies (database, etc.) are healthy,
+#                       so traffic is withheld from instances that cannot serve.
+#
+# Docker's HEALTHCHECK can only express one probe, so it maps to the readiness
+# endpoint (the routing-relevant signal). The startup grace period is expressed
+# via --start-period so slow initialization is not reported as unhealthy.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+	CMD wget -qO- http://127.0.0.1:${PORT:-5000}/health/ready || exit 1
+
+# Kubernetes probe configuration. These labels are consumed by the deployment
+# tooling that renders k8s/backend.yaml; they document the contract in the image
+# itself so the two cannot drift silently.
+LABEL org.stellar.payment.probes.startup.path="/health/startup" \
+	org.stellar.payment.probes.startup.periodSeconds="5" \
+	org.stellar.payment.probes.startup.timeoutSeconds="3" \
+	org.stellar.payment.probes.startup.failureThreshold="60" \
+	org.stellar.payment.probes.liveness.path="/health/live" \
+	org.stellar.payment.probes.liveness.periodSeconds="10" \
+	org.stellar.payment.probes.liveness.timeoutSeconds="3" \
+	org.stellar.payment.probes.liveness.failureThreshold="3" \
+	org.stellar.payment.probes.readiness.path="/health/ready" \
+	org.stellar.payment.probes.readiness.periodSeconds="10" \
+	org.stellar.payment.probes.readiness.timeoutSeconds="3" \
+	org.stellar.payment.probes.readiness.failureThreshold="3"
 
 EXPOSE 5000
 CMD ["./startup.sh"]

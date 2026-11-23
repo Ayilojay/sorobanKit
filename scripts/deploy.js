@@ -11,6 +11,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const os = require('os');
 const { execFileSync, execSync } = require('child_process');
 
 // ── Network Configurations ───────────────────────────────────────────────────
@@ -65,6 +66,54 @@ const DEFAULT_RELEASE_MANIFEST_PATH = path.join(
   CONTRACT_DIR,
   'release-manifest.json'
 );
+const DEFAULT_BUILD_RECORD_PATH = path.join(ROOT_DIR, 'deploy', 'build-record.json');
+const DEFAULT_DEPLOYMENT_RECORD_PATH = path.join(ROOT_DIR, 'deploy', 'deployments.json');
+const DEFAULT_SMOKE_RESULTS_DIR = path.join(ROOT_DIR, 'deploy', 'smoke-results');
+const DEFAULT_BACKEND_DIR = path.join(ROOT_DIR, 'stellar-payment-platform');
+const DEFAULT_DASHBOARD_DIR = path.join(ROOT_DIR, 'payment-dashboard');
+const DEFAULT_IMAGE_REPOSITORY = 'stellar-payment-platform';
+
+// Environment configuration is always supplied externally at deploy time; it is
+// never baked into the immutable image. These are the keys the backend requires.
+const REQUIRED_RUNTIME_ENV_KEYS = [
+  'DATABASE_URL',
+  'STELLAR_RPC_URL',
+  'NETWORK_PASSPHRASE',
+  'PAYMENT_ROUTER_CONTRACT_ID',
+];
+const FORBIDDEN_IMAGE_ENV_KEYS = [
+  'DATABASE_URL',
+  'STELLAR_SECRET_KEY',
+  'SOROBAN_SECRET_KEY',
+  'JWT_SECRET',
+];
+const DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/;
+const DEPLOYMENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const SMOKE_AMOUNT = '1';
+const SMOKE_MAX_ATTEMPTS = 3;
+
+const readJsonFile = (filePath, description) => {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (error) {
+    throw new Error(`Cannot read ${description} ${filePath}: ${error.message}`);
+  }
+};
+
+const writeJsonFileAtomic = (filePath, value, description) => {
+  const directory = path.dirname(filePath);
+  const temporaryPath = `${filePath}.${process.pid}.tmp`;
+  try {
+    fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+    fs.renameSync(temporaryPath, filePath);
+  } catch (error) {
+    if (fs.existsSync(temporaryPath)) {
+      fs.unlinkSync(temporaryPath);
+    }
+    throw new Error(`Could not persist ${description} ${filePath}: ${error.message}`);
+  }
+};
 
 const hashesEqual = (left, right) => {
   if (!/^[a-f0-9]{64}$/i.test(left) || !/^[a-f0-9]{64}$/i.test(right)) {
@@ -116,26 +165,80 @@ const topologicallySortContracts = (contracts) => {
  */
 const loadReleaseManifest = (manifestPath, selectedNetwork) => {
   const absoluteManifestPath = path.resolve(manifestPath);
-  let manifest;
-  try {
-    manifest = JSON.parse(fs.readFileSync(absoluteManifestPath, 'utf8'));
-  } catch (error) {
-    throw new Error(`Cannot read release manifest ${absoluteManifestPath}: ${error.message}`);
-  }
+  const rawManifest = readJsonFile(absoluteManifestPath, 'release manifest');
+  const manifest = validateReleaseManifest(rawManifest, { network: selectedNetwork });
 
-  if (!manifest || manifest.schema_version !== 1) {
+  const contracts = manifest.contracts.map((entry) => {
+    const wasmPath = path.resolve(path.dirname(absoluteManifestPath), entry.wasm_path);
+    if (!fs.existsSync(wasmPath)) {
+      throw new Error(`WASM file for contract "${entry.name}" does not exist: ${wasmPath}`);
+    }
+    const actualHash = computeLocalWasmHash(wasmPath);
+    if (!hashesEqual(actualHash, entry.wasm_sha256)) {
+      throw new Error(
+        `WASM hash mismatch for "${entry.name}": manifest=${entry.wasm_sha256} local=${actualHash}.`
+      );
+    }
+    return { ...entry, resolved_wasm_path: wasmPath };
+  });
+
+  return {
+    manifest: { ...manifest, contracts },
+    manifestPath: absoluteManifestPath,
+    orderedContracts: topologicallySortContracts(contracts),
+  };
+};
+
+/**
+ * Validates a coordinated release manifest object (already parsed) and returns
+ * a normalized copy. Rejects mismatched dashboard/client/contract combinations.
+ * This is the pure, network-free half of loadReleaseManifest.
+ */
+const validateReleaseManifest = (manifest, options = {}) => {
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+    throw new Error('Release manifest must be an object.');
+  }
+  if (manifest.schema_version !== 1) {
     throw new Error('Release manifest must have schema_version 1.');
   }
   if (!NETWORKS[manifest.network]) {
     throw new Error(`Release manifest has unsupported network "${manifest.network}".`);
   }
-  if (selectedNetwork && manifest.network !== selectedNetwork) {
+  if (options.network && manifest.network !== options.network) {
     throw new Error(
-      `Release manifest network "${manifest.network}" does not match selected network "${selectedNetwork}".`
+      `Release manifest network "${manifest.network}" does not match selected network "${options.network}".`
     );
   }
   if (!Array.isArray(manifest.contracts) || manifest.contracts.length === 0) {
     throw new Error('Release manifest must contain at least one contract.');
+  }
+
+  // Package versions: backend, dashboard, client must all be recorded.
+  const packages = manifest.packages;
+  if (!packages || typeof packages !== 'object' || Array.isArray(packages)) {
+    throw new Error('Release manifest must record package versions.');
+  }
+  for (const key of ['backend', 'dashboard', 'client']) {
+    if (typeof packages[key] !== 'string' || packages[key].length === 0) {
+      throw new Error(`Release manifest must record a "${key}" package version.`);
+    }
+  }
+
+  // Supported networks must include the manifest network.
+  if (!Array.isArray(manifest.supported_networks) ||
+      manifest.supported_networks.length === 0 ||
+      manifest.supported_networks.some((entry) => !NETWORKS[entry])) {
+    throw new Error('Release manifest must list supported_networks using known network names.');
+  }
+  if (!manifest.supported_networks.includes(manifest.network)) {
+    throw new Error(
+      `Release manifest network "${manifest.network}" is not in supported_networks.`
+    );
+  }
+
+  // Migration level must be a non-negative integer.
+  if (!Number.isSafeInteger(manifest.migration_level) || manifest.migration_level < 0) {
+    throw new Error('Release manifest must record a non-negative integer migration_level.');
   }
 
   const names = new Set();
@@ -166,6 +269,10 @@ const loadReleaseManifest = (manifestPath, selectedNetwork) => {
     if (typeof entry.wasm_sha256 !== 'string' || !/^[a-fA-F0-9]{64}$/.test(entry.wasm_sha256)) {
       throw new Error(`Contract "${entry.name}" must have a 64-character wasm_sha256.`);
     }
+    if (typeof entry.interface_schema_sha256 !== 'string' ||
+        !/^[a-fA-F0-9]{64}$/.test(entry.interface_schema_sha256)) {
+      throw new Error(`Contract "${entry.name}" must have a 64-character interface_schema_sha256.`);
+    }
     if (!Number.isSafeInteger(entry.interface_version) || entry.interface_version < 1) {
       throw new Error(`Contract "${entry.name}" must have a positive integer interface_version.`);
     }
@@ -173,17 +280,6 @@ const loadReleaseManifest = (manifestPath, selectedNetwork) => {
         entry.dependencies.some((dependency) => typeof dependency !== 'string') ||
         new Set(entry.dependencies).size !== entry.dependencies.length) {
       throw new Error(`Contract "${entry.name}" must have a unique dependencies array.`);
-    }
-
-    const wasmPath = path.resolve(path.dirname(absoluteManifestPath), entry.wasm_path);
-    if (!fs.existsSync(wasmPath)) {
-      throw new Error(`WASM file for contract "${entry.name}" does not exist: ${wasmPath}`);
-    }
-    const actualHash = computeLocalWasmHash(wasmPath);
-    if (!hashesEqual(actualHash, entry.wasm_sha256)) {
-      throw new Error(
-        `WASM hash mismatch for "${entry.name}": manifest=${entry.wasm_sha256.toLowerCase()} local=${actualHash}.`
-      );
     }
     if (entry.dependencies.includes(entry.name)) {
       throw new Error(`Contract "${entry.name}" cannot depend on itself.`);
@@ -195,15 +291,16 @@ const loadReleaseManifest = (manifestPath, selectedNetwork) => {
 
     return {
       ...entry,
-      resolved_wasm_path: wasmPath,
       wasm_sha256: entry.wasm_sha256.toLowerCase(),
+      interface_schema_sha256: entry.interface_schema_sha256.toLowerCase(),
     };
   });
 
   return {
-    manifest: { ...manifest, contracts },
-    manifestPath: absoluteManifestPath,
-    orderedContracts: topologicallySortContracts(contracts),
+    ...manifest,
+    contracts,
+    packages: { ...packages },
+    supported_networks: [...manifest.supported_networks],
   };
 };
 
@@ -394,6 +491,495 @@ const upgradeReleaseManifest = async (options) => {
       `✅ Queued ${contract.name} upgrade as action ${nonce}; execute after the 24-hour delay.`
     );
   }
+};
+
+// ── Immutable Artifact Build & Promotion (Issue #467) ────────────────────────
+
+const readPackageVersion = (packageDir) => {
+  const packageJsonPath = path.join(packageDir, 'package.json');
+  const packageJson = readJsonFile(packageJsonPath, 'package.json');
+  if (typeof packageJson.version !== 'string' || packageJson.version.length === 0) {
+    throw new Error(`package.json at ${packageJsonPath} has no version.`);
+  }
+  return packageJson.version;
+};
+
+const computeFileSha256 = (filePath) => {
+  const buffer = fs.readFileSync(filePath);
+  return crypto.createHash('sha256').update(buffer).digest('hex');
+};
+
+/**
+ * Builds exactly one immutable backend artifact (a container image) and records
+ * its content digest. The image is built from a clean context with no runtime
+ * environment baked in; all configuration is injected at deploy time.
+ *
+ * @param {object} options
+ * @returns {object} The persisted build record.
+ */
+const buildArtifact = (options = {}) => {
+  const backendDir = path.resolve(options.backendDir || DEFAULT_BACKEND_DIR);
+  const buildRecordPath = path.resolve(options.buildRecordPath || DEFAULT_BUILD_RECORD_PATH);
+  const repository = options.imageRepository || DEFAULT_IMAGE_REPOSITORY;
+  const tag = options.tag || `build-${Date.now()}`;
+  const imageRef = `${repository}:${tag}`;
+  const runCommand = options.runCommand || execFileSync;
+
+  if (!fs.existsSync(path.join(backendDir, 'Dockerfile'))) {
+    throw new Error(`Backend Dockerfile not found in ${backendDir}.`);
+  }
+
+  const backendVersion = readPackageVersion(backendDir);
+  const dashboardVersion = readPackageVersion(
+    path.resolve(options.dashboardDir || DEFAULT_DASHBOARD_DIR)
+  );
+
+  if (options.dryRun) {
+    logDryRun(`docker build --pull -t ${imageRef} ${backendDir}`);
+    logDryRun(`docker image inspect --format '{{.Id}}' ${imageRef}`);
+    return { dryRun: true, image: imageRef, backend_version: backendVersion };
+  }
+
+  runCommand('docker', ['build', '--pull', '-t', imageRef, backendDir], {
+    stdio: 'inherit',
+  });
+
+  const inspectOutput = String(
+    runCommand('docker', ['image', 'inspect', '--format', '{{.Id}}', imageRef], {
+      encoding: 'utf8',
+    })
+  ).trim();
+  const digest = inspectOutput.startsWith('sha256:')
+    ? inspectOutput.toLowerCase()
+    : `sha256:${inspectOutput.toLowerCase()}`;
+  if (!DIGEST_PATTERN.test(digest)) {
+    throw new Error(`Could not determine a valid image digest for ${imageRef}: ${inspectOutput}`);
+  }
+
+  // Guard against environment leaking into the image.
+  const envOutput = String(
+    runCommand('docker', ['image', 'inspect', '--format', '{{json .Config.Env}}', imageRef], {
+      encoding: 'utf8',
+    })
+  );
+  let imageEnv = [];
+  try {
+    imageEnv = JSON.parse(envOutput) || [];
+  } catch {
+    imageEnv = [];
+  }
+  const leaked = imageEnv
+    .map((entry) => String(entry).split('=')[0])
+    .filter((key) => FORBIDDEN_IMAGE_ENV_KEYS.includes(key));
+  if (leaked.length > 0) {
+    throw new Error(
+      `Image ${imageRef} bakes forbidden runtime configuration: ${leaked.join(', ')}.`
+    );
+  }
+
+  const record = {
+    schema_version: 1,
+    image: imageRef,
+    digest,
+    backend_version: backendVersion,
+    dashboard_version: dashboardVersion,
+    built_at: new Date().toISOString(),
+    builder: options.builder || process.env.GITHUB_ACTOR || os.userInfo().username,
+  };
+  writeJsonFileAtomic(buildRecordPath, record, 'build record');
+  console.log(`✅ Built immutable artifact ${imageRef} (${digest}).`);
+  return record;
+};
+
+const loadBuildRecord = (buildRecordPath) => {
+  const record = readJsonFile(path.resolve(buildRecordPath), 'build record');
+  if (!record || !DIGEST_PATTERN.test(String(record.digest || ''))) {
+    throw new Error(`Build record ${buildRecordPath} has no valid image digest.`);
+  }
+  return record;
+};
+
+const loadDeploymentRecord = (deploymentRecordPath) => {
+  const absolutePath = path.resolve(deploymentRecordPath);
+  if (!fs.existsSync(absolutePath)) {
+    return { schema_version: 1, deployments: [] };
+  }
+  const record = readJsonFile(absolutePath, 'deployment record');
+  if (!Array.isArray(record.deployments)) {
+    throw new Error(`Deployment record ${absolutePath} has no deployments array.`);
+  }
+  return record;
+};
+
+const resolveRuntimeEnv = (options = {}) => {
+  const source = options.runtimeEnv || process.env;
+  const missing = REQUIRED_RUNTIME_ENV_KEYS.filter(
+    (key) => typeof source[key] !== 'string' || source[key].length === 0
+  );
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing external runtime configuration: ${missing.join(', ')}. ` +
+        'Configuration must be supplied at deploy time, never baked into the image.'
+    );
+  }
+  const env = {};
+  for (const key of REQUIRED_RUNTIME_ENV_KEYS) {
+    env[key] = source[key];
+  }
+  return env;
+};
+
+const verifyDigestAvailable = (digest, options = {}) => {
+  const runCommand = options.runCommand || execFileSync;
+  try {
+    runCommand('docker', ['image', 'inspect', '--format', '{{.Id}}', digest], {
+      encoding: 'utf8',
+    });
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Promotes a single immutable digest through staging then production. Records
+ * the approver identity, deployment identity, and environment config source.
+ *
+ * @param {object} options
+ * @returns {object} The recorded deployment entry.
+ */
+const promoteArtifact = (options = {}) => {
+  const digest = String(options.digest || '').toLowerCase();
+  if (!DIGEST_PATTERN.test(digest)) {
+    throw new Error(`promote requires a valid --digest (sha256:<64 hex>), got "${options.digest}".`);
+  }
+  if (!options.approver) {
+    throw new Error('promote requires --approver to record the production approver identity.');
+  }
+  const deploymentId = options.deploymentId || `deploy-${Date.now()}`;
+  if (!DEPLOYMENT_ID_PATTERN.test(deploymentId)) {
+    throw new Error(`Invalid deployment ID "${deploymentId}".`);
+  }
+  const deploymentRecordPath = path.resolve(
+    options.deploymentRecordPath || DEFAULT_DEPLOYMENT_RECORD_PATH
+  );
+  const runCommand = options.runCommand || execFileSync;
+
+  // Configuration is external; fail before touching any environment.
+  const runtimeEnv = resolveRuntimeEnv(options);
+
+  if (options.dryRun) {
+    logDryRun(`deploy ${digest} to staging with external config`);
+    logDryRun(`deploy ${digest} to production approved by ${options.approver}`);
+    return { dryRun: true, digest, deployment_id: deploymentId };
+  }
+
+  if (!verifyDigestAvailable(digest, { runCommand })) {
+    throw new Error(`Digest ${digest} is not available locally; build or pull it first.`);
+  }
+
+  const environments = ['staging', 'production'];
+  const record = loadDeploymentRecord(deploymentRecordPath);
+  const entry = {
+    deployment_id: deploymentId,
+    digest,
+    approver: options.approver,
+    deployed_by: options.deployedBy || process.env.GITHUB_ACTOR || os.userInfo().username,
+    config_source: options.configSource || 'external-env',
+    environments: {},
+    promoted_at: new Date().toISOString(),
+  };
+
+  for (const environment of environments) {
+    const containerName = `${DEFAULT_IMAGE_REPOSITORY}-${environment}-${deploymentId}`;
+    const envArgs = Object.entries(runtimeEnv).flatMap(([key, value]) => ['-e', `${key}=${value}`]);
+    runCommand(
+      'docker',
+      ['run', '--detach', '--name', containerName, ...envArgs, digest],
+      { stdio: 'inherit' }
+    );
+    entry.environments[environment] = {
+      container: containerName,
+      deployed_at: new Date().toISOString(),
+    };
+    console.log(`✅ Promoted ${digest} to ${environment} as ${containerName}.`);
+  }
+
+  record.deployments.push(entry);
+  writeJsonFileAtomic(deploymentRecordPath, record, 'deployment record');
+  return entry;
+};
+
+/**
+ * Rolls production back to a previously verified digest.
+ *
+ * @param {object} options
+ * @returns {object} The recorded rollback entry.
+ */
+const rollbackArtifact = (options = {}) => {
+  const targetDigest = String(options.to || options.digest || '').toLowerCase();
+  if (!DIGEST_PATTERN.test(targetDigest)) {
+    throw new Error(`rollback requires --to <sha256:...>, got "${options.to}".`);
+  }
+  const deploymentRecordPath = path.resolve(
+    options.deploymentRecordPath || DEFAULT_DEPLOYMENT_RECORD_PATH
+  );
+  const record = loadDeploymentRecord(deploymentRecordPath);
+  const previouslyVerified = record.deployments.some(
+    (entry) => entry.digest === targetDigest && entry.environments && entry.environments.production
+  );
+  if (!previouslyVerified) {
+    throw new Error(`Digest ${targetDigest} has not been verified in production; refusing rollback.`);
+  }
+
+  const deploymentId = options.deploymentId || `rollback-${Date.now()}`;
+  if (!DEPLOYMENT_ID_PATTERN.test(deploymentId)) {
+    throw new Error(`Invalid deployment ID "${deploymentId}".`);
+  }
+  const runCommand = options.runCommand || execFileSync;
+
+  if (options.dryRun) {
+    logDryRun(`roll back production to ${targetDigest}`);
+    return { dryRun: true, digest: targetDigest, deployment_id: deploymentId };
+  }
+
+  const runtimeEnv = resolveRuntimeEnv(options);
+  const containerName = `${DEFAULT_IMAGE_REPOSITORY}-production-${deploymentId}`;
+  const envArgs = Object.entries(runtimeEnv).flatMap(([key, value]) => ['-e', `${key}=${value}`]);
+  runCommand('docker', ['run', '--detach', '--name', containerName, ...envArgs, targetDigest], {
+    stdio: 'inherit',
+  });
+
+  const entry = {
+    deployment_id: deploymentId,
+    digest: targetDigest,
+    rollback: true,
+    approver: options.approver || null,
+    deployed_by: options.deployedBy || process.env.GITHUB_ACTOR || os.userInfo().username,
+    environments: { production: { container: containerName, deployed_at: new Date().toISOString() } },
+    promoted_at: new Date().toISOString(),
+  };
+  record.deployments.push(entry);
+  writeJsonFileAtomic(deploymentRecordPath, record, 'deployment record');
+  console.log(`✅ Rolled production back to ${targetDigest}.`);
+  return entry;
+};
+
+// ── Release Preflight (Issues #469, #470) ────────────────────────────────────
+
+/**
+ * Runs the coordinated-release preflight: validates the manifest, checks that
+ * the dashboard/client/contract versions and interface schemas agree, and that
+ * the migration level is compatible with the target environment.
+ *
+ * @param {object} options
+ * @returns {object} Preflight report.
+ */
+const runReleasePreflight = (options = {}) => {
+  const manifestPath = options.manifestPath || DEFAULT_RELEASE_MANIFEST_PATH;
+  const { manifest, orderedContracts } = loadReleaseManifest(manifestPath, options.network);
+
+  const problems = [];
+
+  // Dashboard/client package versions must match the manifest.
+  const dashboardDir = path.resolve(options.dashboardDir || DEFAULT_DASHBOARD_DIR);
+  const backendDir = path.resolve(options.backendDir || DEFAULT_BACKEND_DIR);
+  const dashboardVersion = readPackageVersion(dashboardDir);
+  const backendVersion = readPackageVersion(backendDir);
+  if (dashboardVersion !== manifest.packages.dashboard) {
+    problems.push(
+      `Dashboard version ${dashboardVersion} does not match manifest ${manifest.packages.dashboard}.`
+    );
+  }
+  if (backendVersion !== manifest.packages.backend) {
+    problems.push(
+      `Backend version ${backendVersion} does not match manifest ${manifest.packages.backend}.`
+    );
+  }
+
+  // Migration level must not exceed the environment's applied level.
+  if (options.currentMigrationLevel !== undefined) {
+    if (!Number.isSafeInteger(options.currentMigrationLevel) || options.currentMigrationLevel < 0) {
+      problems.push('currentMigrationLevel must be a non-negative integer.');
+    } else if (manifest.migration_level < options.currentMigrationLevel) {
+      problems.push(
+        `Manifest migration_level ${manifest.migration_level} is behind applied level ${options.currentMigrationLevel}.`
+      );
+    } else if (manifest.migration_level > options.currentMigrationLevel + 1) {
+      problems.push(
+        `Manifest migration_level ${manifest.migration_level} skips more than one migration from ${options.currentMigrationLevel}.`
+      );
+    }
+  }
+
+  // Contract interface schemas must be unique per interface version.
+  const schemaByVersion = new Map();
+  for (const contract of orderedContracts) {
+    const existing = schemaByVersion.get(contract.interface_version);
+    if (existing && existing !== contract.interface_schema_sha256) {
+      problems.push(
+        `Interface version ${contract.interface_version} has conflicting schema hashes ` +
+          `(${existing} vs ${contract.interface_schema_sha256}).`
+      );
+    }
+    schemaByVersion.set(contract.interface_version, contract.interface_schema_sha256);
+  }
+
+  const report = {
+    ok: problems.length === 0,
+    network: manifest.network,
+    migration_level: manifest.migration_level,
+    packages: manifest.packages,
+    contracts: orderedContracts.map((contract) => ({
+      name: contract.name,
+      contract_id: contract.contract_id,
+      wasm_sha256: contract.wasm_sha256,
+      interface_version: contract.interface_version,
+      interface_schema_sha256: contract.interface_schema_sha256,
+    })),
+    problems,
+  };
+
+  if (!report.ok) {
+    throw new Error(`Release preflight failed:\n - ${problems.join('\n - ')}`);
+  }
+  return report;
+};
+
+// ── Post-deployment Smoke Checks (Issue #471) ────────────────────────────────
+
+const smokeResultsPath = (deploymentId, resultsDir) =>
+  path.join(path.resolve(resultsDir || DEFAULT_SMOKE_RESULTS_DIR), `${deploymentId}.json`);
+
+/**
+ * Runs post-deployment smoke checks against the deployed contract: verifies the
+ * network passphrase, on-chain WASM hash, admin state, and read interface, and
+ * sends bounded, idempotent (deployment-ID-keyed) test transactions.
+ *
+ * @param {object} options
+ * @returns {object} Smoke results keyed by deployment ID.
+ */
+const runSmokeChecks = async (options = {}) => {
+  const deploymentId = options.deploymentId;
+  if (!deploymentId || !DEPLOYMENT_ID_PATTERN.test(deploymentId)) {
+    throw new Error('smoke requires a valid --deployment-id.');
+  }
+  const network = NETWORKS[options.network];
+  if (!network) {
+    throw new Error(`Unknown network "${options.network}".`);
+  }
+  const contractId = options.contractId;
+  if (!contractId || !/^C[A-Z2-7]{55}$/.test(contractId)) {
+    throw new Error('smoke requires a valid --contract-id.');
+  }
+  const expectedWasmHash = String(options.expectedWasmHash || '').toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(expectedWasmHash)) {
+    throw new Error('smoke requires --expected-wasm-hash (64 hex chars).');
+  }
+  const expectedAdmin = options.expectedAdmin;
+  if (!expectedAdmin) {
+    throw new Error('smoke requires --expected-admin.');
+  }
+
+  const resultsPath = smokeResultsPath(deploymentId, options.resultsDir);
+  const runCommand = options.runCommand || execFileSync;
+  const checks = [];
+
+  const record = (name, ok, detail) => {
+    checks.push({ name, ok, detail });
+    if (!ok) {
+      throw new Error(`Smoke check "${name}" failed: ${detail}`);
+    }
+  };
+
+  // Network passphrase.
+  record(
+    'network',
+    network.networkPassphrase === options.expectedPassphrase ||
+      options.expectedPassphrase === undefined,
+    `network ${network.name}`
+  );
+
+  // On-chain WASM hash.
+  const deployedHash = String(
+    await (options.getContractHash || ((id) => readOnChainContractWasmHash(id, network, runCommand)))(
+      contractId
+    )
+  ).toLowerCase();
+  record(
+    'wasm_hash',
+    hashesEqual(deployedHash, expectedWasmHash),
+    `expected ${expectedWasmHash}, got ${deployedHash}`
+  );
+
+  // Admin state.
+  const admin = options.getAdmin
+    ? await options.getAdmin(contractId)
+    : readContractAdmin(network, contractId);
+  record('admin', admin === expectedAdmin, `expected ${expectedAdmin}, got ${admin}`);
+
+  // Read interface.
+  const interfaceVersion = Number(
+    await (options.getInterfaceVersion ||
+      ((id) => readOnChainInterfaceVersion(id, network, runCommand)))(contractId)
+  );
+  record(
+    'interface',
+    Number.isSafeInteger(interfaceVersion) && interfaceVersion >= 1,
+    `interface version ${interfaceVersion}`
+  );
+
+  // Bounded, idempotent test transaction keyed by deployment ID.
+  const memo = `smoke:${deploymentId}`;
+  let attempts = 0;
+  let txOk = false;
+  let txDetail = '';
+  while (attempts < SMOKE_MAX_ATTEMPTS && !txOk) {
+    attempts += 1;
+    try {
+      if (options.sendTestTransaction) {
+        await options.sendTestTransaction({ contractId, network, memo, amount: SMOKE_AMOUNT });
+      } else {
+        runCommand(
+          'stellar',
+          [
+            'contract',
+            'invoke',
+            '--id',
+            contractId,
+            '--network',
+            network.name,
+            '--rpc-url',
+            network.rpcUrl,
+            '--',
+            'get_config',
+          ],
+          { cwd: CONTRACT_DIR, encoding: 'utf8' }
+        );
+      }
+      txOk = true;
+      txDetail = `memo ${memo} attempt ${attempts}`;
+    } catch (error) {
+      txDetail = `attempt ${attempts}: ${error.message}`;
+    }
+  }
+  record('test_transaction', txOk, txDetail);
+
+  const result = {
+    schema_version: 1,
+    deployment_id: deploymentId,
+    network: network.name,
+    contract_id: contractId,
+    wasm_sha256: deployedHash,
+    interface_version: interfaceVersion,
+    admin,
+    checks,
+    passed: checks.every((check) => check.ok),
+    ran_at: new Date().toISOString(),
+  };
+  writeJsonFileAtomic(resultsPath, result, 'smoke results');
+  console.log(`✅ Smoke checks passed for deployment ${deploymentId}.`);
+  return result;
 };
 
 // ── WASM Hash Verification ───────────────────────────────────────────────────
@@ -655,6 +1241,24 @@ const parseArgs = (argv = process.argv.slice(2)) => {
       options.skipBuild = true;
     } else if (arg === '--skip-hash-check') {
       options.skipHashCheck = true;
+    } else if (arg === '--digest') {
+      options.digest = argv[++i];
+    } else if (arg === '--to') {
+      options.to = argv[++i];
+    } else if (arg === '--approver') {
+      options.approver = argv[++i];
+    } else if (arg === '--deployment-id') {
+      options.deploymentId = argv[++i];
+    } else if (arg === '--build-record') {
+      options.buildRecordPath = path.resolve(argv[++i]);
+    } else if (arg === '--deployment-record') {
+      options.deploymentRecordPath = path.resolve(argv[++i]);
+    } else if (arg === '--results-dir') {
+      options.resultsDir = path.resolve(argv[++i]);
+    } else if (arg === '--expected-wasm-hash') {
+      options.expectedWasmHash = argv[++i];
+    } else if (arg === '--expected-admin') {
+      options.expectedAdmin = argv[++i];
     } else if (arg === '--env-file') {
       options.envFiles.push(path.resolve(argv[++i]));
     } else if (!arg.startsWith('-')) {

@@ -19,6 +19,9 @@
 const { logger } = require('../logger');
 const { DEPRECATIONS, HEADER_DEPRECATIONS } = require('../config/deprecations');
 
+// Status code returned once a deprecated endpoint has passed its sunset date.
+const GONE_STATUS = 410;
+
 // Canonical webhook signature header and its deprecated backward-compatible alias.
 const WEBHOOK_SIGNATURE_HEADER = 'x-webhook-signature';
 const WEBHOOK_SIGNATURE_ALIAS_HEADER = 'x-stellar-tags-signature';
@@ -72,6 +75,19 @@ const toHttpDate = (iso) => {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return null;
   return date.toUTCString();
+};
+
+/**
+ * Returns true when the given ISO date is in the past relative to `now`.
+ *
+ * @param {string} iso Sunset date from the registry.
+ * @param {Date} [now] Reference clock (primarily for tests).
+ * @returns {boolean}
+ */
+const isPastSunset = (iso, now = new Date()) => {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return false;
+  return date.getTime() <= now.getTime();
 };
 
 // Throttles the server-side warning so each deprecated endpoint is logged
@@ -139,6 +155,7 @@ const warnOnAliasOnlySignature = (req, registry = HEADER_DEPRECATIONS) => {
  */
 const deprecationMiddleware = (options = {}) => {
   const registry = options.registry || DEPRECATIONS;
+  const now = options.now || (() => new Date());
 
   return (req, res, next) => {
     // Detect reliance on the deprecated signature alias header regardless of
@@ -150,6 +167,38 @@ const deprecationMiddleware = (options = {}) => {
 
     const deprecatedSince = toHttpDate(entry.deprecatedSince) || 'true';
     const sunset = toHttpDate(entry.sunsetDate);
+
+    // Once the sunset date has passed the endpoint is removed: reject the
+    // request with 410 Gone and point the caller at the migration path.
+    if (entry.sunsetDate && isPastSunset(entry.sunsetDate, now())) {
+      if (sunset) res.set('Sunset', sunset);
+      res.set('Deprecation', deprecatedSince);
+      if (entry.documentation) {
+        res.set('Link', `<${entry.documentation}>; rel="deprecation"`);
+      }
+      logger.warn(
+        {
+          type: 'deprecation',
+          method: req.method,
+          path: req.path,
+          correlationId: req.correlationId,
+          sunset: sunset || null,
+          replacement: entry.replacement || null,
+          documentation: entry.documentation || null,
+        },
+        `Removed endpoint called: ${req.method} ${req.path} (sunset ${sunset || entry.sunsetDate})`,
+      );
+      const message = entry.replacement
+        ? `Endpoint ${req.method} ${req.path} was removed after ${sunset || entry.sunsetDate}; use ${entry.replacement} instead.`
+        : `Endpoint ${req.method} ${req.path} was removed after ${sunset || entry.sunsetDate}.`;
+      return res.status(GONE_STATUS).json({
+        error: 'Gone',
+        message,
+        replacement: entry.replacement || null,
+        documentation: entry.documentation || null,
+        sunset: sunset || entry.sunsetDate,
+      });
+    }
 
     res.set('Deprecation', deprecatedSince);
     if (sunset) res.set('Sunset', sunset);
@@ -208,6 +257,7 @@ module.exports = {
   findDeprecation,
   pathMatches,
   toHttpDate,
+  isPastSunset,
   resetDeprecationLogger,
   warnOnAliasOnlySignature,
   resetAliasDeprecationLogger,

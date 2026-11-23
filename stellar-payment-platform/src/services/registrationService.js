@@ -3,6 +3,46 @@ const { prisma, withTransaction } = require('../../prismaClient');
 const { verifyMultiSignerThreshold } = require('../multisigner-verifier');
 const { logger } = require('../logger');
 const { recordActivity, ACTIVITY_ACTIONS } = require('./activityService');
+const {
+  DEFAULT_NETWORK,
+  resolveNetwork,
+  toExactMoney,
+} = require('../money');
+
+/**
+ * Builds the exact-money + network fields required on every Payment write.
+ *
+ * Payment.amount / Payment.fee are legacy float columns kept only for
+ * backwards compatibility during the expand/backfill/contract migration.
+ * New rows must always populate the exact integer-unit columns
+ * (amountUnits / feeUnits / assetPrecision) and an explicit network so the
+ * composite unique constraint on (network, transactionHash) is satisfied.
+ *
+ * @param {object} params
+ * @param {string|number|bigint} params.amount - Human-readable amount.
+ * @param {string|number|bigint} [params.fee=0] - Human-readable fee.
+ * @param {number} [params.assetPrecision] - Asset precision (defaults to 7).
+ * @param {string} [params.network] - Stellar network identifier.
+ * @returns {{amountUnits: bigint, feeUnits: bigint, assetPrecision: number, network: string}}
+ */
+function buildExactPaymentFields({ amount, fee = 0, assetPrecision, network } = {}) {
+  const precision = assetPrecision == null ? undefined : assetPrecision;
+  const amountMoney = toExactMoney(amount, precision);
+  const feeMoney = toExactMoney(fee, precision);
+
+  if (amountMoney.precision !== feeMoney.precision) {
+    const error = new Error('Amount and fee must use the same asset precision');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  return {
+    amountUnits: amountMoney.units,
+    feeUnits: feeMoney.units,
+    assetPrecision: amountMoney.precision,
+    network: resolveNetwork(network) || DEFAULT_NETWORK,
+  };
+}
 
 async function transferAccount(username, oldAddress, newAddress, oldSignature, newSignature) {
   if (!username) {
@@ -187,5 +227,5 @@ async function assignPrimaryUsername(tx, address, username) {
 module.exports = {
   transferAccount,
   removeAlias,
-  assignPrimaryUsername,
+  buildExactPaymentFields,
 };
