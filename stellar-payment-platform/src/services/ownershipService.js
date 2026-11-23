@@ -233,6 +233,89 @@ const httpError = (message, statusCode) => {
   return error;
 };
 
+/**
+ * Returns true when the supplied actor is an administrator.  Accepts either a
+ * boolean flag (`isAdmin`) or a role string (`role === 'admin'`), so callers
+ * can pass whatever their auth middleware exposes.
+ *
+ * @param {{isAdmin?: boolean, role?: string}|null|undefined} actor
+ * @returns {boolean}
+ */
+const isAdminActor = (actor) => {
+  if (!actor || typeof actor !== 'object') return false;
+  if (actor.isAdmin === true) return true;
+  return typeof actor.role === 'string' && actor.role.toLowerCase() === 'admin';
+};
+
+/**
+ * Extracts the owning user identifier from an export job record.  Supports the
+ * common field names used across the codebase (`ownerId`, `userId`,
+ * `requestedBy`) and returns `null` when none is present.
+ *
+ * @param {object|null|undefined} job
+ * @returns {string|null}
+ */
+const getExportJobOwnerId = (job) => {
+  if (!job || typeof job !== 'object') return null;
+  const candidate = job.ownerId ?? job.userId ?? job.requestedBy ?? null;
+  return candidate === null || candidate === undefined ? null : String(candidate);
+};
+
+/**
+ * Extracts the acting user identifier from an authenticated actor object.
+ *
+ * @param {{id?: string|number, userId?: string|number, sub?: string|number}|null|undefined} actor
+ * @returns {string|null}
+ */
+const getActorId = (actor) => {
+  if (!actor || typeof actor !== 'object') return null;
+  const candidate = actor.id ?? actor.userId ?? actor.sub ?? null;
+  return candidate === null || candidate === undefined ? null : String(candidate);
+};
+
+/**
+ * Asserts that `actor` may access `job`.  Admins may access any job; regular
+ * users may only access jobs they own.
+ *
+ * Throws an error with `statusCode` set:
+ *  - 404 when the job is missing (avoids leaking existence to non-owners)
+ *  - 403 when the job exists but is owned by someone else
+ *
+ * @param {object|null|undefined} job
+ * @param {object|null|undefined} actor
+ * @returns {object} the job, for convenient chaining
+ */
+const assertExportJobOwnership = (job, actor) => {
+  if (!job) throw httpError('Export job not found.', 404);
+  if (isAdminActor(actor)) return job;
+
+  const ownerId = getExportJobOwnerId(job);
+  const actorId = getActorId(actor);
+
+  if (!ownerId || !actorId || ownerId !== actorId) {
+    throw httpError('You do not have permission to access this export job.', 403);
+  }
+
+  return job;
+};
+
+/**
+ * Async variant that loads the job via `loadJob` (a function returning the job
+ * or `null`) and then applies {@link assertExportJobOwnership}.  Useful for
+ * route handlers that need to fetch before checking.
+ *
+ * @param {() => Promise<object|null>} loadJob
+ * @param {object|null|undefined} actor
+ * @returns {Promise<object>}
+ */
+const assertExportJobOwnershipById = async (loadJob, actor) => {
+  if (typeof loadJob !== 'function') {
+    throw httpError('Export job not found.', 404);
+  }
+  const job = await loadJob();
+  return assertExportJobOwnership(job, actor);
+};
+
 const verifyFreighterSignedMessage = ({ message, signature, signerAddress, publicKey }) => {
   const claimedSigner = signerAddress || publicKey;
 
@@ -398,4 +481,10 @@ module.exports = {
   SIGNER_CACHE_TTL_MS,
   SIGNER_CACHE_KEY_PREFIX,
   _signerMemoryCache,
+  // Export job ownership helpers
+  isAdminActor,
+  getExportJobOwnerId,
+  getActorId,
+  assertExportJobOwnership,
+  assertExportJobOwnershipById,
 };

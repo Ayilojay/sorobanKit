@@ -767,6 +767,110 @@ Streams transaction records from the database as a CSV or NDJSON download for ex
 
 Records are fetched at most 500 at a time and written directly to the response. The export stops at the lower of `limit` and `ADMIN_EXPORT_MAX_ROWS` (default `1000000`). Configure the cap as a positive integer no greater than `2147483647`; invalid configuration fails closed with HTTP 500. Invalid limits return HTTP 400. A bounded one-row probe checks for additional matching records before streaming starts, so truncated downloads include `X-Truncated: true`; exports ending exactly at the boundary omit that header. JSON output remains newline-delimited (one object per line).
 
+Large exports can also be run as durable background jobs — see
+[Background admin export jobs](#background-admin-export-jobs) below.
+
+### Background admin export jobs
+
+Exports that would take longer than a request should live are run as durable
+background jobs. A job is created, persisted, and processed by a bounded worker
+pool; the caller polls for progress, can cancel it, and downloads the finished
+artifact from a short-lived link.
+
+#### Creating a job
+
+```bash
+curl -X POST "http://localhost:5000/admin/export/jobs" \
+  -H "x-api-key: $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"format":"csv","startDate":"2026-01-01","endDate":"2026-01-31"}'
+```
+
+The body accepts the same `format`, `limit`, `startDate` and `endDate` fields as
+`GET /admin/export`. The response is `202 Accepted` with the job record:
+
+```json
+{
+  "success": true,
+  "data": {
+    "id": "c1f0…",
+    "status": "queued",
+    "format": "csv",
+    "progress": { "rowsWritten": 0, "percent": 0 },
+    "createdAt": "2026-01-31T12:00:00.000Z",
+    "expiresAt": null
+  }
+}
+```
+
+Jobs are owned by the credential that created them. Polling, cancelling or
+downloading a job with a different credential returns `404 Not Found` rather
+than `403`, so job IDs cannot be probed for existence.
+
+#### Polling progress
+
+```bash
+curl "http://localhost:5000/admin/export/jobs/c1f0…" -H "x-api-key: $ADMIN_API_KEY"
+```
+
+`status` moves `queued` → `running` → `succeeded` | `failed` | `cancelled`.
+While running, `progress.rowsWritten` and `progress.percent` are updated as rows
+are written. A failed job carries `error.code` and `error.message`; the stack
+stays in the server log under the job's reference ID.
+
+#### Cancelling
+
+```bash
+curl -X DELETE "http://localhost:5000/admin/export/jobs/c1f0…" -H "x-api-key: $ADMIN_API_KEY"
+```
+
+Cancellation is cooperative: a queued job is cancelled immediately, and a
+running job stops at the next chunk boundary, discards its partial artifact and
+settles as `cancelled`. Cancelling a job that already finished returns `409
+Conflict`.
+
+#### Downloading
+
+```bash
+curl -L "http://localhost:5000/admin/export/jobs/c1f0…/download" -H "x-api-key: $ADMIN_API_KEY"
+```
+
+The download endpoint streams the artifact from disk with the same content type
+and `Content-Disposition` as the synchronous export. Artifacts expire
+`EXPORT_ARTIFACT_TTL` seconds after the job succeeds; after that the endpoint
+returns `410 Gone` and the file is deleted by the cleanup sweep. Re-running the
+export means creating a new job.
+
+#### Storage and worker configuration
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `EXPORT_ARTIFACT_DIR` | `stellar-payment-platform/var/exports` | Directory where finished artifacts are written. Must be writable by the server process and shared by every instance that may serve downloads. |
+| `EXPORT_ARTIFACT_TTL` | `86400` (24h) | Seconds a finished artifact stays downloadable before it is deleted. |
+| `EXPORT_WORKER_CONCURRENCY` | `2` | Maximum number of export jobs processed at once per instance. Queued jobs wait until a slot frees. |
+
+Workers stream rows straight to the artifact file, so memory use stays flat
+regardless of export size — the same bounded paging as the synchronous export,
+with no full result set or full CSV held in memory. Because jobs are persisted,
+a restart resumes `queued` jobs and marks `running` jobs `failed` so they can be
+retried; artifacts already on disk survive restarts until their TTL elapses.
+
+#### Monitoring
+
+Background exports add these metrics to `GET /metrics`:
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `export_jobs_queued` | gauge | Jobs waiting for a worker slot |
+| `export_jobs_running` | gauge | Jobs currently being processed |
+| `export_jobs_completed_total` | counter | Jobs finished, by `status` (`succeeded`, `failed`, `cancelled`) |
+| `export_job_duration_seconds` | histogram | Time from job start to terminal status |
+| `export_job_rows_written_total` | counter | Rows written across finished jobs |
+
+Alert on a sustained `export_jobs_queued` above `EXPORT_WORKER_CONCURRENCY` (the
+queue is not draining) and on any rise in `export_jobs_completed_total{status="failed"}`.
+=======
+
 ### `GET /admin/stats/routing`
 Returns historical payment routing statistics and aggregated volumes, fees, and transaction counts grouped by day, week, or month.
 - **Query Parameters:**
