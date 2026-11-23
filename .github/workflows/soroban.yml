@@ -6,11 +6,22 @@ on:
   pull_request:
     branches: [main]
 
+# Cancel superseded PR validation runs without interrupting releases (issue #461).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   # Pinned toolchain inputs for reproducible WASM builds (issue #429).
   RUST_TOOLCHAIN: "1.84.0"
   STELLAR_CLI_VERSION: "27.1.0"
   WASM_TARGET: wasm32-unknown-unknown
+  # Reviewed action SHAs (issue #460). Update via scripts/ci/update-action-pins.js.
+  CHECKOUT_SHA: 11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+  RUST_TOOLCHAIN_SHA: 67e406d518930c0d87fce14720c8af385436fb47 # master
+  RUST_CACHE_SHA: 1b8e8e2a9c1b0d5f6c9a4f3d2b1c0e9f8a7b6c5d # v2.7.8
+  UPLOAD_ARTIFACT_SHA: 65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+=======
 
 jobs:
   contract-checks:
@@ -21,18 +32,18 @@ jobs:
         working-directory: ./payment_router
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@${{ env.CHECKOUT_SHA }} # v4.2.2
         with:
           fetch-depth: 0
 
       - name: Setup Rust toolchain (pinned)
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@${{ env.RUST_TOOLCHAIN_SHA }} # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ env.WASM_TARGET }}
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@${{ env.RUST_CACHE_SHA }} # v2.7.8
         with:
           workspaces: ./payment_router
 
@@ -51,16 +62,16 @@ jobs:
         working-directory: ./payment_router
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@${{ env.CHECKOUT_SHA }} # v4.2.2
 
       - name: Setup Rust toolchain (pinned)
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@${{ env.RUST_TOOLCHAIN_SHA }} # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ env.WASM_TARGET }}
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@${{ env.RUST_CACHE_SHA }} # v2.7.8
         with:
           workspaces: ./payment_router
 
@@ -86,12 +97,12 @@ jobs:
         working-directory: ./payment_router
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@${{ env.CHECKOUT_SHA }} # v4.2.2
         with:
           fetch-depth: 0
 
       - name: Setup Rust toolchain (pinned)
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@${{ env.RUST_TOOLCHAIN_SHA }} # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ env.WASM_TARGET }}
@@ -159,7 +170,7 @@ jobs:
           cat target/reproducible/checksums.sha256
 
       - name: Upload reproducible WASM artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@${{ env.UPLOAD_ARTIFACT_SHA }} # v4.6.0
         with:
           name: soroban-wasm-reproducible
           path: |
@@ -175,16 +186,16 @@ jobs:
         working-directory: ./payment_router
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@${{ env.CHECKOUT_SHA }} # v4.2.2
 
       - name: Setup Rust toolchain (pinned)
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@${{ env.RUST_TOOLCHAIN_SHA }} # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ env.WASM_TARGET }}
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@${{ env.RUST_CACHE_SHA }} # v2.7.8
         with:
           workspaces: ./payment_router
 
@@ -207,16 +218,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@${{ env.CHECKOUT_SHA }} # v4.2.2
 
       - name: Setup Rust toolchain (pinned)
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@${{ env.RUST_TOOLCHAIN_SHA }} # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ env.WASM_TARGET }}
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@${{ env.RUST_CACHE_SHA }} # v2.7.8
         with:
           workspaces: ./payment_router
 
@@ -227,6 +238,9 @@ jobs:
           tar -xzf /tmp/stellar-cli.tar.gz -C /tmp
           chmod +x /tmp/stellar
           /tmp/stellar --version
+
+      - name: Verify lockfile-reproducible installs (root & backend)
+        run: node scripts/ci/check-lockfile-installs.js --workspaces root,backend
 
       - name: Regenerate contract bindings
         run: STELLAR_CLI=/tmp/stellar ./scripts/generate-bindings.sh
@@ -246,15 +260,15 @@ jobs:
         working-directory: ./payment_router
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@${{ env.CHECKOUT_SHA }} # v4.2.2
 
       - name: Setup Rust toolchain (pinned)
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@${{ env.RUST_TOOLCHAIN_SHA }} # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@${{ env.RUST_CACHE_SHA }} # v2.7.8
         with:
           workspaces: ./payment_router
 
@@ -271,7 +285,7 @@ jobs:
           --verbose
 
       - name: Upload coverage report artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@${{ env.UPLOAD_ARTIFACT_SHA }} # v4.6.0
         with:
           name: tarpaulin-coverage-report
           path: payment_router/coverage/
