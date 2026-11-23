@@ -109,6 +109,7 @@ function Dashboard({
     color: "#1F2937",
     bgColor: "#F3F4F6",
   });
+  const [isConfirmOpen, setIsConfirmOpen] = useState(false);
 
   // Centralized focus + live-region announcements. Background refreshes pass
   // `{ background: true }` so they never steal focus from the user.
@@ -132,14 +133,8 @@ function Dashboard({
     if (balance === null || balance === undefined || balance === '') {
       return '--';
     }
-    const numericBalance = Number(balance);
-    if (Number.isNaN(numericBalance)) {
-      return String(balance);
-    }
-    return numericBalance.toLocaleString(undefined, {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 7,
-    });
+    const formatted = formatAmount(balance);
+    return formatted === null ? String(balance) : formatted;
   }, [balance]);
 
   // Derived state: whether the wallet is currently connected.
@@ -157,15 +152,12 @@ function Dashboard({
     [nameTag],
   );
 
-  // Derived state: parsed numeric amount, recomputed only when amount changes.
-  const parsedAmount = useMemo(() => {
-    const value = parseFloat(amount);
-    return Number.isNaN(value) ? 0 : value;
-  }, [amount]);
+  // Derived state: parsed decimal-safe amount, recomputed only when amount changes.
+  const parsedAmount = useMemo(() => parseAmount(amount), [amount]);
 
   // Derived state: whether the entered amount is valid for submission.
   const hasValidAmount = useMemo(
-    () => parsedAmount > 0,
+    () => parsedAmount !== null && parsedAmount > 0n,
     [parsedAmount],
   );
 
@@ -349,7 +341,20 @@ function Dashboard({
     displayMessage("Wallet connected.", "#059669", "#D1FAE5");
   };
 
-  const handleLookup = async () => {
+  const handleLookup = () => {
+    if (isSubmitting) return;
+
+    const amountValue = parseAmount(amount);
+
+    if (amountValue === null || amountValue <= 0n) {
+      toast.error("Please enter a valid amount greater than zero.");
+      return;
+    }
+
+    setIsConfirmOpen(true);
+  };
+
+  const handleConfirmPayment = async () => {
     if (isSubmitting) return;
     if (!isOnline) {
       toast.error("You are offline. Payments are disabled until you reconnect.");
@@ -358,9 +363,9 @@ function Dashboard({
     setIsSubmitting(true);
 
     const recipientInput = nameTag.trim();
-    const amountValue = parseFloat(amount);
+    const amountValue = parseAmount(amount);
 
-    if (!amountValue || Number.isNaN(amountValue) || amountValue <= 0) {
+    if (amountValue === null || amountValue <= 0n) {
       toast.error("Please enter a valid amount greater than zero.");
       announce("Please enter a valid amount greater than zero.", 'assertive');
       setIsSubmitting(false);
@@ -407,7 +412,7 @@ function Dashboard({
       }
 
       toast.loading("Simulating smart contract execution...", { id: toastId });
-      const amountStroops = BigInt(Math.floor(amountValue * 10000000));
+      const amountStroops = toStroops(amountValue);
 
       // Build and simulate the payment through the type-safe client generated
       // from the contract ABI (packages/types).
@@ -461,6 +466,7 @@ function Dashboard({
     } finally {
       setIsProcessing(false);
       setIsSubmitting(false);
+      setIsConfirmOpen(false);
     }
   };
 
@@ -573,7 +579,12 @@ function Dashboard({
           onChange={(event) => setAmount(event.target.value)}
           placeholder="0.00"
           inputMode="decimal"
+          aria-describedby="amount-hint"
+          aria-invalid={amount.trim().length > 0 && !hasValidAmount}
         />
+        <p id="amount-hint" className="field-hint">
+          Enter an amount with up to 7 decimal places.
+        </p>
 
         <button
           type="button"
@@ -586,6 +597,24 @@ function Dashboard({
         >
           {isProcessing ? "Processing..." : "Send Payment"}
         </button>
+
+        <Dialog
+          isOpen={isConfirmOpen}
+          onClose={() => setIsConfirmOpen(false)}
+          title="Confirm payment"
+          description="Review the details below before submitting."
+          confirmLabel="Confirm and send"
+          cancelLabel="Cancel"
+          onConfirm={handleConfirmPayment}
+          isBusy={isProcessing}
+        >
+          <dl className="confirm-details">
+            <dt>Recipient</dt>
+            <dd>{nameTag.trim()}</dd>
+            <dt>Amount</dt>
+            <dd>{formatAmount(amount) ?? amount}</dd>
+          </dl>
+        </Dialog>
 
         {status.text && (
           <p

@@ -115,6 +115,26 @@ function formatFreshness(value) {
  */
 
 /**
+ * Format a raw decimal amount string for display using token precision.
+ * Keeps the canonical value as a string and only applies precision at the
+ * UI boundary, avoiding floating-point round-trip loss.
+ *
+ * @param {string | undefined | null} rawAmount
+ * @param {string} asset
+ * @returns {string}
+ */
+function formatDisplayAmount(rawAmount, asset) {
+  if (rawAmount === undefined || rawAmount === null || rawAmount === "") {
+    return "-";
+  }
+  const parsed = parseAmount(rawAmount);
+  if (parsed === null) {
+    return `${rawAmount} ${asset}`;
+  }
+  return `${formatAmount(parsed, asset)} ${asset}`;
+}
+
+/**
  * @param {HistoryPageProps} props
  */
 function HistoryPage({
@@ -246,7 +266,7 @@ function HistoryPage({
                   change.from === userPublicKey ? "Sent" : "Received";
                 const counterparty =
                   change.from === userPublicKey ? change.to : change.from;
-                const amount = `${change.amount} XLM`;
+                const amount = formatDisplayAmount(change.amount, "XLM");
                 const status =
                   record.transaction_successful === false
                     ? "Failed"
@@ -290,7 +310,7 @@ function HistoryPage({
                 ? "XLM"
                 : record.asset_code || "Asset";
             const rawAmount = record.amount || record.starting_balance || "";
-            const amount = rawAmount ? `${rawAmount} ${asset}` : "-";
+            const amount = formatDisplayAmount(rawAmount, asset);
             const status =
               record.transaction_successful === false ? "Failed" : "Success";
             const explorerLink = record.transaction_hash

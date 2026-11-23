@@ -26,6 +26,19 @@
   }
 }
 
+/* Respect reduced-motion: skip the entrance animation and nonessential
+   transitions, but keep hover/focus feedback (applied instantly). */
+@media (prefers-reduced-motion: reduce) {
+  .recent-addresses {
+    animation: none;
+  }
+
+  .recent-addresses__clear,
+  .recent-addresses__option {
+    transition: none;
+  }
+}
+
 .recent-addresses__header {
   display: flex;
   align-items: center;
