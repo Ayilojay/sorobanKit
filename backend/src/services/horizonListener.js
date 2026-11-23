@@ -15,6 +15,73 @@ const EVENT_SCHEMA_ID = 'stellar.payment.event';
 const EVENT_SCHEMA_VERSION = 1;
 const SUPPORTED_EVENT_SCHEMA_VERSIONS = [1];
 
+// Canonical payment lifecycle statuses. These are the only values that may be
+// persisted for a payment; legacy values are migrated via PAYMENT_STATUS_ALIASES.
+const PAYMENT_STATUS = Object.freeze({
+  PENDING: 'pending',
+  SUCCEEDED: 'succeeded',
+  FAILED: 'failed',
+  REVERSED: 'reversed',
+});
+
+const PAYMENT_STATUSES = Object.freeze(Object.values(PAYMENT_STATUS));
+
+// Allowed payment lifecycle transitions. Terminal states have no outgoing edges.
+const PAYMENT_TRANSITIONS = Object.freeze({
+  [PAYMENT_STATUS.PENDING]: [PAYMENT_STATUS.SUCCEEDED, PAYMENT_STATUS.FAILED],
+  [PAYMENT_STATUS.SUCCEEDED]: [PAYMENT_STATUS.REVERSED],
+  [PAYMENT_STATUS.FAILED]: [],
+  [PAYMENT_STATUS.REVERSED]: [],
+});
+
+// Legacy persisted payment status values mapped to canonical values.
+const PAYMENT_STATUS_ALIASES = Object.freeze({
+  success: PAYMENT_STATUS.SUCCEEDED,
+  succeeded: PAYMENT_STATUS.SUCCEEDED,
+  complete: PAYMENT_STATUS.SUCCEEDED,
+  completed: PAYMENT_STATUS.SUCCEEDED,
+  confirmed: PAYMENT_STATUS.SUCCEEDED,
+  error: PAYMENT_STATUS.FAILED,
+  failed: PAYMENT_STATUS.FAILED,
+  rejected: PAYMENT_STATUS.FAILED,
+  refunded: PAYMENT_STATUS.REVERSED,
+  reversed: PAYMENT_STATUS.REVERSED,
+  pending: PAYMENT_STATUS.PENDING,
+  processing: PAYMENT_STATUS.PENDING,
+});
+
+// Canonical webhook lifecycle statuses.
+const WEBHOOK_STATUS = Object.freeze({
+  PENDING: 'pending',
+  DELIVERED: 'delivered',
+  FAILED: 'failed',
+  DEAD: 'dead',
+});
+
+const WEBHOOK_STATUSES = Object.freeze(Object.values(WEBHOOK_STATUS));
+
+// Allowed webhook lifecycle transitions. Terminal states have no outgoing edges.
+const WEBHOOK_TRANSITIONS = Object.freeze({
+  [WEBHOOK_STATUS.PENDING]: [WEBHOOK_STATUS.DELIVERED, WEBHOOK_STATUS.FAILED],
+  [WEBHOOK_STATUS.FAILED]: [WEBHOOK_STATUS.PENDING, WEBHOOK_STATUS.DEAD],
+  [WEBHOOK_STATUS.DELIVERED]: [],
+  [WEBHOOK_STATUS.DEAD]: [],
+});
+
+// Legacy persisted webhook status values mapped to canonical values.
+const WEBHOOK_STATUS_ALIASES = Object.freeze({
+  pending: WEBHOOK_STATUS.PENDING,
+  queued: WEBHOOK_STATUS.PENDING,
+  retrying: WEBHOOK_STATUS.PENDING,
+  delivered: WEBHOOK_STATUS.DELIVERED,
+  success: WEBHOOK_STATUS.DELIVERED,
+  sent: WEBHOOK_STATUS.DELIVERED,
+  failed: WEBHOOK_STATUS.FAILED,
+  error: WEBHOOK_STATUS.FAILED,
+  dead: WEBHOOK_STATUS.DEAD,
+  exhausted: WEBHOOK_STATUS.DEAD,
+});
+
 function getExpectedPassphrase(network) {
   const key = String(network || '').toLowerCase();
   return NETWORK_PASSPHRASES[key] || null;
@@ -122,6 +189,56 @@ function validateEventPayload(payload) {
   return normalized;
 }
 
+// Resolve a persisted payment status to its canonical value. Legacy aliases are
+// migrated; unknown values are rejected so they are never written back.
+function normalizePaymentStatus(value) {
+  if (value === undefined || value === null) {
+    throw new Error('Payment status is required');
+  }
+  const key = String(value).trim().toLowerCase();
+  const canonical = PAYMENT_STATUS_ALIASES[key];
+  if (!canonical) {
+    throw new Error(`Unknown payment status: ${value}`);
+  }
+  return canonical;
+}
+
+// Resolve a persisted webhook status to its canonical value.
+function normalizeWebhookStatus(value) {
+  if (value === undefined || value === null) {
+    throw new Error('Webhook status is required');
+  }
+  const key = String(value).trim().toLowerCase();
+  const canonical = WEBHOOK_STATUS_ALIASES[key];
+  if (!canonical) {
+    throw new Error(`Unknown webhook status: ${value}`);
+  }
+  return canonical;
+}
+
+// Enforce an allowed payment lifecycle transition. Returns the canonical next
+// status; throws on unknown or disallowed transitions.
+function assertPaymentTransition(from, to) {
+  const current = normalizePaymentStatus(from);
+  const next = normalizePaymentStatus(to);
+  const allowed = PAYMENT_TRANSITIONS[current] || [];
+  if (!allowed.includes(next)) {
+    throw new Error(`Disallowed payment transition: ${current} -> ${next}`);
+  }
+  return next;
+}
+
+// Enforce an allowed webhook lifecycle transition.
+function assertWebhookTransition(from, to) {
+  const current = normalizeWebhookStatus(from);
+  const next = normalizeWebhookStatus(to);
+  const allowed = WEBHOOK_TRANSITIONS[current] || [];
+  if (!allowed.includes(next)) {
+    throw new Error(`Disallowed webhook transition: ${current} -> ${next}`);
+  }
+  return next;
+}
+
 async function startHorizonListener(config) {
   const server = new Horizon.Server(config.horizonUrl);
 
@@ -159,6 +276,17 @@ function handlePayment(payment, config) {
   } catch (err) {
     logger.error(`Rejected payment event ${payment && payment.id}: ${err.message}`);
     return;
+  }
+
+  // Constrain the persisted lifecycle value to a canonical status. Unknown
+  // statuses are rejected rather than written through.
+  if (event.status !== undefined && event.status !== null) {
+    try {
+      event = { ...event, status: normalizePaymentStatus(event.status) };
+    } catch (err) {
+      logger.error(`Rejected payment event ${payment && payment.id}: ${err.message}`);
+      return;
+    }
   }
 
   if (typeof config.onPayment === 'function') {
@@ -200,8 +328,20 @@ module.exports = {
   normalizeEventMetadata,
   validateEventPayload,
   adaptUnversionedEvent,
+  normalizePaymentStatus,
+  normalizeWebhookStatus,
+  assertPaymentTransition,
+  assertWebhookTransition,
   NETWORK_PASSPHRASES,
   EVENT_SCHEMA_ID,
   EVENT_SCHEMA_VERSION,
   SUPPORTED_EVENT_SCHEMA_VERSIONS,
+  PAYMENT_STATUS,
+  PAYMENT_STATUSES,
+  PAYMENT_TRANSITIONS,
+  PAYMENT_STATUS_ALIASES,
+  WEBHOOK_STATUS,
+  WEBHOOK_STATUSES,
+  WEBHOOK_TRANSITIONS,
+  WEBHOOK_STATUS_ALIASES,
 };
