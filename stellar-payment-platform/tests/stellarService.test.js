@@ -62,6 +62,10 @@ const {
   createBreaker,
   HORIZON_BASE,
   BREAKER_THRESHOLD,
+  resolveNetworkIdentity,
+  DEFAULT_NETWORK,
+  buildTransactionIdentity,
+  upsertLedgerTransaction,
 } = require('../src/services/stellarService');
 
 describe('StellarService — Circuit Breaker', () => {
@@ -305,6 +309,214 @@ describe('StellarService — Circuit Breaker', () => {
       } catch (err) {
         expect(err.code).toBe('EOPENBREAKER');
       }
+    });
+  });
+});
+
+describe('StellarService — network-aware transaction identity', () => {
+  const HASH = 'a'.repeat(64);
+
+  /**
+   * Minimal in-memory stand-in for the ledger_transactions table with the
+   * composite UNIQUE (network, transaction_hash) constraint applied.
+   */
+  function createLedgerStore() {
+    const rows = [];
+    return {
+      rows,
+      async insert({ network, transaction_hash, ledger }) {
+        const duplicate = rows.some(
+          (r) => r.network === network && r.transaction_hash === transaction_hash,
+        );
+        if (duplicate) {
+          const err = new Error('duplicate key value violates unique constraint');
+          err.code = '23505';
+          throw err;
+        }
+        const row = { network, transaction_hash, ledger };
+        rows.push(row);
+        return row;
+      },
+    };
+  }
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    delete process.env.STELLAR_NETWORK;
+  });
+
+  describe('resolveNetworkIdentity', () => {
+    it('defaults to the public network when nothing is configured', () => {
+      expect(DEFAULT_NETWORK).toBe('public');
+      expect(resolveNetworkIdentity()).toBe('public');
+    });
+
+    it('honours an explicit network argument', () => {
+      expect(resolveNetworkIdentity('testnet')).toBe('testnet');
+      expect(resolveNetworkIdentity('futurenet')).toBe('futurenet');
+    });
+
+    it('falls back to STELLAR_NETWORK env when no argument is given', () => {
+      process.env.STELLAR_NETWORK = 'testnet';
+      expect(resolveNetworkIdentity()).toBe('testnet');
+    });
+
+    it('normalises case and whitespace', () => {
+      expect(resolveNetworkIdentity('  TESTNET ')).toBe('testnet');
+    });
+
+    it('rejects empty or non-string network values', () => {
+      expect(() => resolveNetworkIdentity('')).toThrow();
+      expect(() => resolveNetworkIdentity('   ')).toThrow();
+      expect(() => resolveNetworkIdentity(42)).toThrow();
+    });
+  });
+
+  describe('buildTransactionIdentity', () => {
+    it('builds a composite identity from network and hash', () => {
+      expect(buildTransactionIdentity({ network: 'testnet', hash: HASH })).toEqual({
+        network: 'testnet',
+        transaction_hash: HASH,
+      });
+    });
+
+    it('applies the default network policy when network is omitted', () => {
+      expect(buildTransactionIdentity({ hash: HASH })).toEqual({
+        network: 'public',
+        transaction_hash: HASH,
+      });
+    });
+
+    it('rejects a missing or malformed hash', () => {
+      expect(() => buildTransactionIdentity({ network: 'public' })).toThrow();
+      expect(() => buildTransactionIdentity({ network: 'public', hash: 'short' })).toThrow();
+    });
+  });
+
+  describe('unique (network, transaction_hash) constraint', () => {
+    it('allows the same hash on two distinct networks', async () => {
+      const store = createLedgerStore();
+
+      await store.insert({ network: 'public', transaction_hash: HASH, ledger: 1 });
+      await store.insert({ network: 'testnet', transaction_hash: HASH, ledger: 1 });
+
+      expect(store.rows).toHaveLength(2);
+      expect(store.rows.map((r) => r.network).sort()).toEqual(['public', 'testnet']);
+    });
+
+    it('rejects a duplicate (network, hash) pair', async () => {
+      const store = createLedgerStore();
+
+      await store.insert({ network: 'public', transaction_hash: HASH, ledger: 1 });
+
+      await expect(
+        store.insert({ network: 'public', transaction_hash: HASH, ledger: 2 }),
+      ).rejects.toMatchObject({ code: '23505' });
+      expect(store.rows).toHaveLength(1);
+    });
+
+    it('treats network comparison as exact (no implicit defaulting on insert)', async () => {
+      const store = createLedgerStore();
+
+      await store.insert({ network: 'public', transaction_hash: HASH, ledger: 1 });
+
+      await expect(
+        store.insert({ network: 'PUBLIC', transaction_hash: HASH, ledger: 2 }),
+      ).resolves.toBeDefined();
+    });
+  });
+
+  describe('backfill default network policy', () => {
+    it('assigns the default network to pre-existing rows lacking one', () => {
+      const legacyRows = [
+        { transaction_hash: HASH, ledger: 1 },
+        { transaction_hash: 'b'.repeat(64), ledger: 2 },
+      ];
+
+      const backfilled = legacyRows.map((row) => ({
+        ...row,
+        network: row.network || DEFAULT_NETWORK,
+      }));
+
+      expect(backfilled.every((r) => r.network === 'public')).toBe(true);
+      expect(backfilled.map((r) => r.transaction_hash)).toEqual(
+        legacyRows.map((r) => r.transaction_hash),
+      );
+    });
+
+    it('preserves an existing network value during backfill', () => {
+      const row = { transaction_hash: HASH, ledger: 1, network: 'testnet' };
+      const backfilled = { ...row, network: row.network || DEFAULT_NETWORK };
+      expect(backfilled.network).toBe('testnet');
+    });
+  });
+
+  describe('upsertLedgerTransaction', () => {
+    it('includes the network in the upsert payload', async () => {
+      const store = createLedgerStore();
+      const upsert = jest.fn((row) => store.insert(row));
+
+      await upsertLedgerTransaction(
+        { hash: HASH, ledger: 7, network: 'testnet' },
+        { upsert },
+      );
+
+      expect(upsert).toHaveBeenCalledTimes(1);
+      expect(upsert.mock.calls[0][0]).toMatchObject({
+        network: 'testnet',
+        transaction_hash: HASH,
+      });
+    });
+
+    it('applies the default network when the caller omits it', async () => {
+      const store = createLedgerStore();
+      const upsert = jest.fn((row) => store.insert(row));
+
+      await upsertLedgerTransaction({ hash: HASH, ledger: 7 }, { upsert });
+
+      expect(upsert.mock.calls[0][0].network).toBe(DEFAULT_NETWORK);
+    });
+
+    it('is idempotent for a repeated upsert of the same (network, hash)', async () => {
+      const store = createLedgerStore();
+      const upsert = jest.fn((row) => store.insert(row));
+
+      await upsertLedgerTransaction({ hash: HASH, ledger: 7, network: 'public' }, { upsert });
+      await expect(
+        upsertLedgerTransaction({ hash: HASH, ledger: 7, network: 'public' }, { upsert }),
+      ).rejects.toMatchObject({ code: '23505' });
+      expect(store.rows).toHaveLength(1);
+    });
+
+    it('handles concurrent upserts of the same hash on different networks', async () => {
+      const store = createLedgerStore();
+      const upsert = jest.fn((row) => store.insert(row));
+
+      const results = await Promise.all([
+        upsertLedgerTransaction({ hash: HASH, ledger: 1, network: 'public' }, { upsert }),
+        upsertLedgerTransaction({ hash: HASH, ledger: 1, network: 'testnet' }, { upsert }),
+      ]);
+
+      expect(results).toHaveLength(2);
+      expect(store.rows).toHaveLength(2);
+      expect(store.rows.map((r) => r.network).sort()).toEqual(['public', 'testnet']);
+    });
+
+    it('rejects one of two concurrent upserts of the same (network, hash)', async () => {
+      const store = createLedgerStore();
+      const upsert = jest.fn((row) => store.insert(row));
+
+      const settled = await Promise.allSettled([
+        upsertLedgerTransaction({ hash: HASH, ledger: 1, network: 'public' }, { upsert }),
+        upsertLedgerTransaction({ hash: HASH, ledger: 1, network: 'public' }, { upsert }),
+      ]);
+
+      const fulfilled = settled.filter((s) => s.status === 'fulfilled');
+      const rejected = settled.filter((s) => s.status === 'rejected');
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+      expect(rejected[0].reason.code).toBe('23505');
+      expect(store.rows).toHaveLength(1);
     });
   });
 });

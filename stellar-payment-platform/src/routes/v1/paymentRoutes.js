@@ -9,6 +9,15 @@ const { StrKey } = require('@stellar/stellar-sdk');
 const { logger } = require('../../logger');
 const { idempotencyMiddleware } = require('../../../middleware/idempotency');
 const { updatePaymentIntentStatus } = require('../../services/paymentIntentStateMachine');
+const { normalizeAmount, AmountError } = require('../../utils/amount');
+
+// Stellar assets are denominated in 7 decimal places (stroops).
+const STELLAR_ASSET_PRECISION = 7;
+
+// Resolve the network the payment intent is bound to. Falls back to the
+// configured default so transaction identity always includes a network.
+const resolveNetwork = (intent) =>
+  intent.network || process.env.STELLAR_NETWORK || 'testnet';
 
 module.exports = (redisClient) => {
   const router = express.Router();
@@ -36,28 +45,54 @@ module.exports = (redisClient) => {
   const intents = req.body;
 
   // Additional per-item validation that requires runtime logic
+  const normalizedIntents = [];
   for (const idx in intents) {
     const intent = intents[idx];
     if (!StrKey.isValidEd25519PublicKey(intent.from)) {
       const err = new Error(`Invalid Stellar public key for 'from' at index ${idx}`);
       err.statusCode = 400;
+      err.code = 'INVALID_INPUT';
       throw err;
     }
     if (!StrKey.isValidEd25519PublicKey(intent.to)) {
       const err = new Error(`Invalid Stellar public key for 'to' at index ${idx}`);
       err.statusCode = 400;
+      err.code = 'INVALID_INPUT';
       throw err;
     }
+
+    // Amounts are stored as exact decimal strings at asset precision. Values
+    // with more fractional digits than the asset supports are rejected rather
+    // than silently rounded.
+    let amount;
+    try {
+      amount = normalizeAmount(intent.amount, { precision: STELLAR_ASSET_PRECISION });
+    } catch (amountError) {
+      if (amountError instanceof AmountError) {
+        const err = new Error(`Invalid amount at index ${idx}: ${amountError.message}`);
+        err.statusCode = 400;
+        err.code = 'INVALID_INPUT';
+        throw err;
+      }
+      throw amountError;
+    }
+
+    normalizedIntents.push({
+      ...intent,
+      amount,
+      network: resolveNetwork(intent),
+    });
   }
 
   try {
-    const createOps = intents.map((intent) => prisma.paymentIntent.create({
+    const createOps = normalizedIntents.map((intent) => prisma.paymentIntent.create({
       data: {
         externalId: intent.external_id,
         from: intent.from,
         to: intent.to,
         amount: intent.amount,
         asset: intent.asset,
+        network: intent.network,
         memoType: intent.memo_type,
         memo: intent.memo,
         metadata: intent.metadata,
