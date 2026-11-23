@@ -37,6 +37,91 @@ const HORIZON_URLS = {
 const HORIZON_URL = HORIZON_URLS[NETWORK] || HORIZON_URLS.testnet;
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS, 10) || 60000;
 
+// ---------------------------------------------------------------------------
+// Network identity policy (#385)
+// ---------------------------------------------------------------------------
+// Every ledger transaction is uniquely identified by (network, tx_hash): the
+// same hash can legitimately exist on testnet and public. The network label
+// written to the database is derived as follows:
+//   1. If HORIZON_NETWORK is set, use it verbatim (e.g. "testnet", "public").
+//   2. Otherwise, if HORIZON_BASE / HORIZON_URL points at a known Horizon
+//      endpoint, map it to "testnet" or "public".
+//   3. Otherwise fall back to "testnet" (the listener's default network).
+// This value is used both in the ingestion upsert `where` clause and in the
+// `data` payload so re-ingesting the same hash on another network creates a
+// distinct row instead of overwriting the existing one.
+const NETWORK_ALIASES = {
+  testnet: 'testnet',
+  public: 'public',
+  mainnet: 'public',
+};
+
+const deriveNetwork = () => {
+  const explicit = process.env.HORIZON_NETWORK;
+  if (explicit) {
+    const normalized = String(explicit).trim().toLowerCase();
+    return NETWORK_ALIASES[normalized] || normalized;
+  }
+
+  const base = process.env.HORIZON_BASE || process.env.HORIZON_URL;
+  if (base) {
+    const lower = String(base).toLowerCase();
+    if (lower.includes('horizon.stellar.org')) return 'public';
+    if (lower.includes('horizon-testnet.stellar.org')) return 'testnet';
+  }
+
+  return 'testnet';
+};
+
+const NETWORK_ID = deriveNetwork();
+
+// ---------------------------------------------------------------------------
+// Asset precision & exact amount conversion (#384)
+// ---------------------------------------------------------------------------
+// Stellar assets are stored on-ledger as integers scaled by 10^7 (7 decimal
+// places). We persist monetary values as exact integer "units" at the asset's
+// precision rather than as floating point. Rounding is half-up at the asset
+// precision so a Horizon decimal amount converts deterministically.
+const DEFAULT_ASSET_PRECISION = 7;
+
+const resolveAssetPrecision = (payment) => {
+  if (payment && Number.isInteger(payment.asset_precision)) {
+    return payment.asset_precision;
+  }
+  return DEFAULT_ASSET_PRECISION;
+};
+
+/**
+ * Convert a Horizon decimal amount string (e.g. "12.3456789") into exact
+ * integer units at the given precision, rounding half-up.
+ *
+ * @param {string|number} amount
+ * @param {number} precision
+ * @returns {bigint}
+ */
+const toAmountUnits = (amount, precision = DEFAULT_ASSET_PRECISION) => {
+  const scale = 10n ** BigInt(precision);
+  const raw = String(amount ?? '0').trim();
+  if (!raw) return 0n;
+
+  const negative = raw.startsWith('-');
+  const unsigned = negative ? raw.slice(1) : raw;
+
+  const [wholePart, fracPart = ''] = unsigned.split('.');
+  const whole = BigInt(wholePart || '0');
+
+  // Pad/truncate the fractional part to `precision` digits, then round
+  // half-up based on the first dropped digit.
+  const padded = (fracPart + '0'.repeat(precision + 1)).slice(0, precision + 1);
+  const keptFrac = padded.slice(0, precision);
+  const roundDigit = Number(padded[precision] || '0');
+
+  let units = whole * scale + BigInt(keptFrac || '0');
+  if (roundDigit >= 5) units += 1n;
+
+  return negative ? -units : units;
+};
+
 // Reconnect backoff: base 1s, doubling per attempt, capped at this value.
 const HORIZON_RECONNECT_MAX_MS =
   parseInt(process.env.HORIZON_RECONNECT_MAX_MS, 10) || 60000;
@@ -262,11 +347,23 @@ const watchAccount = (accountId, startCursor = 'now') => {
             // A successful event means the connection is healthy again.
             reconnectAttempts.set(accountId, 0);
 
+            // Attach exact monetary units and network identity so downstream
+            // ingestion upserts key on (network, tx_hash) and store amounts as
+            // exact integers rather than floats.
+            const assetPrecision = resolveAssetPrecision(payment);
+            const enrichedPayment = {
+              ...payment,
+              network: NETWORK_ID,
+              asset_precision: assetPrecision,
+              amount_units: toAmountUnits(payment.amount, assetPrecision),
+              fee_units: toAmountUnits(payment.fee_paid, assetPrecision),
+            };
+
             dispatchPaymentWebhooks({
               prisma,
               poolGetFn: poolGet,
               poolRunFn: poolRun,
-              payment,
+              payment: enrichedPayment,
             }).catch((err) =>
               logger.error(
                 `[${timestamp()}] ⚠️  Webhook dispatch failed for tx ${payment.transaction_hash}:`,
@@ -421,4 +518,9 @@ module.exports = {
   reconnectDelay,
   scheduleReconnect,
   HORIZON_RECONNECT_MAX_MS,
+  deriveNetwork,
+  NETWORK_ID,
+  toAmountUnits,
+  resolveAssetPrecision,
+  DEFAULT_ASSET_PRECISION,
 };

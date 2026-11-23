@@ -21,6 +21,112 @@ const { getPool } = require('../db');
 // ---------------------------------------------------------------------------
 const HORIZON_BASE = process.env.HORIZON_BASE || 'https://horizon-testnet.stellar.org';
 
+// ---------------------------------------------------------------------------
+// Network identity
+// ---------------------------------------------------------------------------
+// Ledger transaction hashes are only unique per Stellar network, so every
+// helper that reads/writes transaction identity must carry the network.
+// We derive a stable network identifier from the Horizon base URL, e.g.
+//   https://horizon-testnet.stellar.org -> 'testnet'
+//   https://horizon.stellar.org         -> 'pubnet'
+// An explicit override is supported via STELLAR_NETWORK.
+const KNOWN_NETWORKS = ['pubnet', 'testnet', 'futurenet', 'sandbox'];
+
+function deriveNetworkFromHorizonBase(base) {
+  const url = String(base || '').toLowerCase();
+  if (url.includes('testnet')) return 'testnet';
+  if (url.includes('futurenet')) return 'futurenet';
+  if (url.includes('sandbox')) return 'sandbox';
+  if (url.includes('horizon.stellar.org')) return 'pubnet';
+  return 'unknown';
+}
+
+const STELLAR_NETWORK = (() => {
+  const explicit = (process.env.STELLAR_NETWORK || '').trim().toLowerCase();
+  if (explicit) {
+    if (!KNOWN_NETWORKS.includes(explicit)) {
+      logger.warn(
+        `[stellarService] Unknown STELLAR_NETWORK "${explicit}"; using it verbatim`,
+      );
+    }
+    return explicit;
+  }
+  return deriveNetworkFromHorizonBase(HORIZON_BASE);
+})();
+
+// ---------------------------------------------------------------------------
+// Exact amount helpers
+// ---------------------------------------------------------------------------
+// Horizon returns amounts as decimal strings (e.g. "12.3456789"). We never
+// store floats: amounts are converted to integer units at the asset precision
+// (7 decimal places for Stellar assets) using string math only.
+const STELLAR_ASSET_PRECISION = 7;
+const DEFAULT_ASSET_PRECISION = STELLAR_ASSET_PRECISION;
+
+/**
+ * Convert a decimal amount (string or number) to integer units at `precision`.
+ * Throws on malformed input or when the value has more fractional digits than
+ * the asset precision allows (no silent rounding of user data).
+ */
+function toUnits(amount, precision = DEFAULT_ASSET_PRECISION) {
+  if (amount === null || amount === undefined || amount === '') {
+    throw new TypeError('toUnits: amount is required');
+  }
+  if (!Number.isInteger(precision) || precision < 0 || precision > 18) {
+    throw new RangeError(`toUnits: invalid precision ${precision}`);
+  }
+
+  const raw = String(amount).trim();
+  const match = /^([+-]?)(\d*)(?:\.(\d*))?$/.exec(raw);
+  if (!match || (match[2] === '' && (match[3] === undefined || match[3] === ''))) {
+    throw new TypeError(`toUnits: invalid amount "${raw}"`);
+  }
+
+  const sign = match[1] === '-' ? -1n : 1n;
+  const whole = match[2] || '0';
+  const fraction = match[3] || '';
+
+  if (fraction.length > precision) {
+    // Reject values that cannot be represented exactly at this precision.
+    const excess = fraction.slice(precision);
+    if (/[^0]/.test(excess)) {
+      throw new RangeError(
+        `toUnits: amount "${raw}" exceeds asset precision ${precision}`,
+      );
+    }
+  }
+
+  const paddedFraction = (fraction + '0'.repeat(precision)).slice(0, precision);
+  const units = BigInt(whole) * 10n ** BigInt(precision) + BigInt(paddedFraction || '0');
+  return sign * units;
+}
+
+/**
+ * Convert integer units back to a decimal string at `precision`.
+ * Always returns a string so callers never reintroduce float error.
+ */
+function fromUnits(units, precision = DEFAULT_ASSET_PRECISION) {
+  if (!Number.isInteger(precision) || precision < 0 || precision > 18) {
+    throw new RangeError(`fromUnits: invalid precision ${precision}`);
+  }
+  const value = typeof units === 'bigint' ? units : BigInt(units);
+  const negative = value < 0n;
+  const abs = negative ? -value : value;
+  const divisor = 10n ** BigInt(precision);
+  const whole = abs / divisor;
+  const fraction = (abs % divisor).toString().padStart(precision, '0');
+  const body = precision === 0 ? whole.toString() : `${whole}.${fraction}`;
+  return negative ? `-${body}` : body;
+}
+
+/**
+ * Normalize a Horizon amount string to integer units at the asset precision.
+ * Convenience wrapper used by ingestion code paths.
+ */
+function normalizeHorizonAmount(amount, precision = DEFAULT_ASSET_PRECISION) {
+  return toUnits(amount, precision);
+}
+
 const BREAKER_THRESHOLD = parseInt(process.env.CB_THRESHOLD, 10) || 5;
 const BREAKER_TIMEOUT = parseInt(process.env.CB_TIMEOUT_MS, 10) || 10000;
 const BREAKER_RESET_TIMEOUT = parseInt(process.env.CB_RESET_TIMEOUT_MS, 10) || 30000;
@@ -86,24 +192,65 @@ async function loadAccount(accountId) {
 
 /**
  * Fetch a single transaction by hash.
+ *
+ * Transaction hashes are only unique per network, so the result is annotated
+ * with the network identity it was fetched from. Callers may pass an explicit
+ * `network` (e.g. when ingesting historical data for another network) which
+ * is validated against the configured Horizon base.
  */
 const fetchTransactionBreaker = createBreaker(
-  (txHash) => horizon.transactions().transaction(txHash).call(),
+  ({ txHash, network }) => horizon.transactions().transaction(txHash).call(),
 );
 
-async function fetchTransaction(txHash) {
-  return fetchTransactionBreaker.fire(txHash);
+async function fetchTransaction(txHash, network = STELLAR_NETWORK) {
+  const resolvedNetwork = resolveNetwork(network);
+  const record = await fetchTransactionBreaker.fire({ txHash, network: resolvedNetwork });
+  return annotateNetwork(record, resolvedNetwork);
 }
 
 /**
  * Fetch all payment operations for a given transaction.
+ * Returns the page annotated with the network identity.
  */
 const fetchPaymentsForTransactionBreaker = createBreaker(
-  (txHash) => horizon.payments().forTransaction(txHash).call(),
+  ({ txHash, network }) => horizon.payments().forTransaction(txHash).call(),
 );
 
-async function fetchPaymentsForTransaction(txHash) {
-  return fetchPaymentsForTransactionBreaker.fire(txHash);
+async function fetchPaymentsForTransaction(txHash, network = STELLAR_NETWORK) {
+  const resolvedNetwork = resolveNetwork(network);
+  const page = await fetchPaymentsForTransactionBreaker.fire({
+    txHash,
+    network: resolvedNetwork,
+  });
+  return annotateNetwork(page, resolvedNetwork);
+}
+
+/**
+ * Validate/normalize a network identifier. Defaults to the configured network
+ * when omitted; rejects clearly invalid values so identity is never ambiguous.
+ */
+function resolveNetwork(network) {
+  if (network === undefined || network === null || network === '') {
+    return STELLAR_NETWORK;
+  }
+  const normalized = String(network).trim().toLowerCase();
+  if (!normalized) return STELLAR_NETWORK;
+  if (!/^[a-z0-9_-]+$/.test(normalized)) {
+    throw new TypeError(`Invalid network identifier "${network}"`);
+  }
+  return normalized;
+}
+
+/**
+ * Attach the network identity to a Horizon record or page without mutating
+ * the original object (Horizon records may be frozen).
+ */
+function annotateNetwork(record, network) {
+  if (!record || typeof record !== 'object') return record;
+  if (Object.isFrozen(record)) {
+    return Object.assign(Object.create(Object.getPrototypeOf(record)), record, { network });
+  }
+  return Object.assign(record, { network });
 }
 
 /**
@@ -345,6 +492,19 @@ module.exports = {
   BREAKER_THRESHOLD,
   BREAKER_TIMEOUT,
   BREAKER_RESET_TIMEOUT,
+
+  // Network identity
+  STELLAR_NETWORK,
+  KNOWN_NETWORKS,
+  deriveNetworkFromHorizonBase,
+  resolveNetwork,
+
+  // Exact amount helpers (integer units at asset precision)
+  STELLAR_ASSET_PRECISION,
+  DEFAULT_ASSET_PRECISION,
+  toUnits,
+  fromUnits,
+  normalizeHorizonAmount,
 
   // Circuit-breaker–wrapped helpers
   loadAccount,

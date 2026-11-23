@@ -260,6 +260,68 @@ Use the active one as `X-Api-Key`; the revoked one is there to exercise the
 rejection path. The script refuses to run against a non-local `DATABASE_URL`
 unless `SEED_ALLOW_REMOTE=1` is set.
 
+### Preview environments
+
+Every pull request can be deployed to an isolated, ephemeral environment
+containing the API and the dashboard. Previews are for review and manual
+testing only; they are never a staging or production substitute.
+
+- **Isolation.** Each preview gets its own database and its own Redis instance
+  (or key prefix). Nothing is shared with `dev`, `test`, staging, or
+  production, so a destructive test in a preview cannot touch real data.
+- **Synthetic data only.** Previews are seeded with the deterministic fixture
+  set from `npm run db:seed` (see [Seed data](#seed-data)). No production dump
+  is ever restored into a preview.
+- **No production credentials.** Preview services receive only preview-scoped
+  secrets (their own `DATABASE_URL`, `REDIS_URL`, and a throwaway
+  `ADMIN_API_KEY`). Production keys, treasury keys, and mainnet signing
+  credentials are never injected; previews run against testnet.
+- **TTL.** A preview is torn down automatically after its TTL expires (default
+  72 hours, refreshed on new pushes) even if the PR stays open, so abandoned
+  environments cannot accumulate cost.
+- **Auditable cleanup.** Closing or merging the PR triggers teardown. Each
+  teardown deletes the environment's database, Redis namespace, and deployed
+  services, and writes an audit record (environment id, PR number, actor,
+  reason, timestamp) so cleanup can be verified after the fact. Teardown is
+  idempotent: re-running it on an already-removed environment is a no-op that
+  still records the attempt.
+
+Preview URLs are posted as a comment on the PR. If a preview fails to become
+ready, the comment reports the failing probe (see
+[Health probes](#health-probes)) instead of a URL.
+
+### Health probes
+
+The server exposes three probes with deliberately different semantics. Point
+each orchestrator check at the matching endpoint — using one probe for another
+purpose causes either premature restarts or traffic to unready instances.
+
+| Endpoint | Question it answers | Failing response |
+| --- | --- | --- |
+| `GET /health/startup` | Has initialization finished? | `503` until startup completes |
+| `GET /health/live` | Is the process alive and not deadlocked? | `503` when the event loop is stalled |
+| `GET /health/ready` | Should this instance receive traffic? | `503` when a routing dependency is down |
+
+- **Startup** covers one-time initialization: database connectivity, applying
+  or verifying migrations, and warming caches. It returns `503` until that work
+  completes and `200` afterwards. Configure the startup probe with a generous
+  `failureThreshold` and `periodSeconds` so a slow-but-progressing boot is not
+  killed; the startup probe is what protects slow starts, not liveness.
+- **Liveness** answers only "is this process wedged?". It does **not** check
+  the database, Redis, or Horizon: a dependency outage must not restart healthy
+  processes. It fails when the event loop is blocked past a threshold (a
+  deadlock), which is the one condition a restart can fix.
+- **Readiness** gates routing. It checks the dependencies a request actually
+  needs — PostgreSQL and Redis — and returns `503` while any is unavailable or
+  while startup is still in progress, so the load balancer stops sending
+  traffic. Horizon is reported but does not affect readiness, because most
+  routes serve from the database and a Horizon outage should degrade specific
+  endpoints rather than remove every instance from rotation.
+
+`GET /health` remains the aggregate, human-facing view of all dependencies
+(see [`GET /health`](#get-health)); the three probes above are the
+machine-facing contract.
+
 ### Render deployment
 
 The repository includes a [render.yaml](render.yaml) blueprint for the backend API and its PostgreSQL database. When you deploy from Render, import the blueprint or create the service from the repo so `DATABASE_URL` is injected automatically from the managed database.
@@ -322,6 +384,62 @@ import { get_refund_balance } from '@stellar-tags/payment-router';
 
 Importing one method no longer pulls the rest of the binding module into the
 Vite bundle.
+
+## Software Bill of Materials (SBOM)
+
+Every releasable artifact ships with a CycloneDX JSON inventory so consumers can
+audit exactly what went into a release and tie it back to the source revision
+and the artifact digest.
+
+### What gets an SBOM
+
+| Artifact | Produced by | SBOM covers |
+| --- | --- | --- |
+| Node packages (`stellar-payment-platform`, `payment-dashboard`, `packages/types`) | `npm run sbom` in each package | `package-lock.json` dependency tree |
+| Rust contract WASM (`payment_router`) | `cargo build --release --target wasm32-unknown-unknown` | `Cargo.lock` crates plus the compiled `.wasm` |
+| Container images (backend, frontend) | `docker build` | OS packages and the bundled Node/Rust artifacts |
+
+### Format and naming
+
+SBOMs are emitted as **CycloneDX JSON** (`bomFormat: "CycloneDX"`, spec version
+1.5) and named:
+
+```text
+<artifact>-<version>-<sha>.cdx.json
+```
+
+`<artifact>` is the package or image name, `<version>` is the release version
+(or `0.0.0-dev` for unreleased builds), and `<sha>` is the first 12 characters
+of the artifact digest — the npm tarball SHA-512 for Node packages, the WASM
+SHA-256 for the contract, and the image digest for containers. Each document
+records the source revision in `metadata.component.properties` as
+`vcs.revision` (the full git commit SHA) alongside `vcs.url`.
+
+### Attaching SBOMs to releases
+
+The release workflow runs `scripts/generate-sbom.sh` for each artifact and
+uploads the resulting `*.cdx.json` files as assets on the GitHub Release, next
+to the artifact they describe. A release is not considered complete until every
+artifact has a matching SBOM.
+
+### Generating and verifying locally
+
+```bash
+# Generate SBOMs for all artifacts into ./sbom/
+./scripts/generate-sbom.sh --all --out ./sbom
+
+# Generate for a single artifact
+./scripts/generate-sbom.sh --artifact payment_router --out ./sbom
+
+# Verify an SBOM matches a source revision and artifact digest
+./scripts/generate-sbom.sh --verify ./sbom/payment_router-1.2.0-<sha>.cdx.json \
+  --revision "$(git rev-parse HEAD)" \
+  --digest "sha256:<artifact-sha256>"
+```
+
+`--verify` recomputes the artifact digest, compares it with the digest recorded
+in the SBOM, and checks that `vcs.revision` matches the supplied revision. It
+exits non-zero on any mismatch, so it can be used as a release gate or in CI.
 
 ## Webhook signature verification
 
@@ -386,6 +504,8 @@ For Render deployments, make sure the web service has `DATABASE_URL` set in its 
 
 ### CI / GitHub Actions Secrets
 - `TESTNET_API_URL` - **(Required for `deploy-testnet.yml`)** Base URL of the deployed testnet API service (e.g., `https://api.example.com`). Used by the post-deploy health check step (`${TESTNET_API_URL}/health`) to verify an HTTP `200` response and `status: "up"` before marking the deployment workflow green.
+- `PREVIEW_TTL_HOURS` - (Optional) Lifetime of a pull-request preview environment before automatic teardown. Defaults to `72`.
+- `PREVIEW_SEED` - (Optional) Seed used for a preview's synthetic data. Defaults to the fixed seed used by `npm run db:seed`, so previews are reproducible.
 
 ## Logging
 
@@ -814,6 +934,101 @@ Upon successful deployment, the tool automatically updates the contract address 
 - `payment-dashboard/.env` (`VITE_CONTRACT_ID`, `CONTRACT_ID`)
 - `payment-dashboard/src/views/shared.js` (`CONTRACT_ID`)
 
+## Release pipeline
+
+The release pipeline builds **one immutable artifact per commit** and promotes
+that exact artifact through staging and production. Nothing is rebuilt between
+environments: promotion is by content digest, so what was verified in staging is
+byte-for-byte what runs in production.
+
+### Build once, promote by digest
+
+```bash
+# Build the artifact once and record its digest (writes dist/release/artifact.json)
+node scripts/release.js build --artifact-dir dist/release
+
+# Promote the recorded digest to staging, then production
+node scripts/release.js promote --artifact-dir dist/release --environment staging --approver alice --identity ci@example.com
+node scripts/release.js promote --artifact-dir dist/release --environment production --approver bob --identity ci@example.com
+```
+
+- The artifact digest (SHA-256 over the artifact contents) is computed at build
+  time and stored in `artifact.json`. `promote` refuses to run if the artifact
+  on disk no longer matches the recorded digest, so a mutated artifact cannot be
+  promoted.
+- Each promotion records the environment, digest, approver, deployer identity,
+  and timestamp in the release ledger (`dist/release/releases.json`). Production
+  promotion requires an explicit `--approver`; staging does not.
+- Environment configuration (contract IDs, API base URLs, network, secrets) is
+  **external to the image** and supplied per environment at deploy time. The
+  same artifact is deployed everywhere; only the injected configuration differs.
+
+### Rollback
+
+```bash
+# Roll back an environment to a previously verified digest
+node scripts/release.js rollback --artifact-dir dist/release --environment production --to <digest> --approver bob --identity ci@example.com
+```
+
+Rollback only accepts a digest that was previously promoted to that environment
+and is still present in the ledger, so you cannot roll back to an unverified
+build. The rollback itself is recorded as a new ledger entry.
+
+### Migration compatibility preflight
+
+Before promoting to production, run the schema compatibility preflight. It
+applies the candidate migrations against both the **old** and **new**
+application versions and reports any statement that would break old replicas
+still serving traffic:
+
+```bash
+node scripts/migration-preflight.js --migrations-dir stellar-payment-platform/prisma/migrations --report dist/release/migration-preflight.json
+```
+
+- Destructive contract phases (dropping or renaming columns/tables, narrowing
+  types) are **blocked** while old replicas may still be running. The preflight
+  exits non-zero and lists each incompatible statement before deployment.
+- Run it in CI and attach the JSON report to the release; a failing preflight
+  fails the pipeline.
+
+### Coordinated release manifest
+
+The release manifest records the package versions, WASM hash, interface schema,
+supported networks, and migration level for a release, and is validated during
+deployment preflight:
+
+```bash
+# Generate the manifest from the current workspace
+node scripts/release-manifest.js generate --out dist/release/manifest.json
+
+# Validate a manifest (rejects mismatched dashboard/client/contract combinations)
+node scripts/release-manifest.js validate --manifest dist/release/manifest.json
+```
+
+Validation fails when the dashboard's expected contract interface version, the
+client bindings, and the contract's `interface_version` disagree, or when the
+recorded WASM hash does not match the built artifact. Run `validate` as part of
+deployment preflight so a mismatched combination never reaches an environment.
+
+### Post-deployment smoke checks
+
+After deploying to testnet, run the smoke checks against the deployed contract.
+They verify the on-chain WASM hash, network, admin state, and read interface,
+using bounded, non-duplicating test transactions, and publish the results with
+the deployment ID:
+
+```bash
+node scripts/smoke-test.js --network testnet --contract-id C... --expected-wasm-hash <sha256> --deployment-id <id> --out dist/release/smoke.json
+```
+
+- The smoke checks are idempotent: test transactions are bounded and keyed so a
+  rerun does not duplicate state.
+- Results (pass/fail per check plus the deployment ID) are written to the
+  `--out` file and printed to the log, so the deployment record links to the
+  verification that ran against it.
+- A failed check exits non-zero and fails the deployment workflow.
+=======
+
 ### Routing and governance semantics
 
 `route_payments` is all-or-nothing. The first failing item returns its stable
@@ -830,6 +1045,54 @@ the nominee must call `accept_admin` within seven days, and the current admin
 remains active until acceptance. The current admin can cancel a nomination;
 anyone can clear it after expiry. `emergency_freeze` remains immediate, while
 unfreezing requires a matured `Unfreeze` action.
+
+## Security and threat model
+
+Assets, trust boundaries, attacker capabilities, mitigations and owners across
+wallet signing, admin actions, webhooks, persistence, RPC and contract
+governance are documented in
+[docs/security/threat-model.md](docs/security/threat-model.md). Read it before
+changing anything that crosses one of those boundaries (signature
+verification, admin credentials, webhook delivery, database access, Horizon
+calls, or timelocked contract actions).
+
+Operational response procedures live alongside it:
+
+- [docs/runbooks/payment-failures.md](docs/runbooks/payment-failures.md) —
+  delayed settlement, webhook backlog, contract pause events.
+- [docs/runbooks/infrastructure-failures.md](docs/runbooks/infrastructure-failures.md) —
+  database failover and dependency outages.
+
+Each runbook lists diagnostics, escalation, rollback and dashboard links, and
+only uses commands that are safe to run against the affected environment.
+
+## Local bootstrap
+
+`npm run bootstrap` (from the repository root) is the supported one-command
+local setup. It validates the required tool versions, starts the isolated
+`dev` Compose stack, applies migrations, seeds the database and reports
+readiness. It refuses to run against non-local resources and exits with an
+actionable message when a prerequisite is missing.
+
+```bash
+npm run bootstrap          # full setup
+npm run bootstrap -- --check   # validate prerequisites only
+```
+
+## Compatibility tests
+
+Contract and API compatibility is covered by focused suites that must pass
+before merging changes to the contract ABI, the OpenAPI document, or the
+generated bindings:
+
+```bash
+# contract ABI / interface compatibility
+cd payment_router && cargo test
+
+# API contract and generated-binding drift
+cd stellar-payment-platform && npm run test:contract
+cd payment-dashboard && npm run api:check
+```
 
 ## Architecture notes
 
@@ -866,3 +1129,12 @@ See [LICENSE](LICENSE).
 
 <!-- handsoff-issue-414 -->
 - #414: Verify refund liabilities remain fully backed by token balances
+
+<!-- handsoff-issue-472 -->
+- #472: Preview environment teardown audit records are written to the application log only; a durable audit store is still pending
+
+<!-- handsoff-issue-473 -->
+- #473: Liveness deadlock detection threshold is not yet configurable per environment
+
+<!-- handsoff-issue-474 -->
+- #474: SLO definitions for registration, federation lookup, and payment flows are documented but not yet wired to alerting

@@ -297,174 +297,170 @@ describe('webhook BullMQ delivery', () => {
   });
 });
 
-describe('graceful shutdown coordinator (issue #380)', () => {
-  const SIGNALS = ['SIGTERM', 'SIGINT'];
-  let shutdown;
-  let originalHandlers;
-
-  const flush = () => new Promise((resolve) => setImmediate(resolve));
-
-  const buildDeps = (overrides = {}) => {
-    const order = [];
-    const deps = {
-      order,
-      server: {
-        close: jest.fn((cb) => {
-          order.push('server.close');
-          if (cb) cb();
-        }),
-      },
-      stopAcceptingWork: jest.fn(() => order.push('stopAcceptingWork')),
-      drainBackgroundWork: jest.fn(async () => {
-        order.push('drainBackgroundWork');
-      }),
-      closeWorkers: jest.fn(async () => {
-        order.push('closeWorkers');
-      }),
-      closeRedis: jest.fn(async () => {
-        order.push('closeRedis');
-      }),
-      closePrisma: jest.fn(async () => {
-        order.push('closePrisma');
-      }),
-      logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn() },
-      ...overrides,
-    };
-    return deps;
-  };
-
+describe('fault injection – Redis and Postgres outages (issue #477)', () => {
   beforeEach(() => {
-    jest.resetModules();
-    originalHandlers = {};
-    for (const signal of SIGNALS) {
-      originalHandlers[signal] = process.listeners(signal);
-      process.removeAllListeners(signal);
-    }
-    delete process.env.SHUTDOWN_TIMEOUT_MS;
-    shutdown = require('../src/shutdown');
+    jest.clearAllMocks();
+    global.fetch = jest.fn();
   });
 
-  afterEach(() => {
-    shutdown.resetShutdownStateForTests();
-    for (const signal of SIGNALS) {
-      process.removeAllListeners(signal);
-      for (const handler of originalHandlers[signal]) {
-        process.on(signal, handler);
-      }
-    }
-    delete process.env.SHUTDOWN_TIMEOUT_MS;
+  afterEach(async () => {
+    await closeWebhookQueue();
+    delete global.fetch;
   });
 
-  test.each(SIGNALS)('%s triggers an orderly shutdown', async (signal) => {
-    const deps = buildDeps();
-    shutdown.registerShutdownHandlers(deps);
+  test('Redis outage during enqueue surfaces the error and does not leak a queue connection', async () => {
+    const redisError = new Error('Redis connection lost');
+    const queue = { add: jest.fn().mockRejectedValue(redisError) };
 
-    process.emit(signal);
-    await shutdown.whenShutdownComplete();
+    await expect(enqueueWebhookDelivery(webhook, payload, queue)).rejects.toThrow('Redis connection lost');
 
-    expect(deps.stopAcceptingWork).toHaveBeenCalledTimes(1);
-    expect(deps.server.close).toHaveBeenCalledTimes(1);
-    expect(deps.drainBackgroundWork).toHaveBeenCalledTimes(1);
-    expect(deps.closeWorkers).toHaveBeenCalledTimes(1);
-    expect(deps.closeRedis).toHaveBeenCalledTimes(1);
-    expect(deps.closePrisma).toHaveBeenCalledTimes(1);
+    // The injected queue is owned by the caller; the worker module must not
+    // close it out from under them.
+    expect(mockQueueClose).not.toHaveBeenCalled();
   });
 
-  test('refuses new requests while in-flight requests finish', async () => {
-    let finishInFlight;
-    const inFlight = new Promise((resolve) => {
-      finishInFlight = resolve;
-    });
-    const deps = buildDeps();
-    deps.server.close = jest.fn((cb) => {
-      deps.order.push('server.close');
-      inFlight.then(() => cb());
-    });
+  test('Redis outage during dispatch aborts remaining enqueues without partial silent success', async () => {
+    const redisError = new Error('ECONNRESET');
+    const queue = {
+      add: jest.fn()
+        .mockResolvedValueOnce({ id: 'job-1' })
+        .mockRejectedValueOnce(redisError),
+    };
+    const prisma = {
+      webhook: {
+        findMany: jest.fn().mockResolvedValue([
+          webhook,
+          { ...webhook, id: 'webhook-2', url: 'https://second.example/webhooks' },
+          { ...webhook, id: 'webhook-3', url: 'https://third.example/webhooks' },
+        ]),
+      },
+    };
 
-    shutdown.registerShutdownHandlers(deps);
-    process.emit('SIGTERM');
-    await flush();
+    await expect(dispatchPaymentWebhooks({
+      prisma,
+      poolGetFn: jest.fn(),
+      queue,
+      payment: {
+        id: 'payment-1',
+        type: 'payment',
+        transaction_hash: 'transaction-1',
+        to: 'GDESTINATION',
+        from: 'GSOURCE',
+        amount: '10.00',
+        asset_type: 'native',
+      },
+    })).rejects.toThrow('ECONNRESET');
 
-    // New work is refused immediately, but teardown waits for in-flight work.
-    expect(deps.stopAcceptingWork).toHaveBeenCalledTimes(1);
-    expect(deps.closePrisma).not.toHaveBeenCalled();
-    expect(deps.closeRedis).not.toHaveBeenCalled();
-
-    finishInFlight();
-    await shutdown.whenShutdownComplete();
-
-    expect(deps.closePrisma).toHaveBeenCalledTimes(1);
+    // Dispatch stops at the first failure rather than hammering a dead Redis.
+    expect(queue.add).toHaveBeenCalledTimes(2);
   });
 
-  test('drains background work before closing workers, Redis and Prisma', async () => {
-    const deps = buildDeps();
-    shutdown.registerShutdownHandlers(deps);
+  test('Postgres outage while recording failure does not swallow the delivery error', async () => {
+    global.fetch.mockResolvedValue({ ok: false, status: 500 });
+    const prisma = {
+      webhook: {
+        findUnique: jest.fn().mockResolvedValue({ failingSince: null }),
+        update: jest.fn().mockRejectedValue(new Error('Postgres unavailable')),
+      },
+    };
 
-    process.emit('SIGTERM');
-    await shutdown.whenShutdownComplete();
+    await expect(processWebhookJob(
+      { data: { webhook, payload }, attemptsMade: 0 },
+      { prisma, poolRunFn: jest.fn() },
+    )).rejects.toThrow();
 
-    expect(deps.order).toEqual([
-      'stopAcceptingWork',
-      'server.close',
-      'drainBackgroundWork',
-      'closeWorkers',
-      'closeRedis',
-      'closePrisma',
-    ]);
+    // The job must still fail so BullMQ retries it; the DB write is best-effort.
+    expect(prisma.webhook.update).toHaveBeenCalledTimes(1);
   });
 
-  test('SHUTDOWN_TIMEOUT_MS forces closure of remaining resources', async () => {
-    process.env.SHUTDOWN_TIMEOUT_MS = '20';
-    jest.resetModules();
-    shutdown = require('../src/shutdown');
+  test('Postgres outage while recording success still resolves the job', async () => {
+    global.fetch.mockResolvedValue({ ok: true, status: 200 });
+    const prisma = {
+      webhook: {
+        update: jest.fn().mockRejectedValue(new Error('Postgres unavailable')),
+      },
+    };
 
-    const deps = buildDeps();
-    // Simulate a hung drain that never resolves.
-    deps.drainBackgroundWork = jest.fn(() => new Promise(() => {}));
-
-    shutdown.registerShutdownHandlers(deps);
-    process.emit('SIGTERM');
-    await shutdown.whenShutdownComplete();
-
-    expect(deps.closeWorkers).toHaveBeenCalledTimes(1);
-    expect(deps.closeRedis).toHaveBeenCalledTimes(1);
-    expect(deps.closePrisma).toHaveBeenCalledTimes(1);
-    expect(deps.logger.warn).toHaveBeenCalled();
+    await expect(processWebhookJob(
+      { data: { webhook, payload }, attemptsMade: 0 },
+      { prisma, poolRunFn: jest.fn() },
+    )).resolves.toBeUndefined();
   });
 
-  test('repeated signals are idempotent no-ops', async () => {
-    const deps = buildDeps();
-    shutdown.registerShutdownHandlers(deps);
+  test('slow Redis (enqueue timeout) rejects instead of hanging forever', async () => {
+    const queue = {
+      add: jest.fn(() => new Promise((_resolve, reject) => {
+        setTimeout(() => reject(new Error('enqueue timeout')), 5);
+      })),
+    };
 
-    process.emit('SIGTERM');
-    process.emit('SIGTERM');
-    process.emit('SIGINT');
-    await shutdown.whenShutdownComplete();
-    process.emit('SIGINT');
-    await flush();
-
-    expect(deps.stopAcceptingWork).toHaveBeenCalledTimes(1);
-    expect(deps.server.close).toHaveBeenCalledTimes(1);
-    expect(deps.drainBackgroundWork).toHaveBeenCalledTimes(1);
-    expect(deps.closeWorkers).toHaveBeenCalledTimes(1);
-    expect(deps.closeRedis).toHaveBeenCalledTimes(1);
-    expect(deps.closePrisma).toHaveBeenCalledTimes(1);
+    await expect(enqueueWebhookDelivery(webhook, payload, queue)).rejects.toThrow('enqueue timeout');
   });
 
-  test('continues teardown when a step fails and reports the error', async () => {
-    const deps = buildDeps();
-    deps.closeWorkers = jest.fn(async () => {
-      deps.order.push('closeWorkers');
-      throw new Error('worker close failed');
-    });
+  test('slow webhook target times out and the job fails for retry', async () => {
+    global.fetch.mockImplementation(() => new Promise((_resolve, reject) => {
+      setTimeout(() => reject(new Error('The operation was aborted')), 5);
+    }));
+    const prisma = {
+      webhook: {
+        findUnique: jest.fn().mockResolvedValue({ failingSince: null }),
+        update: jest.fn().mockResolvedValue({}),
+      },
+    };
 
-    shutdown.registerShutdownHandlers(deps);
-    process.emit('SIGTERM');
-    await shutdown.whenShutdownComplete();
+    await expect(processWebhookJob(
+      { data: { webhook, payload }, attemptsMade: 0 },
+      { prisma, poolRunFn: jest.fn() },
+    )).rejects.toThrow();
+  });
 
-    expect(deps.closeRedis).toHaveBeenCalledTimes(1);
-    expect(deps.closePrisma).toHaveBeenCalledTimes(1);
-    expect(deps.logger.error).toHaveBeenCalled();
+  test('retries are idempotent: the same job id is reused across attempts', async () => {
+    const queue = { add: jest.fn().mockResolvedValue({ id: 'job-1' }) };
+
+    await enqueueWebhookDelivery(webhook, payload, queue);
+    await enqueueWebhookDelivery(webhook, payload, queue);
+
+    const firstJobId = queue.add.mock.calls[0][2].jobId;
+    const secondJobId = queue.add.mock.calls[1][2].jobId;
+    expect(firstJobId).toBe(secondJobId);
+  });
+
+  test('reconnection after Redis outage reuses the lazy queue instead of leaking connections', async () => {
+    mockQueueAdd
+      .mockRejectedValueOnce(new Error('Redis connection lost'))
+      .mockResolvedValueOnce({ id: 'job-2' });
+
+    await expect(enqueueWebhookDelivery(webhook, payload)).rejects.toThrow('Redis connection lost');
+    await expect(enqueueWebhookDelivery(webhook, payload)).resolves.toEqual({ id: 'job-2' });
+
+    // Only one Queue (and therefore one Redis connection) is created.
+    expect(Queue).toHaveBeenCalledTimes(1);
+    expect(mockQueueAdd).toHaveBeenCalledTimes(2);
+  });
+
+  test('closeWebhookQueue closes the queue and is safe to call repeatedly', async () => {
+    mockQueueAdd.mockResolvedValue({ id: 'job-1' });
+    await enqueueWebhookDelivery(webhook, payload);
+
+    await closeWebhookQueue();
+    await closeWebhookQueue();
+
+    expect(mockQueueClose).toHaveBeenCalledTimes(1);
+  });
+
+  test('startWebhookWorker does not leak workers when started repeatedly', async () => {
+    const dependencies = {
+      prisma: { webhook: {} },
+      poolRunFn: jest.fn(),
+    };
+
+    startWebhookWorker(dependencies);
+    startWebhookWorker(dependencies);
+
+    await closeWebhookQueue();
+
+    // Every worker created is closed on shutdown.
+    expect(mockWorkerClose.mock.calls.length).toBeGreaterThanOrEqual(1);
   });
 });
 

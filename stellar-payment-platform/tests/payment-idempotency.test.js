@@ -70,4 +70,47 @@ describe('payment intent creation idempotency', () => {
 
     expect(mockPaymentIntentCreate).toHaveBeenCalledTimes(2);
   });
+
+  test('concurrent tabs sharing a key receive the original response with replay header', async () => {
+    const app = buildApp();
+
+    const payload = [{ ...baseIntent }];
+    const responses = await Promise.all([
+      request(app).post('/payments/bulk').set(IDEMPOTENCY_HEADER, 'tab-shared').send(payload),
+      request(app).post('/payments/bulk').set(IDEMPOTENCY_HEADER, 'tab-shared').send(payload),
+      request(app).post('/payments/bulk').set(IDEMPOTENCY_HEADER, 'tab-shared').send(payload),
+    ]);
+
+    responses.forEach((res) => expect(res.status).toBe(201));
+    expect(mockPaymentIntentCreate).toHaveBeenCalledTimes(1);
+
+    const replays = responses.filter((res) => res.headers['x-idempotent-replay'] === 'true');
+    expect(replays.length).toBe(2);
+    replays.forEach((res) => expect(res.body).toEqual(responses[0].body));
+  });
+
+  test('expired coordination key allows a new payment attempt', async () => {
+    const app = buildApp();
+
+    const payload = [{ ...baseIntent }];
+    const first = await request(app)
+      .post('/payments/bulk')
+      .set(IDEMPOTENCY_HEADER, 'tab-stale')
+      .send(payload);
+    expect(first.status).toBe(201);
+    expect(first.headers['x-idempotent-replay']).toBeUndefined();
+
+    // Simulate the coordination window expiring so the key is no longer retained.
+    jest.resetModules();
+    const freshApp = buildApp();
+
+    const second = await request(freshApp)
+      .post('/payments/bulk')
+      .set(IDEMPOTENCY_HEADER, 'tab-stale')
+      .send(payload);
+
+    expect(second.status).toBe(201);
+    expect(second.headers['x-idempotent-replay']).toBeUndefined();
+    expect(mockPaymentIntentCreate).toHaveBeenCalledTimes(2);
+  });
 });
