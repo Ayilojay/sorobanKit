@@ -9,6 +9,10 @@ const {
 const { poolGet, poolRun, poolAll, etagCache } = require("../../db");
 const { logger } = require("../../logger");
 const { transferAccount } = require("../../services/registrationService");
+const {
+  assignPrimaryUsername,
+  isPrimaryUniqueViolation,
+} = require("../../services/primaryUsernameService");
 const { lookupCached, invalidateFederationCache } = require("../../cache");
 const federationCache = require("../../federationCache");
 const {
@@ -278,14 +282,31 @@ router.post(
         }
       }
 
-      await prisma.user.create({
-        data: {
-          username: normalizedUsername,
-          address,
-          isPrimary,
-          ...(memoType && { memoType, memo }),
-        },
-      });
+      // #386 — at most one active primary username per address is enforced by
+      // a partial unique index on (address) WHERE is_primary AND deleted_at IS
+      // NULL. When the address has no active primary yet, claim the slot via
+      // the helper inside a transaction so a concurrent registration for the
+      // same address loses cleanly with a 409 instead of creating a second
+      // primary. Soft-deleting a primary clears is_primary (see DELETE below),
+      // which frees the slot for the next registration.
+      if (isPrimary) {
+        await withTransaction(async (tx) => {
+          await assignPrimaryUsername(tx, {
+            username: normalizedUsername,
+            address,
+            ...(memoType && { memoType, memo }),
+          });
+        });
+      } else {
+        await prisma.user.create({
+          data: {
+            username: normalizedUsername,
+            address,
+            isPrimary: false,
+            ...(memoType && { memoType, memo }),
+          },
+        });
+      }
 
       await recordActivity(prisma, {
         username: normalizedUsername,
@@ -316,6 +337,17 @@ router.post(
         ...(memoType && { memo_type: memoType, memo }),
       });
     } catch (error) {
+      // #386 — losing the race for the primary slot surfaces as a unique
+      // violation on the partial index; report it as a conflict.
+      if (isPrimaryUniqueViolation(error)) {
+        return next(
+          new ApiError(
+            "CONFLICT",
+            "This address already has a primary federation username.",
+          ),
+        );
+      }
+
       if (
         error.code === "SQLITE_CONSTRAINT" ||
         error.code === "P2002" ||
@@ -478,7 +510,10 @@ router.delete(
       await withTransaction(async (tx) => {
         await tx.user.update({
           where: { username },
-          data: { deletedAt: new Date() },
+          data: {
+            deletedAt: new Date(),
+            ...(existing.isPrimary && { isPrimary: false }),
+          },
         });
       });
 
@@ -496,6 +531,9 @@ router.delete(
         );
       }
       invalidateFederationCache(username, existing.address);
+      // #386 — the address's primary slot may now be free; drop any cached
+      // reverse-lookup entry so the next registration is reflected promptly.
+      invalidateFederationCache(null, existing.address);
 
       await recordActivity(prisma, {
         username,
