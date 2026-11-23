@@ -12,7 +12,9 @@
     "test": "vitest run",
     "api:generate": "node scripts/generate-api-types.mjs",
     "api:check": "node scripts/generate-api-types.mjs --check",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "ci:install": "npm ci --legacy-peer-deps",
+    "ci:check": "node scripts/verify-lockfile-install.mjs"
   },
   "dependencies": {
     "@creit.tech/stellar-wallets-kit": "^1.7.5",
