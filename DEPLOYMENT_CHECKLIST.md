@@ -2,6 +2,18 @@
 
 Use this checklist for every deployment. Do not skip steps.
 
+## Build Once, Promote by Digest
+
+- [ ] Build the backend artifact exactly once per release and record its
+      immutable image digest (`sha256:...`). The same digest must be promoted
+      through staging and production; never rebuild per environment.
+- [ ] Confirm all environment configuration (API URLs, network passphrase,
+      contract IDs, secrets, feature flags) is supplied externally via
+      environment variables / secrets and is **not** baked into the image.
+      Changing an environment must not require a new build.
+- [ ] Record the promoted digest in the release notes / deployment record so
+      staging and production can be verified as byte-identical.
+
 ## Pre-Deployment
 
 - [ ] All changes merged to `main` and CI is green
@@ -36,6 +48,10 @@ Use this checklist for every deployment. Do not skip steps.
 - [ ] Verify the deploy steps run only after approval
 - [ ] Configure `TESTNET_API_URL` in **Settings → Secrets and variables → Actions** (or under the `testnet` environment secrets) pointing to the deployed testnet API base URL so the post-deploy `/health` verification step can confirm `200 OK` and `status: "up"`
 - [ ] Smoke-test the integration environment after the deploy completes
+- [ ] **Post-deploy smoke checks (#471):** run the testnet smoke checks against
+      the deployed contract. They must verify the on-chain WASM hash, network,
+      admin state, and read interface, and use bounded, non-duplicating test
+      transactions. Publish the results keyed by the deployment ID.
 
 > The `testnet` environment must exist in **Settings → Environments** with at
 > least one required reviewer configured, and `TESTNET_API_URL` must be set as a
@@ -86,7 +102,11 @@ documented in the target environment:
 
 ## Post-Deployment
 
-- [ ] Verify the deployed version/commit matches the intended release
+- [ ] Verify the deployed version/commit and image digest match the intended
+      release and the recorded deployment identity
+- [ ] Confirm the post-deploy smoke-check results are published and keyed by
+      the deployment ID, and that the on-chain WASM hash matches the release
+      manifest
 - [ ] Monitor logs and metrics for errors
 - [ ] Notify the team that the deployment is complete
 - [ ] If a rollback is required, follow the rollback procedure in the relevant

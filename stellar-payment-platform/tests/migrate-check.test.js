@@ -303,6 +303,151 @@ describe('enforceMigrationPolicy', () => {
     expect(mockLogger.warn).toHaveBeenCalledWith(expect.stringContaining('Could not determine'));
   });
 });
+describe('migration compatibility preflight', () => {
+  let runCompatibilityPreflight;
+  let original;
+
+  beforeAll(() => {
+    ({ runCompatibilityPreflight } = require('../src/migrate-check'));
+    original = {
+      policy: process.env.MIGRATION_POLICY,
+      drain: process.env.MIGRATION_DRAIN_MARKER,
+    };
+  });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    delete process.env.MIGRATION_POLICY;
+    delete process.env.MIGRATION_DRAIN_MARKER;
+  });
+
+  afterEach(() => {
+    delete process.env.MIGRATION_POLICY;
+    delete process.env.MIGRATION_DRAIN_MARKER;
+  });
+
+  afterAll(() => {
+    if (original.policy === undefined) delete process.env.MIGRATION_POLICY;
+    else process.env.MIGRATION_POLICY = original.policy;
+    if (original.drain === undefined) delete process.env.MIGRATION_DRAIN_MARKER;
+    else process.env.MIGRATION_DRAIN_MARKER = original.drain;
+  });
+
+  const compatibleMigrations = [
+    { name: '20260101000000_add_nullable_column', sql: 'ALTER TABLE payments ADD COLUMN memo TEXT;' },
+    { name: '20260102000000_create_index', sql: 'CREATE INDEX CONCURRENTLY idx_memo ON payments (memo);' },
+  ];
+
+  const destructiveMigrations = [
+    { name: '20260103000000_drop_legacy_column', sql: 'ALTER TABLE payments DROP COLUMN legacy_ref;' },
+  ];
+
+  it('passes when candidate migrations are compatible with old and new versions', () => {
+    const r = runCompatibilityPreflight({
+      migrations: compatibleMigrations,
+      oldVersion: '1.4.0',
+      newVersion: '1.5.0',
+    });
+    expect(r.compatible).toBe(true);
+    expect(r.blocked).toBe(false);
+    expect(r.incompatible).toEqual([]);
+    expect(r.contractPhases).toEqual([]);
+  });
+
+  it('reports incompatible statements before deployment', () => {
+    const r = runCompatibilityPreflight({
+      migrations: destructiveMigrations,
+      oldVersion: '1.4.0',
+      newVersion: '1.5.0',
+    });
+    expect(r.compatible).toBe(false);
+    expect(r.incompatible).toHaveLength(1);
+    expect(r.incompatible[0].migration).toBe('20260103000000_drop_legacy_column');
+    expect(r.incompatible[0].statement).toMatch(/DROP COLUMN/i);
+    expect(r.incompatible[0].reason).toBeTruthy();
+  });
+
+  it('blocks destructive contract phases when no drain marker is present', () => {
+    const r = runCompatibilityPreflight({
+      migrations: destructiveMigrations,
+      oldVersion: '1.4.0',
+      newVersion: '1.5.0',
+    });
+    expect(r.blocked).toBe(true);
+    expect(r.contractPhases).toHaveLength(1);
+    expect(r.contractPhases[0].phase).toBe('contract');
+    expect(r.contractPhases[0].blocked).toBe(true);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('drain'),
+    );
+  });
+
+  it('allows destructive contract phases once the drain marker is present', () => {
+    process.env.MIGRATION_DRAIN_MARKER = 'old-replicas-drained';
+    const r = runCompatibilityPreflight({
+      migrations: destructiveMigrations,
+      oldVersion: '1.4.0',
+      newVersion: '1.5.0',
+    });
+    expect(r.blocked).toBe(false);
+    expect(r.contractPhases).toHaveLength(1);
+    expect(r.contractPhases[0].blocked).toBe(false);
+    expect(r.drained).toBe(true);
+  });
+
+  it('treats an empty drain marker as not drained (boundary)', () => {
+    process.env.MIGRATION_DRAIN_MARKER = '';
+    const r = runCompatibilityPreflight({
+      migrations: destructiveMigrations,
+      oldVersion: '1.4.0',
+      newVersion: '1.5.0',
+    });
+    expect(r.drained).toBe(false);
+    expect(r.blocked).toBe(true);
+  });
+
+  it('keeps contract phases blocked on a partial drain (some replicas still on old version)', () => {
+    process.env.MIGRATION_DRAIN_MARKER = 'old-replicas-drained';
+    const r = runCompatibilityPreflight({
+      migrations: destructiveMigrations,
+      oldVersion: '1.4.0',
+      newVersion: '1.5.0',
+      replicas: [
+        { id: 'a', version: '1.5.0' },
+        { id: 'b', version: '1.4.0' },
+      ],
+    });
+    expect(r.drained).toBe(false);
+    expect(r.blocked).toBe(true);
+    expect(r.remainingOldReplicas).toEqual(['b']);
+  });
+
+  it('is idempotent across repeated runs (recovery after a failed deploy)', () => {
+    const first = runCompatibilityPreflight({
+      migrations: destructiveMigrations,
+      oldVersion: '1.4.0',
+      newVersion: '1.5.0',
+    });
+    const second = runCompatibilityPreflight({
+      migrations: destructiveMigrations,
+      oldVersion: '1.4.0',
+      newVersion: '1.5.0',
+    });
+    expect(second).toEqual(first);
+    expect(second.blocked).toBe(true);
+  });
+
+  it('does not block when there are no destructive statements', () => {
+    const r = runCompatibilityPreflight({
+      migrations: compatibleMigrations,
+      oldVersion: '1.4.0',
+      newVersion: '1.5.0',
+    });
+    expect(r.blocked).toBe(false);
+    expect(r.contractPhases).toEqual([]);
+  });
+});
+
 describe('strict-mode process.exit integration', () => {
   let checkMigrations;
   let enforceMigrationPolicy;

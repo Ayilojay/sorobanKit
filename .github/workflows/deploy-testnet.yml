@@ -12,8 +12,72 @@ env:
   WASM_ARTIFACT: payment_router.wasm
 
 jobs:
+  build-backend-image:
+    name: Build Backend Image (once)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_digest: ${{ steps.digest.outputs.image_digest }}
+      image_ref: ${{ steps.digest.outputs.image_ref }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.CONTAINER_REGISTRY || 'ghcr.io' }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push immutable backend image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          # Tag by commit SHA only; promotion is by digest, never by tag.
+          tags: ${{ vars.CONTAINER_REGISTRY || 'ghcr.io' }}/${{ github.repository }}/backend:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          provenance: true
+          sbom: true
+
+      - name: Record immutable image digest
+        id: digest
+        run: |
+          IMAGE_REF="${{ vars.CONTAINER_REGISTRY || 'ghcr.io' }}/${{ github.repository }}/backend"
+          DIGEST="${{ steps.build.outputs.digest }}"
+          if [ -z "$DIGEST" ]; then
+            echo "::error::Build did not produce an image digest."
+            exit 1
+          fi
+          echo "image_digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "image_ref=${IMAGE_REF}@${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "### 🧱 Backend image built once" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Image**: \`${IMAGE_REF}@${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Commit**: \`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload image digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-image-digest
+          path: |
+            ${{ steps.build.outputs.digest }}
+          if-no-files-found: ignore
+
   deploy-testnet:
     name: Deploy to Testnet
+    needs: build-backend-image
     runs-on: ubuntu-latest
     # Manual approval gate: requires a reviewer configured on the `testnet`
     # environment in repository settings before any deploy steps run.
@@ -146,6 +210,10 @@ jobs:
             payment_router/target/sbom/*.spdx.json
 
       - name: Deploy to Testnet
+        id: deploy
+        env:
+          BACKEND_IMAGE_REF: ${{ needs.build-backend-image.outputs.image_ref }}
+          BACKEND_IMAGE_DIGEST: ${{ needs.build-backend-image.outputs.image_digest }}
         run: |
           # Generate deployer keypair
           stellar keys generate deployer --network testnet
@@ -158,11 +226,20 @@ jobs:
             --wasm target/reproducible/payment_router.wasm \
             --source deployer \
             --network testnet)
-          
+
+          # Deployment identity: unique ID ties every artifact to this rollout.
+          DEPLOYMENT_ID="${GITHUB_SHA:0:12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "deployment_id=$DEPLOYMENT_ID" >> "$GITHUB_OUTPUT"
+          echo "contract_id=$CONTRACT_ID" >> "$GITHUB_OUTPUT"
+          echo "$CONTRACT_ID" > target/reproducible/contract-id.txt
+
           # Output to GitHub Step Summary
           echo "### 🚀 Output from Testnet Deployment" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployment ID**: \`$DEPLOYMENT_ID\`" >> $GITHUB_STEP_SUMMARY
           echo "**Contract ID**: \`$CONTRACT_ID\`" >> $GITHUB_STEP_SUMMARY
           echo "**WASM sha256**: \`$(cat target/reproducible/payment_router.wasm.sha256 | awk '{print $1}')\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Backend image**: \`${BACKEND_IMAGE_REF:-unset}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Backend digest**: \`${BACKEND_IMAGE_DIGEST:-unset}\`" >> $GITHUB_STEP_SUMMARY
 
       - name: Attach SBOMs to GitHub Release
         if: ${{ startsWith(github.ref, 'refs/tags/') }}
@@ -210,3 +287,83 @@ jobs:
           fi
 
           echo "✅ Testnet API is live and healthy (status: up)."
+
+      - name: Post-deploy on-chain smoke checks
+        env:
+          DEPLOYMENT_ID: ${{ steps.deploy.outputs.deployment_id }}
+          CONTRACT_ID: ${{ steps.deploy.outputs.contract_id }}
+          BACKEND_IMAGE_DIGEST: ${{ needs.build-backend-image.outputs.image_digest }}
+        run: |
+          # Verify on-chain WASM hash, network, admin state, and read interface.
+          # Uses bounded, non-duplicating test transactions (read-only calls only).
+          EXPECTED_WASM_SHA=$(awk '{print $1}' target/reproducible/${WASM_ARTIFACT}.sha256)
+          RESULTS_FILE="target/reproducible/smoke-results-${DEPLOYMENT_ID}.json"
+          FAILURES=0
+
+          record() {
+            local check="$1" status="$2" detail="$3"
+            jq -n --arg id "$DEPLOYMENT_ID" --arg check "$check" \
+              --arg status "$status" --arg detail "$detail" \
+              '{deployment_id: $id, check: $check, status: $status, detail: $detail}' \
+              >> "$RESULTS_FILE"
+          }
+
+          : > "$RESULTS_FILE"
+
+          # 1. Network identity
+          NETWORK_PASSPHRASE=$(stellar network passphrase --network testnet 2>/dev/null || true)
+          if echo "$NETWORK_PASSPHRASE" | grep -q "Test SDF Network"; then
+            record "network" "pass" "testnet"
+          else
+            record "network" "fail" "unexpected network passphrase"
+            FAILURES=$((FAILURES + 1))
+          fi
+
+          # 2. On-chain WASM hash matches the built artifact
+          ONCHAIN_WASM=$(stellar contract fetch \
+            --id "$CONTRACT_ID" --network testnet 2>/dev/null | sha256sum | awk '{print $1}' || true)
+          if [ "$ONCHAIN_WASM" = "$EXPECTED_WASM_SHA" ]; then
+            record "wasm_hash" "pass" "$ONCHAIN_WASM"
+          else
+            record "wasm_hash" "fail" "expected $EXPECTED_WASM_SHA got ${ONCHAIN_WASM:-none}"
+            FAILURES=$((FAILURES + 1))
+          fi
+
+          # 3. Admin state is set (read-only invocation)
+          ADMIN=$(stellar contract invoke \
+            --id "$CONTRACT_ID" --network testnet --source deployer \
+            -- get_admin 2>/dev/null || true)
+          if [ -n "$ADMIN" ]; then
+            record "admin_state" "pass" "admin configured"
+          else
+            record "admin_state" "fail" "admin not readable"
+            FAILURES=$((FAILURES + 1))
+          fi
+
+          # 4. Read interface responds (bounded, single read call)
+          if stellar contract invoke \
+            --id "$CONTRACT_ID" --network testnet --source deployer \
+            -- get_version >/dev/null 2>&1; then
+            record "read_interface" "pass" "get_version ok"
+          else
+            record "read_interface" "fail" "get_version failed"
+            FAILURES=$((FAILURES + 1))
+          fi
+
+          echo "### 🔎 Post-deploy smoke checks (deployment \`$DEPLOYMENT_ID\`)" >> "$GITHUB_STEP_SUMMARY"
+          jq -r '"| \(.check) | \(.status) | \(.detail) |"' "$RESULTS_FILE" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Backend digest**: \`${BACKEND_IMAGE_DIGEST:-unset}\`" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$FAILURES" -ne 0 ]; then
+            echo "::error::Post-deploy smoke checks failed ($FAILURES failure(s)); see $RESULTS_FILE"
+            exit 1
+          fi
+          echo "✅ All post-deploy smoke checks passed for deployment $DEPLOYMENT_ID."
+
+      - name: Upload smoke check results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-results-${{ steps.deploy.outputs.deployment_id }}
+          path: payment_router/target/reproducible/smoke-results-*.json
+          if-no-files-found: warn

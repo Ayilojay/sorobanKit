@@ -934,6 +934,101 @@ Upon successful deployment, the tool automatically updates the contract address 
 - `payment-dashboard/.env` (`VITE_CONTRACT_ID`, `CONTRACT_ID`)
 - `payment-dashboard/src/views/shared.js` (`CONTRACT_ID`)
 
+## Release pipeline
+
+The release pipeline builds **one immutable artifact per commit** and promotes
+that exact artifact through staging and production. Nothing is rebuilt between
+environments: promotion is by content digest, so what was verified in staging is
+byte-for-byte what runs in production.
+
+### Build once, promote by digest
+
+```bash
+# Build the artifact once and record its digest (writes dist/release/artifact.json)
+node scripts/release.js build --artifact-dir dist/release
+
+# Promote the recorded digest to staging, then production
+node scripts/release.js promote --artifact-dir dist/release --environment staging --approver alice --identity ci@example.com
+node scripts/release.js promote --artifact-dir dist/release --environment production --approver bob --identity ci@example.com
+```
+
+- The artifact digest (SHA-256 over the artifact contents) is computed at build
+  time and stored in `artifact.json`. `promote` refuses to run if the artifact
+  on disk no longer matches the recorded digest, so a mutated artifact cannot be
+  promoted.
+- Each promotion records the environment, digest, approver, deployer identity,
+  and timestamp in the release ledger (`dist/release/releases.json`). Production
+  promotion requires an explicit `--approver`; staging does not.
+- Environment configuration (contract IDs, API base URLs, network, secrets) is
+  **external to the image** and supplied per environment at deploy time. The
+  same artifact is deployed everywhere; only the injected configuration differs.
+
+### Rollback
+
+```bash
+# Roll back an environment to a previously verified digest
+node scripts/release.js rollback --artifact-dir dist/release --environment production --to <digest> --approver bob --identity ci@example.com
+```
+
+Rollback only accepts a digest that was previously promoted to that environment
+and is still present in the ledger, so you cannot roll back to an unverified
+build. The rollback itself is recorded as a new ledger entry.
+
+### Migration compatibility preflight
+
+Before promoting to production, run the schema compatibility preflight. It
+applies the candidate migrations against both the **old** and **new**
+application versions and reports any statement that would break old replicas
+still serving traffic:
+
+```bash
+node scripts/migration-preflight.js --migrations-dir stellar-payment-platform/prisma/migrations --report dist/release/migration-preflight.json
+```
+
+- Destructive contract phases (dropping or renaming columns/tables, narrowing
+  types) are **blocked** while old replicas may still be running. The preflight
+  exits non-zero and lists each incompatible statement before deployment.
+- Run it in CI and attach the JSON report to the release; a failing preflight
+  fails the pipeline.
+
+### Coordinated release manifest
+
+The release manifest records the package versions, WASM hash, interface schema,
+supported networks, and migration level for a release, and is validated during
+deployment preflight:
+
+```bash
+# Generate the manifest from the current workspace
+node scripts/release-manifest.js generate --out dist/release/manifest.json
+
+# Validate a manifest (rejects mismatched dashboard/client/contract combinations)
+node scripts/release-manifest.js validate --manifest dist/release/manifest.json
+```
+
+Validation fails when the dashboard's expected contract interface version, the
+client bindings, and the contract's `interface_version` disagree, or when the
+recorded WASM hash does not match the built artifact. Run `validate` as part of
+deployment preflight so a mismatched combination never reaches an environment.
+
+### Post-deployment smoke checks
+
+After deploying to testnet, run the smoke checks against the deployed contract.
+They verify the on-chain WASM hash, network, admin state, and read interface,
+using bounded, non-duplicating test transactions, and publish the results with
+the deployment ID:
+
+```bash
+node scripts/smoke-test.js --network testnet --contract-id C... --expected-wasm-hash <sha256> --deployment-id <id> --out dist/release/smoke.json
+```
+
+- The smoke checks are idempotent: test transactions are bounded and keyed so a
+  rerun does not duplicate state.
+- Results (pass/fail per check plus the deployment ID) are written to the
+  `--out` file and printed to the log, so the deployment record links to the
+  verification that ran against it.
+- A failed check exits non-zero and fails the deployment workflow.
+=======
+
 ### Routing and governance semantics
 
 `route_payments` is all-or-nothing. The first failing item returns its stable
