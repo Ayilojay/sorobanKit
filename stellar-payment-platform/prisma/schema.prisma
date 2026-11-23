@@ -231,3 +231,59 @@ model ActivityLog {
   @@index([userId, createdAt])
   @@map("activity_logs")
 }
+
+// #390 — Idempotency records. A client-supplied replay key is hashed (never
+// stored raw) and persisted together with a fingerprint of the request and the
+// outcome of the operation, all inside the same transaction as the business
+// command. The unique constraint on `keyHash` makes concurrent requests with
+// the same key converge: the first writer wins and the loser reads back the
+// stored outcome instead of re-executing the command.
+//
+// `expiresAt` drives retention cleanup; a background job deletes rows past
+// their expiry so the table does not grow without bound.
+model IdempotencyRecord {
+  id          String   @id @default(uuid())
+  keyHash     String   @unique @map("key_hash")
+  fingerprint String   @map("fingerprint")
+  method      String
+  path        String
+  // Lifecycle: in_progress → completed | failed
+  status      String   @default("in_progress")
+  // Serialised response/outcome payload replayed to duplicate requests.
+  outcome     Json?
+  expiresAt   DateTime @map("expires_at")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  // Retention cleanup scans by expiry; the composite keeps the delete bounded.
+  @@index([expiresAt])
+  // Lookups by request fingerprint (e.g. detecting key reuse across payloads).
+  @@index([fingerprint])
+  @@map("idempotency_records")
+}
+
+// #391 — Transactional outbox. Domain events are written in the same
+// transaction as the business change, then dispatched asynchronously with
+// bounded retries. `version` provides optimistic ordering per aggregate so
+// consumers can detect gaps/duplicates and stay idempotent.
+model OutboxEvent {
+  id            String    @id @default(uuid())
+  aggregateType String    @map("aggregate_type")
+  aggregateId   String    @map("aggregate_id")
+  eventType     String    @map("event_type")
+  version       Int       @default(1)
+  payload       Json
+  // Lifecycle: pending → processing → processed | failed
+  status        String    @default("pending")
+  attemptCount  Int       @default(0) @map("attempt_count")
+  lastError     String?   @map("last_error")
+  // Earliest time the dispatcher may pick this row up (backoff scheduling).
+  availableAt   DateTime  @default(now()) @map("available_at")
+  processedAt   DateTime? @map("processed_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  // Dispatcher polling: WHERE status = 'pending' AND available_at <= now().
+  @@index([status, availableAt])
+  // Reconciliation query for stuck events and per-aggregate ordering.
+  @@index([aggregateType, aggregateId, version])
+  @@map("outbox_events")
+}

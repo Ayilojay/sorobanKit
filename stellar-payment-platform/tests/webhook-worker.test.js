@@ -36,6 +36,11 @@ const {
   closeWebhookQueue,
   processWebhookJob,
   detectSsrfTarget,
+  dispatchOutboxEvents,
+  processOutboxEvent,
+  findStuckOutboxEvents,
+  OUTBOX_MAX_ATTEMPTS,
+  OUTBOX_STUCK_AFTER_MS,
   MAX_WEBHOOK_ATTEMPTS,
   WEBHOOK_BACKOFF_DELAY_MS,
   WEBHOOK_QUEUE_NAME,
@@ -294,6 +299,174 @@ describe('webhook BullMQ delivery', () => {
       expect.objectContaining({ connection: expect.any(Object) }),
     );
     expect(mockQueueAdd).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('transactional outbox dispatch (issue #391)', () => {
+  const makeOutboxRow = (overrides = {}) => ({
+    id: 'outbox-1',
+    event_type: 'payment.received',
+    aggregate_type: 'payment',
+    aggregate_id: 'payment-1',
+    payload,
+    version: 1,
+    status: 'pending',
+    attempts: 0,
+    next_attempt_at: new Date('2026-08-25T12:00:00.000Z'),
+    last_error: null,
+    processed_at: null,
+    created_at: new Date('2026-08-25T12:00:00.000Z'),
+    updated_at: new Date('2026-08-25T12:00:00.000Z'),
+    ...overrides,
+  });
+
+  const makeOutboxPrisma = (rows = []) => ({
+    outboxEvent: {
+      findMany: jest.fn().mockResolvedValue(rows),
+      update: jest.fn().mockResolvedValue({}),
+      updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+    },
+    webhook: {
+      findMany: jest.fn().mockResolvedValue([webhook]),
+      update: jest.fn().mockResolvedValue({}),
+    },
+  });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    global.fetch = jest.fn();
+  });
+
+  afterAll(() => {
+    delete global.fetch;
+  });
+
+  test('reads pending events from the outbox and enqueues one delivery per webhook', async () => {
+    const prisma = makeOutboxPrisma([makeOutboxRow()]);
+    const queue = { add: jest.fn().mockResolvedValue({ id: 'job-1' }) };
+
+    const result = await dispatchOutboxEvents({ prisma, queue, now: new Date('2026-08-25T12:00:00.000Z') });
+
+    expect(prisma.outboxEvent.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        status: 'pending',
+        next_attempt_at: expect.objectContaining({ lte: expect.any(Date) }),
+      }),
+      orderBy: expect.objectContaining({ created_at: 'asc' }),
+    }));
+    expect(queue.add).toHaveBeenCalledTimes(1);
+    expect(queue.add).toHaveBeenCalledWith(
+      'deliver',
+      expect.objectContaining({
+        outboxEventId: 'outbox-1',
+        payload: expect.objectContaining({ event_id: payload.event_id }),
+      }),
+      expect.objectContaining({ attempts: MAX_WEBHOOK_ATTEMPTS }),
+    );
+    expect(result).toEqual(expect.objectContaining({ dispatched: 1, failed: 0 }));
+  });
+
+  test('skips events that were already processed (idempotent consumers)', async () => {
+    const prisma = makeOutboxPrisma([
+      makeOutboxRow({ id: 'outbox-done', status: 'processed', processed_at: new Date() }),
+    ]);
+    const queue = { add: jest.fn().mockResolvedValue({ id: 'job-1' }) };
+
+    const result = await dispatchOutboxEvents({ prisma, queue });
+
+    expect(queue.add).not.toHaveBeenCalled();
+    expect(result).toEqual(expect.objectContaining({ dispatched: 0, skipped: expect.any(Number) }));
+  });
+
+  test('does not re-dispatch an event whose next_attempt_at is in the future', async () => {
+    const prisma = makeOutboxPrisma([
+      makeOutboxRow({ next_attempt_at: new Date(Date.now() + 60_000) }),
+    ]);
+    const queue = { add: jest.fn().mockResolvedValue({ id: 'job-1' }) };
+
+    const result = await dispatchOutboxEvents({ prisma, queue });
+
+    expect(queue.add).not.toHaveBeenCalled();
+    expect(result.dispatched).toBe(0);
+  });
+
+  test('bounded retries: marks the event failed once OUTBOX_MAX_ATTEMPTS is reached', async () => {
+    const prisma = makeOutboxPrisma([
+      makeOutboxRow({ attempts: OUTBOX_MAX_ATTEMPTS - 1 }),
+    ]);
+    const queue = { add: jest.fn().mockRejectedValue(new Error('redis down')) };
+
+    const result = await dispatchOutboxEvents({ prisma, queue });
+
+    expect(prisma.outboxEvent.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'outbox-1' },
+      data: expect.objectContaining({
+        status: 'failed',
+        attempts: OUTBOX_MAX_ATTEMPTS,
+        last_error: expect.stringContaining('redis down'),
+      }),
+    }));
+    expect(result.failed).toBe(1);
+  });
+
+  test('bounded retries: schedules a backoff retry while attempts remain', async () => {
+    const prisma = makeOutboxPrisma([makeOutboxRow({ attempts: 1 })]);
+    const queue = { add: jest.fn().mockRejectedValue(new Error('transient')) };
+
+    await dispatchOutboxEvents({ prisma, queue });
+
+    expect(prisma.outboxEvent.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'outbox-1' },
+      data: expect.objectContaining({
+        status: 'pending',
+        attempts: 2,
+        next_attempt_at: expect.any(Date),
+      }),
+    }));
+  });
+
+  test('processOutboxEvent marks the row processed and is idempotent on replay', async () => {
+    const prisma = makeOutboxPrisma();
+    global.fetch.mockResolvedValue({ ok: true, status: 200 });
+
+    await processOutboxEvent(
+      { data: { outboxEventId: 'outbox-1', webhook, payload }, attemptsMade: 0 },
+      { prisma, poolRunFn: jest.fn() },
+    );
+
+    expect(prisma.outboxEvent.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ id: 'outbox-1', status: { not: 'processed' } }),
+      data: expect.objectContaining({ status: 'processed', processed_at: expect.any(Date) }),
+    }));
+
+    // Replaying the same event must not send a duplicate webhook.
+    prisma.outboxEvent.updateMany.mockResolvedValue({ count: 0 });
+    global.fetch.mockClear();
+
+    await processOutboxEvent(
+      { data: { outboxEventId: 'outbox-1', webhook, payload }, attemptsMade: 0 },
+      { prisma, poolRunFn: jest.fn() },
+    );
+
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  test('findStuckOutboxEvents reports pending rows older than the stuck threshold', async () => {
+    const stuck = makeOutboxRow({
+      id: 'outbox-stuck',
+      created_at: new Date(Date.now() - OUTBOX_STUCK_AFTER_MS - 60_000),
+    });
+    const prisma = makeOutboxPrisma([stuck]);
+
+    const rows = await findStuckOutboxEvents({ prisma, now: new Date() });
+
+    expect(prisma.outboxEvent.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        status: { in: expect.arrayContaining(['pending']) },
+        created_at: expect.objectContaining({ lte: expect.any(Date) }),
+      }),
+    }));
+    expect(rows).toEqual([stuck]);
   });
 });
 

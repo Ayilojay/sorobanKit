@@ -303,6 +303,179 @@ describe('enforceMigrationPolicy', () => {
     expect(mockLogger.warn).toHaveBeenCalledWith(expect.stringContaining('Could not determine'));
   });
 });
+describe('checksum manifest and drift detection (#389)', () => {
+  let buildManifest;
+  let verifyManifest;
+  let reportSchemaVersion;
+  let checkMigrations;
+  let originalUrl;
+  let originalPolicy;
+
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const crypto = require('crypto');
+
+  let tmpDir;
+
+  const writeMigration = (name, sql) => {
+    const dir = path.join(tmpDir, name);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'migration.sql'), sql);
+    return dir;
+  };
+
+  const sha256 = (text) => crypto.createHash('sha256').update(text).digest('hex');
+
+  beforeAll(() => {
+    ({
+      buildManifest,
+      verifyManifest,
+      reportSchemaVersion,
+      checkMigrations,
+    } = require('../src/migrate-check'));
+    originalUrl = process.env.DATABASE_URL;
+    originalPolicy = process.env.MIGRATION_POLICY;
+  });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'migrate-check-'));
+    process.env.DATABASE_URL = 'postgresql://u:p@localhost:5432/db';
+  });
+
+  afterEach(() => {
+    delete process.env.MIGRATION_POLICY;
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  afterAll(() => {
+    if (originalUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = originalUrl;
+    if (originalPolicy === undefined) delete process.env.MIGRATION_POLICY;
+    else process.env.MIGRATION_POLICY = originalPolicy;
+  });
+
+  it('builds a manifest of applied migration names and checksums', () => {
+    writeMigration('20260101000000_init', 'CREATE TABLE a (id int);');
+    writeMigration('20260102000000_add_b', 'ALTER TABLE a ADD COLUMN b int;');
+
+    const manifest = buildManifest(tmpDir);
+    expect(manifest.migrations).toHaveLength(2);
+    expect(manifest.migrations[0]).toEqual({
+      name: '20260101000000_init',
+      checksum: sha256('CREATE TABLE a (id int);'),
+    });
+    expect(manifest.migrations[1].name).toBe('20260102000000_add_b');
+    expect(manifest.migrations[1].checksum).toBe(
+      sha256('ALTER TABLE a ADD COLUMN b int;'),
+    );
+  });
+
+  it('produces a stable manifest for unchanged files (matching manifest)', () => {
+    writeMigration('20260101000000_init', 'CREATE TABLE a (id int);');
+    const first = buildManifest(tmpDir);
+    const second = buildManifest(tmpDir);
+    expect(second).toEqual(first);
+    const result = verifyManifest(first, second);
+    expect(result.ok).toBe(true);
+    expect(result.changed).toEqual([]);
+    expect(result.missing).toEqual([]);
+    expect(result.extra).toEqual([]);
+  });
+
+  it('detects a changed historical migration file', () => {
+    writeMigration('20260101000000_init', 'CREATE TABLE a (id int);');
+    const recorded = buildManifest(tmpDir);
+
+    // Rewrite the historical file after it was recorded.
+    writeMigration('20260101000000_init', 'CREATE TABLE a (id bigint);');
+    const current = buildManifest(tmpDir);
+
+    const result = verifyManifest(recorded, current);
+    expect(result.ok).toBe(false);
+    expect(result.changed).toEqual(['20260101000000_init']);
+    expect(result.missing).toEqual([]);
+    expect(result.extra).toEqual([]);
+  });
+
+  it('detects a migration missing from the local folder', () => {
+    writeMigration('20260101000000_init', 'CREATE TABLE a (id int);');
+    writeMigration('20260102000000_add_b', 'ALTER TABLE a ADD COLUMN b int;');
+    const recorded = buildManifest(tmpDir);
+
+    fs.rmSync(path.join(tmpDir, '20260102000000_add_b'), { recursive: true, force: true });
+    const current = buildManifest(tmpDir);
+
+    const result = verifyManifest(recorded, current);
+    expect(result.ok).toBe(false);
+    expect(result.missing).toEqual(['20260102000000_add_b']);
+    expect(result.changed).toEqual([]);
+    expect(result.extra).toEqual([]);
+  });
+
+  it('detects an extra migration not present in the recorded manifest', () => {
+    writeMigration('20260101000000_init', 'CREATE TABLE a (id int);');
+    const recorded = buildManifest(tmpDir);
+
+    writeMigration('20260103000000_add_c', 'ALTER TABLE a ADD COLUMN c int;');
+    const current = buildManifest(tmpDir);
+
+    const result = verifyManifest(recorded, current);
+    expect(result.ok).toBe(false);
+    expect(result.extra).toEqual(['20260103000000_add_c']);
+    expect(result.changed).toEqual([]);
+    expect(result.missing).toEqual([]);
+  });
+
+  it('reports the deployed schema version without modifying data', async () => {
+    writeMigration('20260101000000_init', 'CREATE TABLE a (id int);');
+    writeMigration('20260102000000_add_b', 'ALTER TABLE a ADD COLUMN b int;');
+
+    simulateSpawn({ code: 0, stdout: 'Status: Database schema is up to date!' });
+    const version = await reportSchemaVersion({ migrationsDir: tmpDir });
+
+    expect(version).toEqual({
+      version: '20260102000000_add_b',
+      count: 2,
+      checksum: sha256('ALTER TABLE a ADD COLUMN b int;'),
+    });
+    // Read-only: the CLI is only ever asked for status, never migrate.
+    const invokedArgs = mockExecFile.mock.calls.map((c) => c[1]).flat();
+    expect(invokedArgs).toContain('status');
+    expect(invokedArgs).not.toContain('migrate');
+    expect(invokedArgs).not.toContain('deploy');
+    expect(invokedArgs).not.toContain('reset');
+  });
+
+  it('surfaces drift in checkMigrations when a recorded checksum changed', async () => {
+    writeMigration('20260101000000_init', 'CREATE TABLE a (id int);');
+    const recorded = buildManifest(tmpDir);
+    writeMigration('20260101000000_init', 'CREATE TABLE a (id bigint);');
+
+    process.env.MIGRATION_POLICY = 'strict';
+    simulateSpawn({ code: 0, stdout: 'Status: Database schema is up to date!' });
+
+    const r = await checkMigrations({ migrationsDir: tmpDir, recordedManifest: recorded });
+    expect(r.drift).toBe(true);
+    expect(r.status).toBe('drift');
+    expect(r.manifest.changed).toEqual(['20260101000000_init']);
+  });
+
+  it('reports up-to-date when the manifest matches and the DB is healthy', async () => {
+    writeMigration('20260101000000_init', 'CREATE TABLE a (id int);');
+    const recorded = buildManifest(tmpDir);
+
+    process.env.MIGRATION_POLICY = 'strict';
+    simulateSpawn({ code: 0, stdout: 'Status: Database schema is up to date!' });
+
+    const r = await checkMigrations({ migrationsDir: tmpDir, recordedManifest: recorded });
+    expect(r.drift).toBe(false);
+    expect(r.status).toBe('up-to-date');
+    expect(r.manifest.ok).toBe(true);
+  });
+});
+
 describe('strict-mode process.exit integration', () => {
   let checkMigrations;
   let enforceMigrationPolicy;

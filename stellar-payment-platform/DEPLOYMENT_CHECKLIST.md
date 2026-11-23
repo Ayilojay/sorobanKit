@@ -34,10 +34,38 @@
 
 ### Compatibility Review
 - [ ] Backward compatible with existing registrations ✅
-- [ ] No database schema changes
+- [ ] Database schema changes reviewed (migrations, idempotency, outbox)
 - [ ] No breaking API changes
 - [ ] Existing clients still work
 - [ ] Federation lookups unchanged
+
+### Migration Runner & Advisory Lock (#388)
+- [ ] Migration runner acquires a bounded PostgreSQL advisory lock before applying migrations
+- [ ] Concurrent startup across replicas applies each migration exactly once
+- [ ] Lock is released after failures (verify by forcing a failing migration in staging)
+- [ ] Structured logs emitted for lock owner, wait duration, and failures
+- [ ] Lock timeout is configured and documented
+
+### Migration Checksums & Schema Drift (#389)
+- [ ] Checksum manifest generated for all applied migrations
+- [ ] Manifest matches applied migrations (no unexpected entries)
+- [ ] Preflight reports no changed historical migration files
+- [ ] Preflight reports no schema drift
+- [ ] Deployed schema version reported without modifying data
+
+### Idempotency Records (#390)
+- [ ] Idempotency table has database-level unique constraint on hashed replay key
+- [ ] Request fingerprints and operation outcomes persisted in the same transaction as the business command
+- [ ] Concurrent duplicate requests converge (verified in staging)
+- [ ] Retention job configured and documented
+
+### Transactional Outbox (#391)
+- [ ] Outbox rows written in the same transaction as domain changes
+- [ ] Outbox rows are versioned
+- [ ] Dispatcher healthy with bounded retries
+- [ ] Consumers are idempotent
+- [ ] Reconciliation query for stuck events returns no unexpected rows
+=======
 
 ## Staging Deployment
 
@@ -105,11 +133,13 @@
 ### Production Deployment Steps
 1. [ ] Set maintenance mode (optional)
 2. [ ] Deploy code to production
-3. [ ] Run database migrations (if any)
-4. [ ] Verify environment variables
-5. [ ] Start server: `npm start`
-6. [ ] Monitor logs for first 30 minutes
-7. [ ] Exit maintenance mode
+3. [ ] Run database migrations (advisory lock + checksum preflight)
+4. [ ] Verify migration manifest and schema version match expectations
+5. [ ] Verify environment variables
+6. [ ] Start server: `npm start`
+7. [ ] Confirm outbox dispatcher started and reconciliation query is clean
+8. [ ] Monitor logs for first 30 minutes
+9. [ ] Exit maintenance mode
 
 ### Production Verification
 - [ ] Check server health endpoint
@@ -130,18 +160,24 @@
 - [ ] Verify no increase in failed transactions
 - [ ] Check CPU/memory usage normal
 - [ ] Verify backup jobs still run
+- [ ] Monitor advisory lock wait/failure logs (should be none after startup)
+- [ ] Verify no schema drift alerts from preflight
+- [ ] Monitor idempotency retention job runs
+- [ ] Monitor outbox backlog and stuck-event reconciliation results
 
 ## Rollback Procedure
 
 If critical issues occur:
 
 1. [ ] Stop server: `npm stop` or `kill <PID>`
-2. [ ] Restore database backup: `sqlite3 registrations.db < backup.sql`
-3. [ ] Revert code to previous version: `git checkout <previous-tag>`
-4. [ ] Restart server: `npm start`
-5. [ ] Verify service is back online
-6. [ ] Investigate root cause
-7. [ ] Document incident
+2. [ ] Confirm no migration advisory lock is held (released on failure)
+3. [ ] Restore database backup: `sqlite3 registrations.db < backup.sql`
+4. [ ] Revert code to previous version: `git checkout <previous-tag>`
+5. [ ] Restart server: `npm start`
+6. [ ] Verify migration manifest matches restored schema version
+7. [ ] Verify service is back online
+8. [ ] Investigate root cause
+9. [ ] Document incident
 
 ## Documentation Updates
 
@@ -177,6 +213,10 @@ If critical issues occur:
 8. [ ] No database connection issues
 9. [ ] Horizon API calls successful
 10. [ ] Staff verified registration manually
+11. [ ] Migrations applied once under advisory lock with no lock leaks
+12. [ ] Checksum manifest matches applied migrations; no schema drift
+13. [ ] Idempotency unique constraint active and retention job running
+14. [ ] Outbox dispatcher healthy; no stuck events
 
 ## Sign-Off
 
