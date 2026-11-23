@@ -49,7 +49,7 @@ describe('POST /api/v1/webhooks/verify-test', () => {
     expect(res.body.expectedSignature).toBe(signature);
   });
 
-  test('returns detailed failure when the signature does not match', async () => {
+  test('returns a standardized authentication error without echoing the signature', async () => {
     const secret = 'test-webhook-secret';
     const payload = { event: 'payment.created', id: 'evt_123', amount: 42 };
 
@@ -59,12 +59,15 @@ describe('POST /api/v1/webhooks/verify-test', () => {
       .send({ secret, payload: JSON.stringify(payload) });
 
     expect(res.status).toBe(401);
-    expect(res.body.ok).toBe(false);
-    expect(res.body.valid).toBe(false);
-    expect(res.body.error).toMatchObject({
-      code: 'INVALID_WEBHOOK_SIGNATURE',
+    expect(res.body).toMatchObject({
+      success: false,
+      error: {
+        code: 'UNAUTHENTICATED',
+        retryable: false,
+      },
     });
-    expect(res.body.receivedSignature).toBe('abc123');
+    expect(res.body).not.toHaveProperty('expectedSignature');
+    expect(res.body).not.toHaveProperty('receivedSignature');
   });
 });
 

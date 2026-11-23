@@ -113,14 +113,23 @@ describe('Dashboard – signing-failure path', () => {
       'fetch',
       vi
         .fn()
-        // 1st call: /lookup during loadReceiveDetails
+        // Initial health check, then /lookup during loadReceiveDetails.
         .mockResolvedValueOnce({
           ok: true,
+          headers: new Headers({ 'Content-Type': 'application/json' }),
+          json: async () => ({ status: 'UP' }),
+          text: async () => JSON.stringify({ status: 'UP' }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          headers: new Headers({ 'Content-Type': 'application/json' }),
+          json: async () => ({ address: PUBLIC_KEY, username: 'alice' }),
           text: async () => JSON.stringify({ address: PUBLIC_KEY, username: 'alice' }),
         })
-        // All subsequent calls: /federation for recipient resolution (debounce + handleLookup)
+        // All subsequent calls: /federation for recipient resolution.
         .mockResolvedValue({
           ok: true,
+          headers: new Headers({ 'Content-Type': 'application/json' }),
           json: async () => ({ account_id: RECIPIENT_KEY }),
           text: async () => JSON.stringify({ account_id: RECIPIENT_KEY }),
         }),

@@ -2,7 +2,13 @@
 
 const crypto = require('crypto');
 const { logger } = require('../logger');
-const { ApiError, codeForStatus, errorBody, DEFAULT_MESSAGES } = require('../errors');
+const {
+  ApiError,
+  ERROR_CODES,
+  codeForStatus,
+  errorBody,
+  DEFAULT_MESSAGES,
+} = require('../errors');
 
 /**
  * Maps errors thrown by libraries, which carry their own conventions rather
@@ -15,15 +21,20 @@ const classify = (err, req, isPrismaConnectionError) => {
       statusCode: err.statusCode,
       message: err.message,
       details: err.details,
+      retryable: err.retryable,
       expected: true,
     };
   }
 
-  if (isPrismaConnectionError(err)) {
+  if (
+    typeof isPrismaConnectionError === 'function' &&
+    isPrismaConnectionError(err)
+  ) {
     return {
       code: 'SERVICE_UNAVAILABLE',
       statusCode: 503,
       message: DEFAULT_MESSAGES.SERVICE_UNAVAILABLE,
+      retryable: true,
       expected: true,
     };
   }
@@ -45,12 +56,13 @@ const classify = (err, req, isPrismaConnectionError) => {
 
   const statusCode = err.statusCode || err.status || 500;
   return {
-    code: err.code && typeof err.code === 'string' && /^[A-Z_]+$/.test(err.code)
+    code: err.code && Object.hasOwn(ERROR_CODES, err.code)
       ? err.code
       : codeForStatus(statusCode),
     statusCode,
     message: err.message || DEFAULT_MESSAGES.INTERNAL_ERROR,
     details: err.details,
+    retryable: err.retryable,
   };
 };
 
@@ -69,8 +81,8 @@ const classify = (err, req, isPrismaConnectionError) => {
 const buildErrorHandler = (isPrismaConnectionError) =>
   // eslint-disable-next-line no-unused-vars
   (err, req, res, _next) => {
-    const { code, statusCode, message, details, expected } = classify(err, req, isPrismaConnectionError);
-
+    const { code, statusCode, message, details, retryable, expected } =
+      classify(err, req, isPrismaConnectionError);
     if (res.headersSent) {
       return;
     }
@@ -84,14 +96,16 @@ const buildErrorHandler = (isPrismaConnectionError) =>
 
       return res.status(statusCode).json(
         errorBody(code, expected ? message : DEFAULT_MESSAGES.INTERNAL_ERROR, {
+          details: expected ? details : undefined,
           correlationId: req.correlationId,
           referenceId,
+          retryable,
         }),
       );
     }
 
     return res.status(statusCode).json(
-      errorBody(code, message, { details, correlationId: req.correlationId }),
+      errorBody(code, message, { details, correlationId: req.correlationId, retryable }),
     );
   };
 

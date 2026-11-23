@@ -10,6 +10,7 @@ import ScrollToTop from '../ScrollToTop';
 import MobileNav from './MobileNav';
 import RecentAddresses from '../components/RecentAddresses';
 import { useRecentAddresses } from '../useRecentAddresses';
+import { getFederation, getLookup } from '../api/client';
 import {
   API_BASE,
   NAV_STORAGE_KEY,
@@ -197,11 +198,7 @@ function Dashboard({
       );
 
       try {
-        const response = await fetch(
-          `${API_BASE}/lookup?address=${encodeURIComponent(userPublicKey)}`,
-        );
-        const rawBody = await response.text();
-        const data = rawBody ? JSON.parse(rawBody) : null;
+        const { response, data } = await getLookup(userPublicKey);
 
         if (response.ok && data) {
           setReceiveAddress(data.address);
@@ -267,10 +264,8 @@ function Dashboard({
         }
 
         if (resolved.tag) {
-          const response = await fetch(
-            `${API_BASE}/federation?q=${encodeURIComponent(resolved.tag)}&type=name`,
-          );
-          const data = response.ok ? await response.json() : null;
+          const result = await getFederation(resolved.tag, 'name');
+          const data = result.response.ok ? result.data : null;
           if (!data?.account_id) {
             return;
           }
@@ -320,10 +315,8 @@ function Dashboard({
 
       let recipientAddress = resolved.address;
       if (!recipientAddress && resolved.tag) {
-        const response = await fetch(
-          `${API_BASE}/federation?q=${encodeURIComponent(resolved.tag)}&type=name`,
-        );
-        const data = response.ok ? await response.json() : null;
+        const result = await getFederation(resolved.tag, 'name');
+        const data = result.response.ok ? result.data : null;
         if (!data?.account_id)
           throw new Error(
             "Recipient address could not be resolved from backend.",

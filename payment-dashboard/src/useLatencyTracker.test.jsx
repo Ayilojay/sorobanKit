@@ -1,21 +1,28 @@
-import React from 'react';
+// @vitest-environment jsdom
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, act } from '@testing-library/react';
 import { useLatencyTracker } from './useLatencyTracker';
 
 describe('useLatencyTracker', () => {
-  let originalFetch;
-
   beforeEach(() => {
-    jest.useFakeTimers();
-    originalFetch = global.fetch;
-    global.fetch = jest.fn(() => Promise.resolve({ ok: true }));
+    vi.useFakeTimers();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve({
+          ok: true,
+          headers: new Headers({ 'Content-Type': 'application/json' }),
+          json: async () => ({ status: 'UP' }),
+        }),
+      ),
+    );
   });
 
   afterEach(() => {
-    global.fetch = originalFetch;
-    jest.clearAllTimers();
-    jest.useRealTimers();
-    jest.restoreAllMocks();
+    vi.unstubAllGlobals();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
   });
 
   function TestComponent() {
@@ -28,34 +35,34 @@ describe('useLatencyTracker', () => {
 
     // Allow any initial effect-triggered fetch to settle.
     await act(async () => {
-      jest.advanceTimersByTime(0);
+      await vi.advanceTimersByTimeAsync(0);
     });
 
-    const callsBeforeUnmount = global.fetch.mock.calls.length;
+    const callsBeforeUnmount = fetch.mock.calls.length;
 
     unmount();
 
     // Advance timers well past the 30s polling interval.
     await act(async () => {
-      jest.advanceTimersByTime(120000);
+      await vi.advanceTimersByTimeAsync(120000);
     });
 
-    expect(global.fetch.mock.calls.length).toBe(callsBeforeUnmount);
+    expect(fetch.mock.calls.length).toBe(callsBeforeUnmount);
   });
 
   it('does not update state after unmount (no React warnings)', async () => {
-    const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     const { unmount } = render(<TestComponent />);
 
     await act(async () => {
-      jest.advanceTimersByTime(0);
+      await vi.advanceTimersByTimeAsync(0);
     });
 
     unmount();
 
     await act(async () => {
-      jest.advanceTimersByTime(120000);
+      await vi.advanceTimersByTimeAsync(120000);
     });
 
     const stateUpdateWarnings = consoleErrorSpy.mock.calls.filter((call) =>

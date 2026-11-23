@@ -120,6 +120,7 @@ describe('rejectNestedObjects middleware', () => {
       error: {
         code: 'INVALID_INPUT',
         message: 'Invalid parameter type: nested objects and arrays are not allowed.',
+        retryable: false,
       },
       });
     });
@@ -145,6 +146,7 @@ describe('rejectNestedObjects middleware', () => {
       error: {
         code: 'INVALID_INPUT',
         message: 'Invalid parameter type: nested objects and arrays are not allowed.',
+        retryable: false,
       },
       });
     });
@@ -191,6 +193,7 @@ describe('rejectNestedObjects middleware', () => {
       error: {
         code: 'INVALID_INPUT',
         message: 'Invalid parameter type: nested objects and arrays are not allowed.',
+        retryable: false,
       },
       });
     });

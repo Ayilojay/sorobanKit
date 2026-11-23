@@ -1,6 +1,7 @@
 'use strict';
 
 const { asyncHandler } = require('../../middleware/asyncHandler');
+const { ApiError } = require('../../errors');
 const { parsePagination, paginatedResponse, parseCursorQuery, paginateByKeyset, cursorPaginatedResponse, keysetWhereDesc } = require('../../pagination');
 
 module.exports = (router, adminAuth, getPrisma) => {
@@ -24,7 +25,7 @@ module.exports = (router, adminAuth, getPrisma) => {
       // Keyset (cursor) pagination
       const { limit, cursor: parsedCursor, invalid } = parseCursorQuery(req.query);
       if (invalid) {
-        return res.status(400).json({ error: 'Invalid cursor' });
+        return next(new ApiError('INVALID_INPUT', 'Invalid cursor'));
       }
 
       if (parsedCursor) {

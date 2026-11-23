@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { API_BASE, apiErrorMessage, walletKit } from './shared'; // <-- 1. Import walletKit instead of Freighter
+import { getLookup } from '../api/client';
 
 const USERNAME_REGEX = /^[a-zA-Z0-9]/;
 
@@ -59,11 +60,7 @@ function RegistrationPage({
 
     const checkExisting = async () => {
       try {
-        const response = await fetch(
-          `${API_BASE}/lookup?address=${encodeURIComponent(userPublicKey)}`,
-        );
-        const rawBody = await response.text();
-        const data = rawBody ? JSON.parse(rawBody) : null;
+        const { response, data } = await getLookup(userPublicKey);
 
         if (response.ok && data?.username) {
           onRegistered();

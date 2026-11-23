@@ -352,9 +352,12 @@ router.post(
 
 router.post("/users/:username/transfer", async (req, res, next) => {
   if (!req.is("application/json")) {
-    return res
-      .status(415)
-      .json({ error: "Unsupported Media Type. Please send application/json" });
+    return next(
+      new ApiError(
+        "UNSUPPORTED_MEDIA_TYPE",
+        "Unsupported Media Type. Please send application/json",
+      ),
+    );
   }
 
   const { username } = req.params;
@@ -389,10 +392,7 @@ router.post("/users/:username/transfer", async (req, res, next) => {
       new_address: updatedUser.address,
     });
   } catch (error) {
-    const status = error.statusCode || 500;
-    return res
-      .status(status)
-      .json({ error: error.message || "Transfer failed" });
+    return next(error);
   }
 });
 
@@ -518,7 +518,7 @@ router.get(
     if (!signature || !signerAddress) {
       return next(
         new ApiError(
-          "UNAUTHORIZED",
+          "UNAUTHENTICATED",
           "Missing signature or signer address for ownership verification.",
         ),
       );
@@ -531,7 +531,7 @@ router.get(
       logger.error("Failed to fetch account signers:", error.message);
       return next(
         new ApiError(
-          "UNAUTHORIZED",
+          "UNAUTHENTICATED",
           "Unable to verify ownership: account signers unavailable.",
         ),
       );
@@ -544,7 +544,7 @@ router.get(
     if (!signerKeys.includes(signerAddress)) {
       return next(
         new ApiError(
-          "UNAUTHORIZED",
+          "UNAUTHENTICATED",
           "Signer is not authorized for this account.",
         ),
       );
@@ -563,7 +563,7 @@ router.get(
     if (!verification.success) {
       return next(
         new ApiError(
-          "UNAUTHORIZED",
+          "UNAUTHENTICATED",
           verification.errorMessage || "Signature verification failed.",
         ),
       );

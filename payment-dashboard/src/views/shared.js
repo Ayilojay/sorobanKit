@@ -8,11 +8,11 @@ import {
 } from '@creit.tech/stellar-wallets-kit';
 import { useEffect, useRef, useState } from 'react';
 
+export { API_BASE } from '../api/baseUrl';
+
 export const CONTRACT_ID = 'CDNQ7OMHIFOLZHOKWQLOGDW7CF3DRMKXJC6OULNGNBWF4O4NO2NEIGER';
 export const TREASURY_ADDRESS = 'GAAFWEZKDYPXLTQGKQ3F23TXWYQUDAYTDW7P7VUQSVJFW2GWC4Y6LWST';
 export const TOKEN_ADDRESS = 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC';
-export const API_BASE =
-  import.meta.env.VITE_API_BASE || 'https://stellar-tags.onrender.com';
 export const DEFAULT_FEDERATION_DOMAIN = 'localhost';
 export const HORIZON_BASE = 'https://horizon-testnet.stellar.org';
 export const ANALYTICS_WINDOW_MS = 60 * 60 * 1000;
