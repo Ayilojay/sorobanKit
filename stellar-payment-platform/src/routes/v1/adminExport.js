@@ -2,6 +2,7 @@
 
 const { once } = require('events');
 const { asyncHandler } = require('../../middleware/asyncHandler');
+const { ApiError } = require('../../errors');
 const { adminExportQuerySchema } = require('../../schemas');
 const { logger } = require('../../logger');
 
@@ -48,16 +49,18 @@ const csvRow = (record) => Object.values(record).map((value) => {
  *             description: True when additional matching rows were omitted.
  */
 module.exports = (router, adminAuth, getPrisma) => {
-  router.get('/admin/export', adminAuth, asyncHandler(async (req, res) => {
+  router.get('/admin/export', adminAuth, asyncHandler(async (req, res, next) => {
     const parsed = adminExportQuerySchema.shape.limit.safeParse(req.query.limit);
-    if (!parsed.success) return res.status(400).json({ error: 'limit must be a positive integer' });
+    if (!parsed.success) return next(new ApiError('INVALID_INPUT', 'limit must be a positive integer'));
 
     let rowLimit;
     try {
       rowLimit = exportRowLimit(parsed.data);
     } catch (error) {
-      logger.error(error.message);
-      return res.status(500).json({ error: 'Invalid admin export configuration' });
+      return next(new ApiError('INTERNAL_ERROR', 'Admin export configuration is invalid', {
+        cause: error,
+        retryable: false,
+      }));
     }
 
     const { format = 'csv', startDate, endDate } = req.query;
@@ -65,9 +68,9 @@ module.exports = (router, adminAuth, getPrisma) => {
     if (startDate || endDate) {
       const gte = startDate ? new Date(startDate) : undefined;
       const lte = endDate ? new Date(endDate) : undefined;
-      if (gte && isNaN(gte.getTime())) return res.status(400).json({ error: 'Invalid startDate' });
-      if (lte && isNaN(lte.getTime())) return res.status(400).json({ error: 'Invalid endDate' });
-      if (gte && lte && gte > lte) return res.status(400).json({ error: 'startDate must not be after endDate' });
+      if (gte && isNaN(gte.getTime())) return next(new ApiError('INVALID_INPUT', 'Invalid startDate'));
+      if (lte && isNaN(lte.getTime())) return next(new ApiError('INVALID_INPUT', 'Invalid endDate'));
+      if (gte && lte && gte > lte) return next(new ApiError('INVALID_INPUT', 'startDate must not be after endDate'));
       dateFilter = {};
       if (gte) dateFilter.gte = gte;
       if (lte) dateFilter.lte = lte;

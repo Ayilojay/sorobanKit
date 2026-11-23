@@ -1,6 +1,7 @@
 'use strict';
 
 const { asyncHandler } = require('../../middleware/asyncHandler');
+const { ApiError } = require('../../errors');
 const { listDLQEntries, replayFromDLQ } = require('../../webhookWorker');
 
 module.exports = (router, adminAuth, getPrisma) => {
@@ -81,15 +82,15 @@ module.exports = (router, adminAuth, getPrisma) => {
         typeof req.params?.id === 'string' ? req.params.id.trim() : '';
 
       if (!id) {
-        return res.status(400).json({ error: 'DLQ entry id is required in URL path.' });
+        return next(new ApiError('INVALID_INPUT', 'DLQ entry id is required in URL path.'));
       }
 
       try {
         const result = await replayFromDLQ(prisma, async (sql, params) => [], id);
 
         if (!result.ok) {
-          const status = result.error === 'DLQ entry not found' ? 404 : 409;
-          return res.status(status).json({ error: result.error });
+          const code = result.error === 'DLQ entry not found' ? 'NOT_FOUND' : 'CONFLICT';
+          return next(new ApiError(code, result.error));
         }
 
         return res.status(200).json({ ok: true, replayed: true });

@@ -49,6 +49,7 @@ describe('validateSchema middleware', () => {
         error: {
           code: 'VALIDATION_FAILED',
           message: 'Invalid request body',
+          retryable: false,
           details: [{ field: 'name', message: 'name must be at least 2 characters' }],
         },
       });
@@ -133,6 +134,7 @@ describe('validateSchema middleware', () => {
         error: {
           code: 'INVALID_INPUT',
           message: 'Invalid request query',
+          retryable: false,
           details: [{ field: 'q', message: "Missing 'q' parameter" }],
         },
       });

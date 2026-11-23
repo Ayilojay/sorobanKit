@@ -135,6 +135,28 @@ npm install
 npm run dev
 ```
 
+Dashboard API types are generated from [`docs/openapi.json`](./docs/openapi.json):
+
+```bash
+npm run api:generate
+npm run api:check
+```
+
+Commit regenerated types whenever the OpenAPI contract changes. The dashboard
+transport is generated-contract typed and does not import server implementation
+code.
+
+API failures use `{ success: false, error: { code, message, retryable, details? } }`.
+Codes are stable machine-readable identifiers; `details` contains only safe
+field/message pairs, and unexpected server errors include a reference ID while
+their stack traces remain in server logs.
+
+API keys are optional for public routes. When supplied, credentials are
+authenticated before rate limiting and must have `read` for GET/HEAD routes,
+`write` for mutations, or `admin` for `/admin/*` routes. Invalid keys return
+401; authenticated keys missing the required scope return 403. The legacy
+`ADMIN_API_KEY` remains an admin-scoped credential.
+
 ### Server
 
 The server uses **PostgreSQL** as its database, accessed through the

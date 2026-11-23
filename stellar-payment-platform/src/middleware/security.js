@@ -12,6 +12,7 @@
  */
 
 const helmet = require('helmet');
+const { errorBody } = require('../errors');
 
 // SECURITY REQUIREMENT: API key hash verification must be constant-time.
 // Any middleware or route that compares a hash of an incoming `X-Api-Key`
@@ -196,12 +197,11 @@ function createRateLimiter(options = {}) {
 
     if (bucket.count > limit) {
       res.setHeader('Retry-After', String(resetSeconds));
-      res.status(429).json({
-        error: 'Too Many Requests',
-        message: 'Rate limit exceeded. Please retry later.',
-        tier: authenticated ? 'authenticated' : 'anonymous',
-        retryAfter: resetSeconds,
-      });
+      res.status(429).json(
+        errorBody('RATE_LIMITED', 'Too many requests, please try again later.', {
+          correlationId: req.correlationId,
+        }),
+      );
       return;
     }
 

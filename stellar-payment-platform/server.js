@@ -39,6 +39,11 @@ const {
 const { ApiError, errorBody } = require("./src/errors");
 const { requireJson } = require("./src/middleware/requireJson");
 const { bodySizeLimit } = require("./src/middleware/bodyLimit");
+const {
+  apiKeyAuthentication,
+  apiKeyScopeMiddleware,
+  getRequestApiKey,
+} = require("./src/middleware/apiKeyAuth");
 const { apiVersion } = require("./src/middleware/apiVersion");
 const { deprecationMiddleware } = require("./src/middleware/deprecation");
 const {
@@ -163,7 +168,7 @@ const corsOptions = {
     return callback(new Error("Not allowed by CORS"));
   },
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Api-Key"],
   credentials: true,
   optionsSuccessStatus: 204,
 };
@@ -223,40 +228,6 @@ const RATE_LIMIT_AUTHENTICATED =
   parseInt(process.env.RATE_LIMIT_AUTHENTICATED, 10) || 1000;
 const RATE_LIMIT_ANONYMOUS =
   parseInt(process.env.RATE_LIMIT_ANONYMOUS, 10) || 100;
-
-// Resolve the API key presented on the request, if any. Accepts the header
-// (preferred) or the legacy query-string fallback.
-const getRequestApiKey = (req) => {
-  const apiKey = req.headers["x-api-key"] || req.query.api_key;
-  return typeof apiKey === "string" && apiKey.trim() ? apiKey.trim() : null;
-};
-
-// Validate an API key against the API key store. Returns the owning record on
-// success, or null when the key is missing, unknown, revoked or expired.
-const validateApiKey = async (apiKey) => {
-  if (!apiKey) return null;
-  try {
-    const { validateApiKey: validate } = require("./src/services/apiKeyService");
-    const record = await validate(apiKey);
-    return record || null;
-  } catch (err) {
-    // Any failure to validate (store down, malformed key, etc.) must degrade
-    // to the anonymous tier rather than granting the higher limit.
-    logger.warn({ err }, "API key validation failed; using anonymous tier");
-    return null;
-  }
-};
-
-// Attach the validated API key record (if any) to the request so the limiter
-// can pick the right tier without re-validating.
-const apiKeyTier = async (req, res, next) => {
-  try {
-    req.apiKeyRecord = await validateApiKey(getRequestApiKey(req));
-  } catch (err) {
-    req.apiKeyRecord = null;
-  }
-  next();
-};
 
 const limiter = rateLimit({
   windowMs: RATE_LIMIT_WINDOW_MS,
@@ -332,10 +303,10 @@ app.use(cors(corsOptions));
 // instead of the previous uniform 10kb, and answers oversized payloads with 413.
 app.use(bodySizeLimit);
 
-// #177 — Resolve the API key tier before the limiter runs so it can apply the
-// authenticated or anonymous ceiling, and fall back to anonymous for invalid
-// keys.
-app.use(apiKeyTier);
+// Authenticate supplied API keys and enforce route scopes before applying
+// the corresponding authenticated request limit.
+app.use(apiKeyAuthentication);
+app.use(apiKeyScopeMiddleware);
 app.use(limiter);
 const isPrimitive = (v) =>
   v === null || v === undefined || typeof v !== "object";
@@ -532,7 +503,7 @@ const registerLocalUser = async ({ username, address, isPrimary = false }) => {
  *       401:
  *         description: Unauthorized — missing or invalid METRICS_TOKEN
  */
-app.get("/metrics", async (req, res) => {
+app.get("/metrics", async (req, res, next) => {
   // Require a bearer token or query-string token when METRICS_TOKEN is set.
   // This protects operational metrics (memory, CPU, connection counts, etc.)
   // from unauthenticated access while allowing scraper tools (Prometheus,
@@ -551,9 +522,7 @@ app.get("/metrics", async (req, res) => {
     const provided = bearerToken || queryToken;
 
     if (!provided || provided !== metricsToken) {
-      return res
-        .status(401)
-        .json({ error: "Unauthorized: missing or invalid metrics token" });
+      return next(new ApiError("UNAUTHENTICATED", "Unauthorized: missing or invalid metrics token"));
     }
   }
 
@@ -562,8 +531,7 @@ app.get("/metrics", async (req, res) => {
     const metrics = await getMetrics();
     res.end(metrics);
   } catch (err) {
-    logger.error(err, `[Correlation ID: ${req.correlationId}] Metrics error`);
-    res.status(500).end(err.message);
+    return next(new ApiError("INTERNAL_ERROR", "Failed to generate metrics", { cause: err }));
   }
 });
 
@@ -857,7 +825,7 @@ app.post(
       ? normalizedUsername.split("*")[0]
       : normalizedUsername;
     if (RESERVED_USERNAMES.includes(normalizedLocalPart)) {
-      return res.status(403).json({ error: "Username is reserved." });
+      return next(new ApiError("FORBIDDEN", "Username is reserved."));
     }
 
     const RESERVED_NAMES = [
@@ -1354,7 +1322,7 @@ app.use("/auth/api-keys", require("./src/routes/v1/apiKeyRoutes")(redisClient));
  *       200:
  *         description: Success
  */
-app.get("/.well-known/jwks.json", (_req, res) => {
+app.get("/.well-known/jwks.json", (_req, res, next) => {
   try {
     const { getJwks } = require("./src/utils/jwt");
     const jwks = getJwks();
@@ -1365,9 +1333,13 @@ app.get("/.well-known/jwks.json", (_req, res) => {
     return res.json(jwks);
   } catch (err) {
     logger.warn({ err }, "JWKS endpoint: JWT_PUBLIC_KEY is not configured");
-    return res
-      .status(503)
-      .json({ error: "JWKS not available: public key not configured." });
+    return next(
+      new ApiError(
+        "SERVICE_UNAVAILABLE",
+        "JWKS not available: public key not configured.",
+        { cause: err, retryable: false },
+      ),
+    );
   }
 });
 

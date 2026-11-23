@@ -9,6 +9,7 @@ const { shouldFallbackToLocalRegistry } = require('../../utils');
 const { idempotencyMiddleware } = require('../../../middleware/idempotency');
 const { authenticateUsernameOwner } = require('../../services/ownershipService');
 const { ACTIVITY_ACTIONS, recordActivity } = require('../../services/activityService');
+const { ApiError, errorBody } = require('../../errors');
 
 module.exports = (redisClient) => {
   const router = express.Router();
@@ -94,11 +95,9 @@ router.post('/webhooks/verify-test', asyncHandler(async (req, res, next) => {
    const secret = getWebhookSecret(req);
    if (!secret) {
      return res.status(400).json({
-       ok: false,
-       error: {
-         code: 'MISSING_WEBHOOK_SECRET',
-         message: 'Missing required webhook secret. Provide secret or webhookSecret in the request body or X-Webhook-Secret header.',
-       },
+       ...errorBody('INVALID_INPUT', 'Missing required webhook secret. Provide it in the request body or X-Webhook-Secret header.', {
+         correlationId: req.correlationId,
+       }),
      });
    }
 
@@ -107,11 +106,9 @@ router.post('/webhooks/verify-test', asyncHandler(async (req, res, next) => {
    );
    if (!signatureHeader) {
      return res.status(400).json({
-       ok: false,
-       error: {
-         code: 'MISSING_SIGNATURE',
-         message: 'Missing required X-Webhook-Signature header.',
-       },
+       ...errorBody('INVALID_INPUT', 'Missing required X-Webhook-Signature header.', {
+         correlationId: req.correlationId,
+       }),
      });
    }
 
@@ -124,34 +121,19 @@ router.post('/webhooks/verify-test', asyncHandler(async (req, res, next) => {
 
    if (expectedBuffer.length !== receivedBuffer.length) {
      return res.status(401).json({
-       ok: false,
-       valid: false,
-       error: {
-         code: 'INVALID_WEBHOOK_SIGNATURE',
-         message: 'The provided signature does not match the webhook secret and payload.',
-       },
-       expectedSignature,
-       receivedSignature: signatureHeader,
+       ...errorBody('UNAUTHENTICATED', 'The provided signature is invalid.', {
+         correlationId: req.correlationId,
+       }),
      });
    }
 
-   let valid;
-   try {
-     valid = crypto.timingSafeEqual(expectedBuffer, receivedBuffer);
-   } catch (error) {
-     valid = false;
-   }
+   const valid = crypto.timingSafeEqual(expectedBuffer, receivedBuffer);
 
    if (!valid) {
      return res.status(401).json({
-       ok: false,
-       valid: false,
-       error: {
-         code: 'INVALID_WEBHOOK_SIGNATURE',
-         message: 'The provided signature does not match the webhook secret and payload.',
-       },
-       expectedSignature,
-       receivedSignature: signatureHeader,
+       ...errorBody('UNAUTHENTICATED', 'The provided signature is invalid.', {
+         correlationId: req.correlationId,
+       }),
      });
    }
 
@@ -164,10 +146,7 @@ router.post('/webhooks/verify-test', asyncHandler(async (req, res, next) => {
    });
   } catch (err) {
    if (err.statusCode) return next(err);
-   logger.error('[webhooks] POST /webhooks/verify-test failed:', err.message);
-   const error = new Error(err.message || 'Failed to verify webhook signature');
-   error.statusCode = 400;
-   return next(error);
+   return next(new ApiError('INVALID_INPUT', 'Failed to verify webhook signature', { cause: err }));
   }
 }));
 
@@ -185,7 +164,7 @@ router.post('/webhooks/verify-test', asyncHandler(async (req, res, next) => {
 router.post('/webhooks', asyncHandler(async (req, res, next) => {
   try {
     if (!req.is('application/json')) {
-      return res.status(415).json({ error: 'Unsupported Media Type. Please send application/json' });
+      return next(new ApiError('UNSUPPORTED_MEDIA_TYPE', 'Please send application/json'));
     }
 
     const user = await authenticateWebhookCall(req);
@@ -193,7 +172,7 @@ router.post('/webhooks', asyncHandler(async (req, res, next) => {
     const events = normalizeWebhookEvents(req.body?.events);
 
     if (!isValidWebhookUrl(rawUrl)) {
-      return res.status(400).json({ error: 'Invalid webhook URL. Must be http or https.' });
+      return next(new ApiError('INVALID_INPUT', 'Invalid webhook URL. Must be http or https.'));
     }
 
     const secret = crypto.randomBytes(32).toString('hex');
@@ -279,7 +258,7 @@ router.post('/webhooks', asyncHandler(async (req, res, next) => {
 router.get('/webhooks', asyncHandler(async (req, res, next) => {
   try {
     if (!req.is('application/json') && Object.keys(req.body || {}).length > 0) {
-      return res.status(415).json({ error: 'Unsupported Media Type. Please send application/json' });
+      return next(new ApiError('UNSUPPORTED_MEDIA_TYPE', 'Please send application/json'));
     }
 
     const user = await authenticateWebhookCall(req);
@@ -347,14 +326,14 @@ router.get('/webhooks', asyncHandler(async (req, res, next) => {
 router.delete('/webhooks/:id', asyncHandler(async (req, res, next) => {
   try {
     if (!req.is('application/json') && Object.keys(req.body || {}).length > 0) {
-      return res.status(415).json({ error: 'Unsupported Media Type. Please send application/json' });
+      return next(new ApiError('UNSUPPORTED_MEDIA_TYPE', 'Please send application/json'));
     }
 
     const user = await authenticateWebhookCall(req);
     const id = typeof req.params?.id === 'string' ? req.params.id.trim() : '';
 
     if (!id) {
-      return res.status(400).json({ error: 'Webhook id is required in URL path.' });
+      return next(new ApiError('INVALID_INPUT', 'Webhook id is required in URL path.'));
     }
 
     let deletedCount = 0;
@@ -373,7 +352,7 @@ router.delete('/webhooks/:id', asyncHandler(async (req, res, next) => {
     }
 
     if (deletedCount === 0) {
-      return res.status(404).json({ error: 'Webhook not found.' });
+      return next(new ApiError('NOT_FOUND', 'Webhook not found.'));
     }
 
     await recordActivity(prisma, {
@@ -393,38 +372,15 @@ router.delete('/webhooks/:id', asyncHandler(async (req, res, next) => {
   }
 }));
 
-  router.post('/webhooks/verify-test', (req, res) => {
-    const { secret, payload } = req.body;
-    const signature = req.headers['x-webhook-signature'];
-
-    if (!secret || !payload) {
-      return res.status(400).json({ error: 'Missing secret or payload' });
-    }
-
-    const expectedSignature = crypto.createHmac('sha256', secret).update(payload).digest('hex');
-
-    if (signature === expectedSignature) {
-      return res.status(200).json({
-        ok: true,
-        valid: true,
-        message: 'Signature verification succeeded',
-        expectedSignature,
-      });
-    } else {
-      return res.status(401).json({
-        ok: false,
-        valid: false,
-        error: { code: 'INVALID_WEBHOOK_SIGNATURE' },
-        receivedSignature: signature,
-      });
-    }
-  });
-
   router.all('/webhooks', (req, res) => {
     if (req.method !== 'GET' && req.method !== 'POST') {
-      return res.status(405).json({ error: 'Method Not Allowed' });
+      return res.status(405).json(errorBody('METHOD_NOT_ALLOWED', 'Method Not Allowed', {
+        correlationId: req.correlationId,
+      }));
     }
-    res.status(404).end();
+    return res.status(404).json(errorBody('NOT_FOUND', 'Webhook route not found', {
+      correlationId: req.correlationId,
+    }));
   });
 
   return router;

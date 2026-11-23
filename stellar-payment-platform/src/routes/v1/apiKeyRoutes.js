@@ -6,6 +6,7 @@ const { requireJson } = require('../../middleware/requireJson');
 const { createApiKeyBodySchema, revokeApiKeyBodySchema, rotateApiKeyBodySchema } = require('../../schemas');
 const { asyncHandler } = require('../../middleware/asyncHandler');
 const { requireAuth } = require('../../utils/jwt');
+const { hashKey, validateApiKey } = require('../../services/apiKeyService');
 
 module.exports = (redisClient) => {
   const router = express.Router();
@@ -14,24 +15,6 @@ module.exports = (redisClient) => {
 
   const KEY_PREFIX = 'sk_live_';
   const GRACE_PERIOD_MS = 60 * 60 * 1000; // 1 hour default
-
-  const hashKey = (key) => crypto.createHash('sha256').update(key).digest('hex');
-
-  // SECURITY: API key hash comparisons must ALWAYS use crypto.timingSafeEqual
-  // (never `===` or string equality) to avoid timing attacks that could
-  // recover the hash character by character. Returns false on length mismatch
-  // instead of throwing.
-  const safeCompareHash = (incomingHash, storedHash) => {
-    if (typeof incomingHash !== 'string' || typeof storedHash !== 'string') {
-      return false;
-    }
-    const incoming = Buffer.from(incomingHash, 'hex');
-    const stored = Buffer.from(storedHash, 'hex');
-    if (incoming.length !== stored.length) {
-      return false;
-    }
-    return crypto.timingSafeEqual(incoming, stored);
-  };
 
   // Middleware: require a valid API key in the request
   const requireApiKey = asyncHandler(async (req, res, next) => {
@@ -47,19 +30,9 @@ module.exports = (redisClient) => {
       return next(new ApiError('UNAUTHENTICATED', 'API key required. Provide via X-Api-Key header or Authorization: Bearer <key>'));
     }
 
-    const keyHash = hashKey(token);
-    const record = await prisma.apiKey.findUnique({ where: { keyHash } });
-
-    if (!record || !safeCompareHash(keyHash, record.keyHash)) {
-      return next(new ApiError('UNAUTHENTICATED', 'Invalid API key'));
-    }
-
-    if (record.revokedAt) {
-      return next(new ApiError('UNAUTHENTICATED', 'API key has been revoked'));
-    }
-
-    if (record.expiresAt && record.expiresAt < new Date()) {
-      return next(new ApiError('UNAUTHENTICATED', 'API key has expired'));
+    const record = await validateApiKey(token);
+    if (!record) {
+      return next(new ApiError('UNAUTHENTICATED', 'Invalid or expired API key'));
     }
 
     // Update lastUsedAt (fire-and-forget)

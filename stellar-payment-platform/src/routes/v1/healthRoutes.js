@@ -3,6 +3,7 @@
 const express = require('express');
 const { prisma } = require('../../../prismaClient');
 const { logger } = require('../../logger');
+const { ApiError } = require('../../errors');
 const { HORIZON_BASE } = require('../../services/stellarService');
 
 const DEFAULT_HORIZON_TIMEOUT_MS = 3000;
@@ -26,7 +27,7 @@ async function pingHorizon() {
 module.exports = (redisClient) => {
   const router = express.Router();
 
-  router.get('/health', async (req, res) => {
+  router.get('/health', async (req, res, next) => {
     const checks = { database: null, redis: null, horizon: null };
     const failures = [];
 
@@ -36,7 +37,7 @@ module.exports = (redisClient) => {
         checks[key] = 'up';
       } catch (err) {
         checks[key] = 'down';
-        failures.push(`${label} unavailable`);
+        failures.push({ field: key, message: `${label} unavailable` });
         logger.error(err, `[Correlation ID: ${req.correlationId}] ${label} health check failed`);
       }
     };
@@ -56,8 +57,13 @@ module.exports = (redisClient) => {
     };
 
     if (failures.length) {
-      response.message = failures.join(', ');
-      return res.status(503).json(response);
+      return next(
+        new ApiError(
+          'SERVICE_UNAVAILABLE',
+          'One or more health checks are unavailable',
+          { details: failures },
+        ),
+      );
     }
 
     return res.status(200).json(response);

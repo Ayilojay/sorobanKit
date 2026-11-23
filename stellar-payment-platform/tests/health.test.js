@@ -12,10 +12,12 @@ jest.mock('../prismaClient', () => ({
 const { prisma } = require('../prismaClient');
 const { HORIZON_BASE } = require('../src/services/stellarService');
 const healthRoutes = require('../src/routes/v1/healthRoutes');
+const { buildErrorHandler } = require('../src/middleware/errorHandler');
 
 const buildApp = (redisClient = null) => {
   const app = express();
   app.use(healthRoutes(redisClient));
+  app.use(buildErrorHandler(() => false));
   return app;
 };
 
@@ -61,9 +63,12 @@ describe('GET /health', () => {
     const res = await request(buildApp(redisClient)).get('/health');
 
     expect(res.status).toBe(503);
-    expect(res.body.status).toBe('DOWN');
-    expect(res.body.database).toBe('down');
-    expect(res.body.message).toContain('Database unavailable');
+    expect(res.body.error).toMatchObject({
+      code: 'SERVICE_UNAVAILABLE',
+      message: 'One or more health checks are unavailable',
+      retryable: true,
+      details: [{ field: 'database', message: 'Database unavailable' }],
+    });
   });
 
   test('returns 503 when the Redis PING fails', async () => {
@@ -72,8 +77,10 @@ describe('GET /health', () => {
     const res = await request(buildApp(redisClient)).get('/health');
 
     expect(res.status).toBe(503);
-    expect(res.body.redis).toBe('down');
-    expect(res.body.message).toContain('Redis unavailable');
+    expect(res.body.error.details).toContainEqual({
+      field: 'redis',
+      message: 'Redis unavailable',
+    });
   });
 
   test('returns 503 when Horizon is unreachable', async () => {
@@ -82,8 +89,10 @@ describe('GET /health', () => {
     const res = await request(buildApp(redisClient)).get('/health');
 
     expect(res.status).toBe(503);
-    expect(res.body.horizon).toBe('down');
-    expect(res.body.message).toContain('Horizon unavailable');
+    expect(res.body.error.details).toContainEqual({
+      field: 'horizon',
+      message: 'Horizon unavailable',
+    });
   });
 
   test('returns 503 when Horizon answers with a non-2xx status', async () => {
@@ -92,7 +101,10 @@ describe('GET /health', () => {
     const res = await request(buildApp(redisClient)).get('/health');
 
     expect(res.status).toBe(503);
-    expect(res.body.horizon).toBe('down');
+    expect(res.body.error.details).toContainEqual({
+      field: 'horizon',
+      message: 'Horizon unavailable',
+    });
   });
 
   test('reports every failing dependency in one response', async () => {
@@ -104,9 +116,15 @@ describe('GET /health', () => {
 
     expect(res.status).toBe(503);
     expect(res.body).toMatchObject({
-      database: 'down',
-      redis: 'down',
-      horizon: 'down',
+      success: false,
+      error: {
+        code: 'SERVICE_UNAVAILABLE',
+        details: [
+          { field: 'database', message: 'Database unavailable' },
+          { field: 'redis', message: 'Redis unavailable' },
+          { field: 'horizon', message: 'Horizon unavailable' },
+        ],
+      },
     });
   });
 
@@ -157,7 +175,7 @@ describe('GET /health', () => {
     expect(elapsed).toBeGreaterThanOrEqual(40);
     expect(elapsed).toBeLessThan(1000);
     expect(res.status).toBe(503);
-    expect(res.body.horizon).toBe('down');
+    expect(res.body.error.code).toBe('SERVICE_UNAVAILABLE');
   });
 
   test('falls back to the default timeout when HEALTH_HORIZON_TIMEOUT_MS is invalid', async () => {
@@ -226,6 +244,7 @@ describe('GET /health — X-Correlation-ID header', () => {
     healthApp = express();
     healthApp.use(correlationId);
     healthApp.use(healthRoutes(redisClient));
+    healthApp.use(buildErrorHandler(() => false));
   });
 
   test('200 health response includes X-Correlation-ID header', async () => {

@@ -28,6 +28,7 @@ const { auditLogMiddleware } = require('../../middleware/auditLog');
 const { idempotencyMiddleware } = require('../../../middleware/idempotency');
 const { ACTIVITY_ACTIONS, recordActivity } = require('../../services/activityService');
 const { PRIMARY_USERNAME_ORDER } = require('../../utils');
+const { ApiError } = require('../../errors');
 
 
 module.exports = (redisClient) => {
@@ -45,10 +46,11 @@ module.exports = (redisClient) => {
     return require('../../../prismaClient');
   };
 
-  const adminAuth = (req, res, next) => {
+  const adminAuth = (req, _res, next) => {
+    if (req.apiKeyRecord?.scopes?.includes('admin')) return next();
     const apiKey = req.headers['x-api-key'] || req.query.api_key;
     if (!apiKey || apiKey !== process.env.ADMIN_API_KEY) {
-      return res.status(401).json({ error: 'Unauthorized: Invalid or missing API key' });
+      return next(new ApiError('UNAUTHENTICATED', 'Invalid or missing API key'));
     }
     next();
   };
@@ -71,7 +73,7 @@ router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
     const { address } = req.body;
 
     if (!address || typeof address !== 'string') {
-      return res.status(400).json({ error: 'Missing or invalid address' });
+      return next(new ApiError('INVALID_INPUT', 'Missing or invalid address'));
     }
 
     try {
@@ -85,7 +87,7 @@ router.post('/admin/block', adminAuth, asyncHandler(async (req, res, next) => {
       });
 
       if (count === 0) {
-        return res.status(404).json({ error: 'Address not found' });
+        return next(new ApiError('NOT_FOUND', 'Address not found'));
       }
 
       const blocked = await prisma.user.findMany({

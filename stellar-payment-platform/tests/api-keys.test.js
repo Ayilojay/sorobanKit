@@ -61,6 +61,7 @@ jest.mock('../src/utils/jwt', () => ({
 const { app } = require('../server');
 
 const KEY_PREFIX = 'sk_live_';
+const TEST_ADMIN_API_KEY = process.env.TEST_ADMIN_API_KEY;
 const hashKey = (key) => crypto.createHash('sha256').update(key).digest('hex');
 
 // API key hash comparisons MUST use crypto.timingSafeEqual to avoid timing

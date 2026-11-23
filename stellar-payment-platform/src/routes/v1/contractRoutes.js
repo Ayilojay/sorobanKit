@@ -1,18 +1,21 @@
 const express = require('express');
 const { getContractStatus } = require('../../services/contractService');
+const { ApiError } = require('../../errors');
 
 const router = express.Router();
 
-router.get('/contract/status', async (req, res) => {
+router.get('/contract/status', async (req, res, next) => {
   try {
     const status = await getContractStatus();
     return res.status(200).json(status);
   } catch (error) {
-    console.error('Error fetching contract status:', error);
     if (error.message.includes('not set')) {
-      return res.status(500).json({ error: 'Contract configuration is missing' });
+      return next(new ApiError('SERVICE_UNAVAILABLE', 'Contract configuration is missing', {
+        cause: error,
+        retryable: false,
+      }));
     }
-    return res.status(500).json({ error: 'Failed to fetch contract status' });
+    return next(new ApiError('INTERNAL_ERROR', 'Failed to fetch contract status', { cause: error }));
   }
 });
 

@@ -15,6 +15,7 @@
 
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const { ApiError } = require('../errors');
 
 // ---------------------------------------------------------------------------
 // Key loading
@@ -150,7 +151,7 @@ function requireAuth(req, res, next) {
   const [scheme, token] = authHeader.split(' ');
 
   if (scheme !== 'Bearer' || !token) {
-    return res.status(401).json({ error: 'Missing or malformed Authorization header.' });
+    return next(new ApiError('UNAUTHENTICATED', 'Missing or malformed Authorization header.'));
   }
 
   try {
@@ -158,11 +159,11 @@ function requireAuth(req, res, next) {
     return next();
   } catch (err) {
     if (err.message === 'UNAUTHENTICATED' || err.code === 'UNAUTHENTICATED') {
-      return res.status(401).json({ error: 'UNAUTHENTICATED' });
+      return next(new ApiError('UNAUTHENTICATED'));
     }
     const message =
       err.name === 'TokenExpiredError' ? 'Token has expired.' : 'Invalid token.';
-    return res.status(401).json({ error: message });
+    return next(new ApiError('UNAUTHENTICATED', message));
   }
 }
 

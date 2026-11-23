@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
+import { getHealth } from './api/client'
 
 const LATENCY_CHECK_INTERVAL = 30 * 1000 // 30 seconds
-const HEALTH_ENDPOINT = '/health'
 
 /**
  * @typedef {'idle' | 'checking' | 'healthy' | 'unhealthy'} LatencyStatus
@@ -24,10 +24,7 @@ export const useLatencyTracker = (apiBase = '') => {
       setStatus('checking')
       const startTime = performance.now()
       
-      const response = await fetch(`${apiBase}${HEALTH_ENDPOINT}`, {
-        method: 'GET',
-        signal: AbortSignal.timeout(10000), // 10 second timeout
-      })
+      const { response } = await getHealth(AbortSignal.timeout(10000), apiBase)
       
       const endTime = performance.now()
       const delta = Math.round(endTime - startTime)

@@ -3,7 +3,7 @@
   "info": {
     "title": "Stellar Tags API",
     "version": "1.0.0",
-    "description": "OpenAPI specification for the Stellar Tags API. Covers the documented endpoints for tags, addresses, activity, and stats.\n\n## Soft-delete, restore, and username reuse semantics\n\n- **Reservation window**: when a tag (username) is soft-deleted, its name is reserved for a fixed `SOFT_DELETE_RESERVATION_DAYS` (default 30 days) from `deletedAt`. During this window the name cannot be claimed by any other owner.\n- **Restoration proof**: restoring a soft-deleted tag requires the original owner's authenticated identity (bearer token whose subject matches the tag's `ownerId`). The restore request must reference the tag id and the `deletedAt` value observed at deletion time; a mismatch (stale or already-restored) is rejected with `409 Conflict`.\n- **Post-expiry reuse**: once the reservation window elapses, the name becomes reusable. A new registration may claim it; the prior soft-deleted record is retained for audit but can no longer be restored (`410 Gone`).\n- **Transactional transitions**: delete, restore, and registration are enforced transactionally (row-level lock on the name). Concurrent delete/restore/registration cannot produce multiple active owners; losers receive `409 Conflict`.",
+    "description": "OpenAPI specification for the Stellar Tags API. Covers the documented endpoints for tags, addresses, activity, and stats. API errors use a stable envelope with a machine-readable code and retryable flag; validation details contain only field names and safe messages.\n\n## Soft-delete, restore, and username reuse semantics\n\n- **Reservation window**: when a tag (username) is soft-deleted, its name is reserved for a fixed `SOFT_DELETE_RESERVATION_DAYS` (default 30 days) from `deletedAt`. During this window the name cannot be claimed by any other owner.\n- **Restoration proof**: restoring a soft-deleted tag requires the original owner's authenticated identity (bearer token whose subject matches the tag's `ownerId`). The restore request must reference the tag id and the `deletedAt` value observed at deletion time; a mismatch (stale or already-restored) is rejected with `409 Conflict`.\n- **Post-expiry reuse**: once the reservation window elapses, the name becomes reusable. A new registration may claim it; the prior soft-deleted record is retained for audit but can no longer be restored (`410 Gone`).\n- **Transactional transitions**: delete, restore, and registration are enforced transactionally (row-level lock on the name). Concurrent delete/restore/registration cannot produce multiple active owners; losers receive `409 Conflict`.",
     "license": {
       "name": "MIT"
     }
@@ -26,6 +26,97 @@
     { "name": "Admin", "description": "Administrative endpoints" }
   ],
   "paths": {
+    "/health": {
+      "get": {
+        "tags": ["Platform"],
+        "summary": "Check platform health",
+        "operationId": "getHealth",
+        "responses": {
+          "200": {
+            "description": "All configured dependencies are healthy",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/HealthStatus" }
+              }
+            }
+          },
+          "503": { "$ref": "#/components/responses/ApiErrorResponse" }
+        }
+      }
+    },
+    "/federation": {
+      "get": {
+        "tags": ["Addresses"],
+        "summary": "Resolve a federation name or address",
+        "operationId": "getFederation",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "type",
+            "in": "query",
+            "schema": { "type": "string", "enum": ["id", "name"] }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Resolved federation identity",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/FederationEntry" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ApiErrorResponse" },
+          "404": { "$ref": "#/components/responses/ApiErrorResponse" },
+          "500": { "$ref": "#/components/responses/ApiErrorResponse" },
+          "502": { "$ref": "#/components/responses/ApiErrorResponse" },
+          "503": { "$ref": "#/components/responses/ApiErrorResponse" }
+        }
+      }
+    },
+    "/lookup": {
+      "get": {
+        "tags": ["Addresses"],
+        "summary": "Look up registered usernames",
+        "operationId": "lookupUsernames",
+        "parameters": [
+          {
+            "name": "address",
+            "in": "query",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "search",
+            "in": "query",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "all",
+            "in": "query",
+            "schema": { "type": "boolean" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Lookup result",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/LookupResult" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/ApiErrorResponse" },
+          "404": { "$ref": "#/components/responses/ApiErrorResponse" },
+          "500": { "$ref": "#/components/responses/ApiErrorResponse" },
+          "503": { "$ref": "#/components/responses/ApiErrorResponse" }
+        }
+      }
+    },
     "/api/tags": {
       "get": {
         "tags": ["Tags"],
@@ -350,6 +441,14 @@
       }
     },
     "responses": {
+      "ApiErrorResponse": {
+        "description": "A standardized API error",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
+        }
+      },
       "BadRequest": {
         "description": "Invalid request",
         "content": {
@@ -396,6 +495,141 @@
       }
     },
     "schemas": {
+      "TagInput": {
+        "type": "object",
+        "required": ["username", "address"],
+        "properties": {
+          "username": { "type": "string" },
+          "address": { "type": "string" }
+        }
+      },
+      "Tag": {
+        "type": "object",
+        "required": ["id", "username", "address"],
+        "properties": {
+          "id": { "type": "string" },
+          "username": { "type": "string" },
+          "address": { "type": "string" },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "deletedAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "TagList": {
+        "type": "object",
+        "required": ["data"],
+        "properties": {
+          "data": { "type": "array", "items": { "$ref": "#/components/schemas/Tag" } },
+          "totalCount": { "type": "integer" },
+          "totalPages": { "type": "integer" },
+          "currentPage": { "type": "integer" }
+        }
+      },
+      "ActivityList": {
+        "type": "object",
+        "required": ["data"],
+        "properties": {
+          "data": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+          "nextCursor": { "type": "string" },
+          "hasMore": { "type": "boolean" }
+        }
+      },
+      "Stats": {
+        "type": "object",
+        "description": "Aggregate metrics and the refresh watermark for the reporting read model.",
+        "additionalProperties": true
+      },
+      "StatsRefreshStatus": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "type": "string", "enum": ["idle", "refreshing", "succeeded", "failed"] },
+          "sourceWatermark": { "type": "string", "format": "date-time" },
+          "startedAt": { "type": "string", "format": "date-time" },
+          "completedAt": { "type": "string", "format": "date-time" },
+          "error": { "type": "string" }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": ["success", "error"],
+        "properties": {
+          "success": { "type": "boolean", "const": false },
+          "error": {
+            "type": "object",
+            "required": ["code", "message", "retryable"],
+            "properties": {
+              "code": {
+                "type": "string",
+                "enum": [
+                  "INVALID_INPUT",
+                  "UNAUTHENTICATED",
+                  "FORBIDDEN",
+                  "NOT_FOUND",
+                  "METHOD_NOT_ALLOWED",
+                  "GONE",
+                  "CONFLICT",
+                  "PAYLOAD_TOO_LARGE",
+                  "UNSUPPORTED_MEDIA_TYPE",
+                  "VALIDATION_FAILED",
+                  "RATE_LIMITED",
+                  "INTERNAL_ERROR",
+                  "UPSTREAM_ERROR",
+                  "SERVICE_UNAVAILABLE"
+                ]
+              },
+              "message": { "type": "string" },
+              "retryable": { "type": "boolean" },
+              "details": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["field", "message"],
+                  "properties": {
+                    "field": { "type": "string" },
+                    "message": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "correlation_id": { "type": "string" },
+          "reference_id": { "type": "string" }
+        }
+      },
+      "HealthStatus": {
+        "type": "object",
+        "required": ["status", "timestamp", "database", "redis", "horizon"],
+        "properties": {
+          "status": { "type": "string", "enum": ["UP"] },
+          "timestamp": { "type": "string", "format": "date-time" },
+          "database": { "type": "string", "enum": ["up"] },
+          "redis": { "type": "string", "enum": ["up", "not configured"] },
+          "horizon": { "type": "string", "enum": ["up"] }
+        }
+      },
+      "FederationEntry": {
+        "type": "object",
+        "required": ["stellar_address", "account_id"],
+        "properties": {
+          "stellar_address": { "type": "string" },
+          "account_id": { "type": "string" },
+          "memo_type": { "type": "string" },
+          "memo": { "type": "string" }
+        }
+      },
+      "LookupResult": {
+        "type": "object",
+        "properties": {
+          "username": { "type": "string" },
+          "address": { "type": "string" },
+          "primary": { "type": "string" },
+          "usernames": { "type": "array", "items": { "type": "string" } },
+          "data": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+          "totalCount": { "type": "integer" },
+          "totalPages": { "type": "integer" },
+          "currentPage": { "type": "integer" }
+        }
+      },
       "RestoreTagInput": {
         "type": "object",
         "required": ["deletedAt"],

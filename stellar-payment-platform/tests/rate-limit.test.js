@@ -1,6 +1,7 @@
 'use strict';
 
 const request = require('supertest');
+const crypto = require('crypto');
 
 // ── Mocks ────────────────────────────────────────────────────────────────────
 jest.mock('dotenv', () => ({ config: jest.fn() }));
@@ -170,6 +171,7 @@ describe('Rate Limiting — express-rate-limit', () => {
         error: {
           code: 'RATE_LIMITED',
           message: 'Too many requests, please try again later.',
+          retryable: true,
         },
       });
     });
@@ -193,6 +195,7 @@ describe('Rate Limiting — express-rate-limit', () => {
         error: {
           code: 'RATE_LIMITED',
           message: 'Too many requests, please try again later.',
+          retryable: true,
         },
       });
     });
@@ -253,6 +256,7 @@ describe('Rate Limiting — express-rate-limit', () => {
         error: {
           code: 'RATE_LIMITED',
           message: 'Too many requests, please try again later.',
+          retryable: true,
         },
       });
     });
@@ -283,11 +287,18 @@ describe('Rate Limiting — express-rate-limit', () => {
     // The API key validator is mocked so that only VALID_API_KEY is accepted.
     beforeEach(() => {
       const { prisma } = require('../prismaClient');
+      const keyHash = crypto.createHash('sha256').update(VALID_API_KEY).digest('hex');
       prisma.apiKey = {
         findUnique: jest.fn(({ where }) =>
           Promise.resolve(
-            where && where.key === VALID_API_KEY
-              ? { id: 'key-1', key: VALID_API_KEY, revoked: false }
+            where && where.keyHash === keyHash
+              ? {
+                  id: 'key-1',
+                  keyHash,
+                  scopes: ['read'],
+                  revokedAt: null,
+                  expiresAt: null,
+                }
               : null,
           ),
         ),
@@ -320,14 +331,14 @@ describe('Rate Limiting — express-rate-limit', () => {
       expect(res.headers['ratelimit-limit']).toBe(String(AUTHENTICATED_LIMIT));
     });
 
-    it('falls back to the anonymous limit for an invalid API key', async () => {
+    it('rejects invalid API credentials instead of treating them as anonymous', async () => {
       const res = await request(app)
         .get('/api/v1/federation')
         .query({ q: 'client*localhost' })
         .set('X-Api-Key', INVALID_API_KEY);
 
-      expect(res.status).toBe(200);
-      expect(res.headers['ratelimit-limit']).toBe(String(ANONYMOUS_LIMIT));
+      expect(res.status).toBe(401);
+      expect(res.body.error.code).toBe('UNAUTHENTICATED');
     });
 
     it('exhausts the anonymous pool without affecting the authenticated pool', async () => {
@@ -389,6 +400,7 @@ describe('Rate Limiting — express-rate-limit', () => {
         error: {
           code: 'RATE_LIMITED',
           message: 'Too many requests, please try again later.',
+          retryable: true,
         },
       });
     });

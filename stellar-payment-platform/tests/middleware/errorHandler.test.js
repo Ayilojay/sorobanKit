@@ -49,6 +49,7 @@ describe('error envelope', () => {
 
       expect(res.status).toBe(422);
       expect(res.body.error.details).toEqual(details);
+      expect(res.body.error.retryable).toBe(false);
     });
 
     test('omits details when there are none', async () => {
@@ -169,6 +170,7 @@ describe('error envelope', () => {
 
       expect(res.status).toBe(502);
       expect(res.body.error.message).toBe('Failed to fetch payments from Horizon');
+      expect(res.body.error.retryable).toBe(true);
     });
 
     test('does not attach a reference id to a 4xx', async () => {
@@ -176,6 +178,15 @@ describe('error envelope', () => {
       const res = await request(app).get('/boom');
 
       expect(res.body).not.toHaveProperty('reference_id');
+    });
+
+    test('allows an explicit retryability override', async () => {
+      const app = buildApp((req, res, next) =>
+        next(new ApiError('UPSTREAM_ERROR', 'Do not retry', { retryable: false })),
+      );
+      const res = await request(app).get('/boom');
+
+      expect(res.body.error.retryable).toBe(false);
     });
   });
 
@@ -239,7 +250,26 @@ describe('errors module', () => {
   test('errorBody omits optional members when absent', () => {
     expect(errorBody('NOT_FOUND', 'missing')).toEqual({
       success: false,
-      error: { code: 'NOT_FOUND', message: 'missing' },
+      error: { code: 'NOT_FOUND', message: 'missing', retryable: false },
+    });
+  });
+
+  test('errorBody exposes only bounded field and message detail values', () => {
+    expect(
+      errorBody('VALIDATION_FAILED', 'bad', {
+        details: [
+          { field: 'name', message: 'required', value: 'secret' },
+          { field: 12, message: 'not public' },
+        ],
+      }),
+    ).toEqual({
+      success: false,
+      error: {
+        code: 'VALIDATION_FAILED',
+        message: 'bad',
+        retryable: false,
+        details: [{ field: 'name', message: 'required' }],
+      },
     });
   });
 });
