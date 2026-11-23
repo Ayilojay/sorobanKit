@@ -17,6 +17,8 @@
 const { once } = require('events');
 const { Transform } = require('stream');
 const { Parser: CsvParser } = require('json2csv');
+const fs = require('fs');
+const { pipeline } = require('stream/promises');
 
 /** Default asset precision (Stellar classic assets use 7 decimal places). */
 const DEFAULT_ASSET_PRECISION = 7;
@@ -111,14 +113,23 @@ const EXPORT_SELECT = {
  * Writes `chunk` to `res`, waiting for a drain event if the write buffer is
  * full (i.e. the socket is applying backpressure).
  *
- * @param {import('http').ServerResponse} res
+ * @param {import('stream').Writable} sink
  * @param {string|Buffer} chunk
  */
-const writeChunk = async (res, chunk) => {
-  if (!res.write(chunk)) {
-    await once(res, 'drain');
+const writeChunk = async (sink, chunk) => {
+  if (!sink.write(chunk)) {
+    await once(sink, 'drain');
   }
 };
+
+/**
+ * Returns true when the sink can no longer accept writes (HTTP response
+ * ended/destroyed, or file stream closed).
+ *
+ * @param {import('stream').Writable} sink
+ * @returns {boolean}
+ */
+const isSinkClosed = (sink) => Boolean(sink.writableEnded || sink.destroyed);
 
 /**
  * Builds the Prisma `where` clause for the optional date-range filters.
@@ -151,14 +162,18 @@ const buildDateFilter = (startDate, endDate) => {
  * @param {string} correlationId
  * @returns {Promise<number>} Total rows written.
  */
-const streamCsv = async (res, prisma, filter, logger, correlationId) => {
+const streamCsv = async (res, prisma, filter, logger, correlationId, options = {}) => {
+  const maxPages = options.maxPages || MAX_PAGES;
+  const onPage = typeof options.onPage === 'function' ? options.onPage : null;
+  const isCancelled = typeof options.isCancelled === 'function' ? options.isCancelled : null;
   let page = 0;
   let totalRows = 0;
   let truncated = false;
   let headerWritten = false;
 
-  for (; page < MAX_PAGES; page++) {
-    if (res.writableEnded) break;
+  for (; page < maxPages; page++) {
+    if (isSinkClosed(res)) break;
+    if (isCancelled && isCancelled()) break;
 
     const records = await prisma.payment.findMany({
       where: filter,
@@ -188,16 +203,18 @@ const streamCsv = async (res, prisma, filter, logger, correlationId) => {
 
     totalRows += records.length;
 
+    if (onPage) await onPage({ page: page + 1, rows: totalRows });
+
     if (records.length < PAGE_SIZE) break; // last page
 
-    if (page === MAX_PAGES - 1) {
+    if (page === maxPages - 1) {
       truncated = true;
     }
   }
 
   if (truncated) {
     logger.warn(
-      `[exporter][${correlationId}] CSV export hit ${MAX_PAGES}-page cap after ${totalRows} rows — truncated`,
+      `[exporter][${correlationId}] CSV export hit ${maxPages}-page cap after ${totalRows} rows — truncated`,
     );
   }
 
@@ -216,13 +233,17 @@ const streamCsv = async (res, prisma, filter, logger, correlationId) => {
  * @param {string} correlationId
  * @returns {Promise<number>} Total rows written.
  */
-const streamJson = async (res, prisma, filter, logger, correlationId) => {
+const streamJson = async (res, prisma, filter, logger, correlationId, options = {}) => {
+  const maxPages = options.maxPages || MAX_PAGES;
+  const onPage = typeof options.onPage === 'function' ? options.onPage : null;
+  const isCancelled = typeof options.isCancelled === 'function' ? options.isCancelled : null;
   let page = 0;
   let totalRows = 0;
   let truncated = false;
 
-  for (; page < MAX_PAGES; page++) {
-    if (res.writableEnded) break;
+  for (; page < maxPages; page++) {
+    if (isSinkClosed(res)) break;
+    if (isCancelled && isCancelled()) break;
 
     const records = await prisma.payment.findMany({
       where: filter,
@@ -240,16 +261,18 @@ const streamJson = async (res, prisma, filter, logger, correlationId) => {
       totalRows += 1;
     }
 
+    if (onPage) await onPage({ page: page + 1, rows: totalRows });
+
     if (records.length < PAGE_SIZE) break;
 
-    if (page === MAX_PAGES - 1) {
+    if (page === maxPages - 1) {
       truncated = true;
     }
   }
 
   if (truncated) {
     logger.warn(
-      `[exporter][${correlationId}] JSON export hit ${MAX_PAGES}-page cap after ${totalRows} rows — truncated`,
+      `[exporter][${correlationId}] JSON export hit ${maxPages}-page cap after ${totalRows} rows — truncated`,
     );
   }
 
@@ -306,8 +329,95 @@ const streamAdminExport = async ({
   res.end();
 };
 
+/**
+ * Streams an admin export to a file on disk (artifact storage) instead of an
+ * HTTP response.  Rows are paged from the database and written incrementally
+ * so the whole export is never buffered in memory.
+ *
+ * The caller may supply:
+ *  - `isCancelled()`: polled between pages; when it returns true the export
+ *    stops early and the partial artifact is left for the caller to clean up.
+ *  - `onProgress({ page, rows })`: invoked after each page is flushed.
+ *
+ * @param {object} opts
+ * @param {string} opts.filePath        - Destination artifact path.
+ * @param {object} opts.prisma          - Prisma client instance.
+ * @param {string} opts.format          - 'csv' or 'json'
+ * @param {string} [opts.startDate]
+ * @param {string} [opts.endDate]
+ * @param {object} opts.logger
+ * @param {string} opts.correlationId
+ * @param {number} [opts.maxPages]      - Override the page cap.
+ * @param {() => boolean} [opts.isCancelled]
+ * @param {(progress: {page: number, rows: number}) => (void|Promise<void>)} [opts.onProgress]
+ * @returns {Promise<{rows: number, cancelled: boolean}>}
+ */
+const streamExportToFile = async ({
+  filePath,
+  prisma,
+  format,
+  startDate,
+  endDate,
+  logger,
+  correlationId,
+  maxPages,
+  isCancelled,
+  onProgress,
+}) => {
+  const dateFilter = buildDateFilter(startDate, endDate);
+  const sink = fs.createWriteStream(filePath, { flags: 'w' });
+  // Surface sink errors as rejections from the awaited writes below.
+  const sinkError = new Promise((_, reject) => {
+    sink.once('error', reject);
+  });
+  sinkError.catch(() => {});
+
+  let cancelled = false;
+  const options = {
+    maxPages,
+    isCancelled: () => {
+      if (isCancelled && isCancelled()) {
+        cancelled = true;
+        return true;
+      }
+      return false;
+    },
+    onPage: onProgress
+      ? async (progress) => {
+          await onProgress(progress);
+        }
+      : null,
+  };
+
+  try {
+    const rows =
+      format === 'json'
+        ? await Promise.race([
+            streamJson(sink, prisma, dateFilter, logger, correlationId, options),
+            sinkError,
+          ])
+        : await Promise.race([
+            streamCsv(sink, prisma, dateFilter, logger, correlationId, options),
+            sinkError,
+          ]);
+
+    await new Promise((resolve, reject) => {
+      sink.end((err) => (err ? reject(err) : resolve()));
+    });
+
+    logger.info(
+      `[exporter][${correlationId}] file export complete — ${rows} rows${cancelled ? ' (cancelled)' : ''}`,
+    );
+    return { rows, cancelled };
+  } catch (err) {
+    sink.destroy();
+    throw err;
+  }
+};
+
 module.exports = {
   streamAdminExport,
+  streamExportToFile,
   buildDateFilter,
   formatUnits,
   toExportRecord,

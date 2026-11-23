@@ -233,125 +233,87 @@ const httpError = (message, statusCode) => {
   return error;
 };
 
-const FORBIDDEN_CODE = 'FORBIDDEN';
-
-const forbiddenError = (message = 'You do not have permission to access this resource.') => {
-  const error = httpError(message, 403);
-  error.code = FORBIDDEN_CODE;
-  return error;
-};
-
 /**
- * Extracts the authenticated identity from a request principal.
+ * Returns true when the supplied actor is an administrator.  Accepts either a
+ * boolean flag (`isAdmin`) or a role string (`role === 'admin'`), so callers
+ * can pass whatever their auth middleware exposes.
  *
- * Only server-derived principal fields are trusted.  Caller-supplied
- * usernames or addresses carried on the request body/query are never
- * consulted here, so they cannot be used to grant access.
- *
- * @param {unknown} principal
- * @returns {{username: string|null, address: string|null}}
- */
-const normalizePrincipal = (principal) => {
-  if (!principal || typeof principal !== 'object') {
-    return { username: null, address: null };
-  }
-  const rawUsername = principal.username;
-  const rawAddress = principal.address;
-  const username =
-    typeof rawUsername === 'string' && rawUsername.trim()
-      ? normalizeNameTag(rawUsername.trim()).toLowerCase()
-      : null;
-  const address =
-    typeof rawAddress === 'string' && rawAddress.trim() ? rawAddress.trim() : null;
-  return { username, address };
-};
-
-/**
- * Returns true when `principal` is authenticated (has a username or address).
- * @param {unknown} principal
+ * @param {{isAdmin?: boolean, role?: string}|null|undefined} actor
  * @returns {boolean}
  */
-const isAuthenticated = (principal) => {
-  const { username, address } = normalizePrincipal(principal);
-  return Boolean(username || address);
+const isAdminActor = (actor) => {
+  if (!actor || typeof actor !== 'object') return false;
+  if (actor.isAdmin === true) return true;
+  return typeof actor.role === 'string' && actor.role.toLowerCase() === 'admin';
 };
 
 /**
- * Returns true when the authenticated `principal` owns `resource`.
+ * Extracts the owning user identifier from an export job record.  Supports the
+ * common field names used across the codebase (`ownerId`, `userId`,
+ * `requestedBy`) and returns `null` when none is present.
  *
- * `resource` may be a username string, an address string, or an object with
- * `username` and/or `address` fields.  Ownership is granted when the
- * principal's username matches the resource username, or the principal's
- * address matches the resource address.  Unauthenticated principals never
- * own anything.
- *
- * @param {unknown} principal
- * @param {unknown} resource
- * @returns {boolean}
+ * @param {object|null|undefined} job
+ * @returns {string|null}
  */
-const isOwner = (principal, resource) => {
-  const { username, address } = normalizePrincipal(principal);
-  if (!username && !address) return false;
-
-  let resourceUsername = null;
-  let resourceAddress = null;
-
-  if (typeof resource === 'string') {
-    const trimmed = resource.trim();
-    if (!trimmed) return false;
-    if (StrKey.isValidEd25519PublicKey(trimmed)) {
-      resourceAddress = trimmed;
-    } else {
-      resourceUsername = normalizeNameTag(trimmed).toLowerCase();
-    }
-  } else if (resource && typeof resource === 'object') {
-    if (typeof resource.username === 'string' && resource.username.trim()) {
-      resourceUsername = normalizeNameTag(resource.username.trim()).toLowerCase();
-    }
-    if (typeof resource.address === 'string' && resource.address.trim()) {
-      resourceAddress = resource.address.trim();
-    }
-  } else {
-    return false;
-  }
-
-  if (username && resourceUsername && username === resourceUsername) return true;
-  if (address && resourceAddress && address === resourceAddress) return true;
-  return false;
+const getExportJobOwnerId = (job) => {
+  if (!job || typeof job !== 'object') return null;
+  const candidate = job.ownerId ?? job.userId ?? job.requestedBy ?? null;
+  return candidate === null || candidate === undefined ? null : String(candidate);
 };
 
 /**
- * Returns true when the authenticated `principal` may access `resource`.
- * Currently equivalent to ownership; kept as a separate seam so future
- * role-based access can be layered on without changing call sites.
+ * Extracts the acting user identifier from an authenticated actor object.
  *
- * @param {unknown} principal
- * @param {unknown} resource
- * @returns {boolean}
+ * @param {{id?: string|number, userId?: string|number, sub?: string|number}|null|undefined} actor
+ * @returns {string|null}
  */
-const canAccess = (principal, resource) => isOwner(principal, resource);
+const getActorId = (actor) => {
+  if (!actor || typeof actor !== 'object') return null;
+  const candidate = actor.id ?? actor.userId ?? actor.sub ?? null;
+  return candidate === null || candidate === undefined ? null : String(candidate);
+};
 
 /**
- * Centralized ownership enforcement shared by routes and services.
+ * Asserts that `actor` may access `job`.  Admins may access any job; regular
+ * users may only access jobs they own.
  *
- * Throws a consistent 403 `FORBIDDEN` error when the principal is missing,
- * unauthenticated, or does not own the resource.  Caller-supplied usernames
- * or addresses on the request body/query are ignored: only the principal
- * (derived from authentication) is trusted.
+ * Throws an error with `statusCode` set:
+ *  - 404 when the job is missing (avoids leaking existence to non-owners)
+ *  - 403 when the job exists but is owned by someone else
  *
- * @param {unknown} principal
- * @param {unknown} resource
- * @returns {true} when access is granted
- * @throws {Error} with `statusCode` 403 and `code` `FORBIDDEN`
+ * @param {object|null|undefined} job
+ * @param {object|null|undefined} actor
+ * @returns {object} the job, for convenient chaining
  */
-const assertOwnership = (principal, resource) => {
-  if (!isAuthenticated(principal)) {
-    throw forbiddenError('Authentication required.');
+const assertExportJobOwnership = (job, actor) => {
+  if (!job) throw httpError('Export job not found.', 404);
+  if (isAdminActor(actor)) return job;
+
+  const ownerId = getExportJobOwnerId(job);
+  const actorId = getActorId(actor);
+
+  if (!ownerId || !actorId || ownerId !== actorId) {
+    throw httpError('You do not have permission to access this export job.', 403);
   }
-  if (!isOwner(principal, resource)) {
-    throw forbiddenError();
+
+  return job;
+};
+
+/**
+ * Async variant that loads the job via `loadJob` (a function returning the job
+ * or `null`) and then applies {@link assertExportJobOwnership}.  Useful for
+ * route handlers that need to fetch before checking.
+ *
+ * @param {() => Promise<object|null>} loadJob
+ * @param {object|null|undefined} actor
+ * @returns {Promise<object>}
+ */
+const assertExportJobOwnershipById = async (loadJob, actor) => {
+  if (typeof loadJob !== 'function') {
+    throw httpError('Export job not found.', 404);
   }
-  return true;
+  const job = await loadJob();
+  return assertExportJobOwnership(job, actor);
 };
 
 const verifyFreighterSignedMessage = ({ message, signature, signerAddress, publicKey }) => {
@@ -525,4 +487,10 @@ module.exports = {
   SIGNER_CACHE_TTL_MS,
   SIGNER_CACHE_KEY_PREFIX,
   _signerMemoryCache,
+  // Export job ownership helpers
+  isAdminActor,
+  getExportJobOwnerId,
+  getActorId,
+  assertExportJobOwnership,
+  assertExportJobOwnershipById,
 };

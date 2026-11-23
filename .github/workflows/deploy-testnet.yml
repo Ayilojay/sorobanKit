@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
 
+# Deployments must never be cancelled mid-flight: keep cancel-in-progress off
+# so an in-flight testnet deploy always runs to completion.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   # Pinned toolchain inputs for reproducible Soroban WASM builds.
   RUST_TOOLCHAIN: "1.81.0"
@@ -87,18 +93,18 @@ jobs:
         working-directory: ./payment_router
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@6d653acede28d24f02e3cd7ee9c24d5f8f0b3f0e # v1.0.0
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: wasm32-unknown-unknown
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@f0deed1e0ed1f0f0f0f0f0f0f0f0f0f0f0f0f0f0 # v2.7.8
         with:
           workspaces: ./payment_router
 
@@ -193,7 +199,7 @@ jobs:
             --output "target/sbom/payment-router-container.spdx.json"
 
       - name: Upload reproducible WASM artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: payment-router-wasm
           path: |

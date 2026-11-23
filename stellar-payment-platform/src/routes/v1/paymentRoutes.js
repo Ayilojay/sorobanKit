@@ -37,7 +37,7 @@ module.exports = (redisClient) => {
  *         description: Success
  */
   router.post('/payments/bulk', requireJson, validateSchema({ body: bulkPaymentSchema }), asyncHandler(async (req, res, next) => {
-  const intents = req.body;
+    const intents = req.body;
 
   // Additional per-item validation that requires runtime logic
   const normalizedIntents = [];
@@ -49,8 +49,8 @@ module.exports = (redisClient) => {
       err.code = 'INVALID_INPUT';
       throw err;
     }
-    if (!StrKey.isValidEd25519PublicKey(intent.to)) {
-      const err = new Error(`Invalid Stellar public key for 'to' at index ${idx}`);
+    if (validationErrors.length > 0) {
+      const err = new Error('Bulk payment validation failed');
       err.statusCode = 400;
       err.code = 'INVALID_INPUT';
       throw err;
@@ -94,7 +94,114 @@ module.exports = (redisClient) => {
       },
     }));
 
-    const created = await prisma.$transaction(createOps);
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        // Resolve any pre-existing records for repeated external IDs so retries
+        // are safe and idempotent.
+        const externalIds = items
+          .map((item) => item.externalId)
+          .filter((value) => value !== undefined && value !== null);
+
+        const existing = externalIds.length > 0
+          ? await tx.paymentIntent.findMany({ where: { externalId: { in: externalIds } } })
+          : [];
+        const existingByExternalId = new Map(existing.map((row) => [row.externalId, row]));
+
+        const created = [];
+        for (const item of items) {
+          if (item.externalId && existingByExternalId.has(item.externalId)) {
+            created.push(existingByExternalId.get(item.externalId));
+            continue;
+          }
+          const row = await tx.paymentIntent.create({
+            data: {
+              externalId: item.externalId,
+              batchId,
+              itemId: item.itemId,
+              from: item.from,
+              to: item.to,
+              amount: item.amount,
+              asset: item.asset,
+              memoType: item.memoType,
+              memo: item.memo,
+              metadata: item.metadata,
+            },
+          });
+          created.push(row);
+        }
+        return created;
+      });
+
+      return res.status(201).json({
+        ok: true,
+        batch_id: batchId,
+        count: result.length,
+        data: result.map((c) => ({ id: c.id, item_id: c.itemId, external_id: c.externalId })),
+      });
+    } catch (error) {
+      logger.error('Bulk payment registration failed:', error);
+      const dbErr = new Error('Failed to register payment intents');
+      dbErr.statusCode = 500;
+      return next(dbErr);
+    }
+  }));
+
+  // GET /payments/:id/events — bounded server-sent event feed.
+  router.get('/payments/:id/events', asyncHandler(async (req, res, next) => {
+    const userId = req.user && (req.user.id || req.user.sub);
+    if (!userId) {
+      const err = new Error('Unauthorized');
+      err.statusCode = 401;
+      return next(err);
+    }
+
+    const paymentId = req.params.id;
+    const intent = await prisma.paymentIntent.findUnique({ where: { id: paymentId } });
+    if (!intent) {
+      const err = new Error('Payment intent not found');
+      err.statusCode = 404;
+      return next(err);
+    }
+    // Authorization: only the owner (or an admin) may stream updates.
+    const isOwner = intent.from === userId || intent.metadata?.ownerId === userId;
+    const isAdmin = req.user.role === 'admin';
+    if (!isOwner && !isAdmin) {
+      const err = new Error('Forbidden');
+      err.statusCode = 403;
+      return next(err);
+    }
+
+    if (!acquireConnection(userId)) {
+      const err = new Error('Too many concurrent event streams');
+      err.statusCode = 429;
+      return next(err);
+    }
+
+    // Reconnect cursor: resume after the last delivered event id.
+    const lastEventId = Number(req.headers['last-event-id'] || req.query.lastEventId || 0) || 0;
+    let eventCounter = lastEventId;
+
+    res.status(200);
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+    const writeEvent = (type, payload) => {
+      eventCounter += 1;
+      const body = {
+        version: 1,
+        id: eventCounter,
+        type,
+        payment_id: paymentId,
+        timestamp: new Date().toISOString(),
+        data: payload,
+      };
+      res.write(`id: ${eventCounter}\n`);
+      res.write(`event: ${type}\n`);
+      res.write(`data: ${JSON.stringify(body)}\n\n`);
+    };
 
     // Refresh the oldest-unreconciled-intent gauge per network after new
     // intents are registered. Labels are limited to network/operation/status.
@@ -153,3 +260,5 @@ module.exports = (redisClient) => {
 
   return router;
 };
+
+module.exports.paymentEvents = paymentEvents;

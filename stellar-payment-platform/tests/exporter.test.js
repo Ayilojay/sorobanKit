@@ -8,6 +8,9 @@
  */
 
 const { EventEmitter } = require('events');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 const exporter = require('../src/utils/exporter');
 const {
@@ -70,6 +73,27 @@ const makeLogger = () => ({
 const makePrisma = (findManyImpl) => ({
   payment: { findMany: jest.fn(findManyImpl) },
 });
+
+/**
+ * A minimal writable sink that records every chunk and applies the same
+ * backpressure contract as a real stream (write() -> boolean, 'drain' event).
+ */
+const makeSink = ({ backpressure = false } = {}) => {
+  const sink = new EventEmitter();
+  sink.chunks = [];
+  sink.write = jest.fn((chunk) => {
+    sink.chunks.push(String(chunk));
+    if (backpressure) {
+      backpressure = false;
+      setImmediate(() => sink.emit('drain'));
+      return false;
+    }
+    return true;
+  });
+  sink.end = jest.fn();
+  sink.text = () => sink.chunks.join('');
+  return sink;
+};
 
 const writtenText = (res) =>
   res.write.mock.calls.map(([chunk]) => String(chunk)).join('');
@@ -212,6 +236,161 @@ describe('streamAdminExport CSV', () => {
     } finally {
       delete process.env.EXPORT_MAX_PAGES;
     }
+  });
+});
+
+// ── streamExportToSink (generic sink) ────────────────────────────────────────
+
+describe('streamExportToSink', () => {
+  it('streams CSV rows into an arbitrary writable sink', async () => {
+    const sink = makeSink();
+    const logger = makeLogger();
+    const prisma = makePrisma(async () => [makeRecord(1), makeRecord(2)]);
+
+    const result = await exporter.streamExportToSink({
+      sink,
+      prisma,
+      format: 'csv',
+      logger,
+      correlationId: 'sink-1',
+    });
+
+    expect(sink.text()).toMatch(/txn-1/);
+    expect(sink.text()).toMatch(/txn-2/);
+    expect(result.rows).toBe(2);
+    expect(result.truncated).toBe(false);
+  });
+
+  it('streams NDJSON rows into an arbitrary writable sink', async () => {
+    const sink = makeSink();
+    const logger = makeLogger();
+    const prisma = makePrisma(async () => [makeRecord(1), makeRecord(2)]);
+
+    const result = await exporter.streamExportToSink({
+      sink,
+      prisma,
+      format: 'json',
+      logger,
+      correlationId: 'sink-2',
+    });
+
+    const lines = sink.text().trim().split('\n').filter(Boolean);
+    expect(lines.length).toBe(2);
+    expect(JSON.parse(lines[0]).id).toBe('txn-1');
+    expect(result.rows).toBe(2);
+  });
+
+  it('writes to a real file stream on disk', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'exporter-test-'));
+    const filePath = path.join(dir, 'export.csv');
+    const fileStream = fs.createWriteStream(filePath);
+    const logger = makeLogger();
+    const prisma = makePrisma(async () => [makeRecord(1), makeRecord(2), makeRecord(3)]);
+
+    try {
+      const result = await exporter.streamExportToSink({
+        sink: fileStream,
+        prisma,
+        format: 'csv',
+        logger,
+        correlationId: 'sink-file',
+      });
+      await new Promise((resolve, reject) => {
+        fileStream.on('finish', resolve);
+        fileStream.on('error', reject);
+      });
+
+      const contents = fs.readFileSync(filePath, 'utf8');
+      expect(contents).toMatch(/txn-1/);
+      expect(contents).toMatch(/txn-3/);
+      expect(result.rows).toBe(3);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('invokes the progress callback after each page', async () => {
+    const sink = makeSink();
+    const logger = makeLogger();
+    const onProgress = jest.fn();
+    const prisma = makePrisma(async () => [makeRecord(1), makeRecord(2)]);
+
+    await exporter.streamExportToSink({
+      sink,
+      prisma,
+      format: 'csv',
+      logger,
+      correlationId: 'sink-progress',
+      onProgress,
+    });
+
+    expect(onProgress).toHaveBeenCalled();
+    const lastCall = onProgress.mock.calls[onProgress.mock.calls.length - 1][0];
+    expect(lastCall).toEqual(expect.objectContaining({ rows: 2 }));
+  });
+
+  it('stops mid-export when the cancellation predicate returns true', async () => {
+    const sink = makeSink();
+    const logger = makeLogger();
+    const fullPage = Array.from({ length: exporter.PAGE_SIZE }, (_, i) => makeRecord(i));
+    const prisma = makePrisma(async () => fullPage);
+    let calls = 0;
+    const isCancelled = jest.fn(() => {
+      calls += 1;
+      return calls > 1;
+    });
+
+    const result = await exporter.streamExportToSink({
+      sink,
+      prisma,
+      format: 'csv',
+      logger,
+      correlationId: 'sink-cancel',
+      isCancelled,
+    });
+
+    expect(result.cancelled).toBe(true);
+    // Only the first page was fetched before cancellation was observed.
+    expect(prisma.payment.findMany).toHaveBeenCalledTimes(1);
+  });
+
+  it('flushes each page incrementally instead of buffering the whole export', async () => {
+    const sink = makeSink();
+    const logger = makeLogger();
+    const fullPage = Array.from({ length: exporter.PAGE_SIZE }, (_, i) => makeRecord(i));
+    const prisma = makePrisma(async () => fullPage);
+    process.env.EXPORT_MAX_PAGES = '3';
+    try {
+      await exporter.streamExportToSink({
+        sink,
+        prisma,
+        format: 'csv',
+        logger,
+        correlationId: 'sink-bounded',
+      });
+
+      // One write per page (plus header) — never a single giant buffered write.
+      expect(sink.write.mock.calls.length).toBeGreaterThan(1);
+      expect(sink.write.mock.calls.length).toBeLessThanOrEqual(4);
+    } finally {
+      delete process.env.EXPORT_MAX_PAGES;
+    }
+  });
+
+  it('waits for drain when the sink applies backpressure', async () => {
+    const sink = makeSink({ backpressure: true });
+    const logger = makeLogger();
+    const prisma = makePrisma(async () => [makeRecord(1), makeRecord(2)]);
+
+    await exporter.streamExportToSink({
+      sink,
+      prisma,
+      format: 'csv',
+      logger,
+      correlationId: 'sink-backpressure',
+    });
+
+    expect(sink.text()).toMatch(/txn-2/);
   });
 });
 

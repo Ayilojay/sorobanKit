@@ -139,6 +139,7 @@
         "tags": ["Addresses"],
         "summary": "Resolve a federation name or address",
         "operationId": "getFederation",
+        "description": "Public metadata response. The `ETag` is computed from the canonical resolved federation data and changes whenever a user mutation changes the resolved result. Clients may send `If-None-Match` to receive `304 Not Modified` when the representation is unchanged. Responses are public-cacheable (`Cache-Control: public`) because they do not depend on the caller's authorization.",
         "parameters": [
           {
             "name": "q",
@@ -150,17 +151,24 @@
             "name": "type",
             "in": "query",
             "schema": { "type": "string", "enum": ["id", "name"] }
-          }
+          },
+          { "$ref": "#/components/parameters/IfNoneMatchParam" }
         ],
         "responses": {
           "200": {
             "description": "Resolved federation identity",
+            "headers": {
+              "ETag": { "$ref": "#/components/headers/ETagHeader" },
+              "Cache-Control": { "$ref": "#/components/headers/PublicCacheControlHeader" },
+              "Vary": { "$ref": "#/components/headers/VaryHeader" }
+            },
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/FederationEntry" }
               }
             }
           },
+          "304": { "$ref": "#/components/responses/NotModified" },
           "400": { "$ref": "#/components/responses/ApiErrorResponse" },
           "404": { "$ref": "#/components/responses/ApiErrorResponse" },
           "500": { "$ref": "#/components/responses/ApiErrorResponse" },
@@ -212,20 +220,28 @@
         "tags": ["Tags"],
         "summary": "List tags",
         "operationId": "listTags",
+        "description": "Public metadata response. The `ETag` is computed from the canonical response data and is invalidated when user mutations change the resolved data. Supports `If-None-Match` conditional requests returning `304 Not Modified`.",
         "parameters": [
           { "$ref": "#/components/parameters/PageParam" },
           { "$ref": "#/components/parameters/LimitParam" },
-          { "name": "q", "in": "query", "description": "Search query", "schema": { "type": "string" } }
+          { "name": "q", "in": "query", "description": "Search query", "schema": { "type": "string" } },
+          { "$ref": "#/components/parameters/IfNoneMatchParam" }
         ],
         "responses": {
           "200": {
             "description": "A paginated list of tags",
+            "headers": {
+              "ETag": { "$ref": "#/components/headers/ETagHeader" },
+              "Cache-Control": { "$ref": "#/components/headers/PublicCacheControlHeader" },
+              "Vary": { "$ref": "#/components/headers/VaryHeader" }
+            },
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/TagList" }
               }
             }
           },
+          "304": { "$ref": "#/components/responses/NotModified" },
           "400": { "$ref": "#/components/responses/BadRequest" }
         }
       },
@@ -251,6 +267,50 @@
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Tag" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "409": { "$ref": "#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/api/tags/bulk": {
+      "post": {
+        "tags": ["Tags"],
+        "summary": "Create payment intents in bulk",
+        "operationId": "createTagsBulk",
+        "description": "Creates multiple payment intents atomically. Each request carries a client-supplied `batchId` (stable batch identifier) and each item carries a client-supplied `externalId` (stable item identifier). Persistence is all-or-nothing: if any item fails validation, no items are written and the response is `400` with per-item validation details. Item ordering in the response matches the request order. Retries are safe: repeating a request with the same `batchId` and `externalId` values returns the previously created batch (`200`) instead of creating duplicates; reusing an `externalId` with different content is rejected with `409 Conflict`.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/BulkTagCreateInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Idempotent replay of a previously created batch",
+            "headers": {
+              "ETag": { "$ref": "#/components/headers/ETagHeader" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/BulkTagCreateResult" }
+              }
+            }
+          },
+          "201": {
+            "description": "All items created atomically",
+            "headers": {
+              "ETag": { "$ref": "#/components/headers/ETagHeader" }
+            },
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/BulkTagCreateResult" }
               }
             }
           },
@@ -389,6 +449,46 @@
         }
       }
     },
+    "/api/payments/events": {
+      "get": {
+        "tags": ["Payments"],
+        "summary": "Stream payment status updates",
+        "operationId": "streamPaymentEvents",
+        "description": "Server-sent event (SSE) feed of payment status updates for the authenticated client. Each event is versioned (`event: payment.status`, `data` includes `version` and monotonic `sequence`). Clients reconnect with `Last-Event-ID` (or the `cursor` query parameter) to resume after the last received event; the server replays events after the cursor. Heartbeat comments are sent periodically to keep idle connections alive. The feed is bounded: a per-client connection limit applies (`429` when exceeded) and slow clients are disconnected rather than buffered indefinitely. Disconnects release all server resources. Responses are never shared-cached because they depend on the caller's authorization.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque reconnect cursor; equivalent to sending the `Last-Event-ID` header",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "Last-Event-ID",
+            "in": "header",
+            "description": "Standard SSE reconnect header carrying the last received event id",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Event stream",
+            "headers": {
+              "Cache-Control": { "$ref": "#/components/headers/PrivateNoStoreCacheControlHeader" },
+              "Vary": { "$ref": "#/components/headers/VaryHeader" }
+            },
+            "content": {
+              "text/event-stream": {
+                "schema": { "$ref": "#/components/schemas/PaymentEventStream" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "$ref": "#/components/responses/TooManyRequests" }
+        }
+      }
+    },
     "/api/activity": {
       "get": {
         "tags": ["Activity"],
@@ -449,37 +549,126 @@
         }
       }
     },
-    "/api/admin/audit/verify": {
+    "/api/admin/export/jobs": {
       "post": {
         "tags": ["Admin"],
-        "summary": "Verify the audit integrity chain",
-        "description": "Re-walks the administrative audit hash chain and verifies each keyed digest against the recorded `keyId`. Returns the first broken link, if any. Verification is read-only and preserves redaction.",
-        "operationId": "verifyAuditIntegrity",
+        "summary": "Create a background export job",
+        "description": "Creates a durable, cancellable background job that streams a large administrative export to artifact storage. The job is owned by the authenticated caller; only the owner may read, cancel, or download it. Returns `202 Accepted` with the job id and initial status.",
+        "operationId": "createExportJob",
         "security": [{ "bearerAuth": [] }],
         "requestBody": {
-          "required": false,
+          "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/AuditVerifyInput" }
+              "schema": { "$ref": "#/components/schemas/ExportJobInput" }
             }
           }
         },
         "responses": {
-          "200": {
-            "description": "Verification result",
+          "202": {
+            "description": "Export job accepted and running in the background",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/AuditVerifyResult" }
+                "schema": { "$ref": "#/components/schemas/ExportJob" }
               }
             }
           },
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
-          "403": { "$ref": "#/components/responses/Forbidden" }
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "$ref": "#/components/responses/ApiErrorResponse" }
+        }
+      }
+    },
+    "/api/admin/export/jobs/{id}": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ExportJobIdParam" }
+      ],
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Get export job status and progress",
+        "description": "Returns the current status and progress of an export job. Only the job owner may read it; other authenticated callers receive `403 Forbidden`.",
+        "operationId": "getExportJob",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Current export job status and progress",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ExportJob" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/admin/export/jobs/{id}/cancel": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ExportJobIdParam" }
+      ],
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Cancel an export job",
+        "description": "Requests cancellation of a queued or running export job. Cancellation is cooperative: the worker stops streaming and the job transitions to `cancelled`. Cancelling an already terminal job is idempotent and returns its current state. Only the job owner may cancel it.",
+        "operationId": "cancelExportJob",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Export job cancellation acknowledged; current job state returned",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ExportJob" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/api/admin/export/jobs/{id}/download": {
+      "parameters": [
+        { "$ref": "#/components/parameters/ExportJobIdParam" }
+      ],
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Download a completed export artifact",
+        "description": "Streams the completed export artifact from artifact storage. The response is `text/csv` or `application/x-ndjson` depending on the requested format. Only the job owner may download it. Returns `409 Conflict` if the job has not completed, and `410 Gone` once the artifact has expired.",
+        "operationId": "downloadExportJob",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Export artifact stream",
+            "headers": {
+              "Content-Disposition": {
+                "description": "Attachment filename for the export artifact",
+                "schema": { "type": "string" }
+              }
+            },
+            "content": {
+              "text/csv": {
+                "schema": { "type": "string", "format": "binary" }
+              },
+              "application/x-ndjson": {
+                "schema": { "type": "string", "format": "binary" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "410": { "$ref": "#/components/responses/Gone" }
         }
       }
     },
     "/api/admin/stats/refresh": {
+=======
       "post": {
         "tags": ["Admin"],
         "summary": "Trigger a reporting read model refresh",
@@ -532,6 +721,24 @@
         "type": "http",
         "scheme": "bearer",
         "bearerFormat": "JWT"
+      }
+    },
+    "headers": {
+      "ETagHeader": {
+        "description": "Strong validator computed from the canonical response data",
+        "schema": { "type": "string" }
+      },
+      "PublicCacheControlHeader": {
+        "description": "Public caching directive for authorization-independent responses",
+        "schema": { "type": "string", "example": "public, max-age=60" }
+      },
+      "PrivateNoStoreCacheControlHeader": {
+        "description": "Prevents shared caching of authorization-dependent responses",
+        "schema": { "type": "string", "example": "private, no-store" }
+      },
+      "VaryHeader": {
+        "description": "Response varies on these request headers",
+        "schema": { "type": "string", "example": "Accept, Accept-Encoding" }
       }
     },
     "parameters": {
@@ -644,6 +851,19 @@
         "content": {
           "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
         }
+      },
+      "NotModified": {
+        "description": "The `If-None-Match` validator matched the current ETag; the representation is unchanged",
+        "headers": {
+          "ETag": { "$ref": "#/components/headers/ETagHeader" },
+          "Cache-Control": { "$ref": "#/components/headers/PublicCacheControlHeader" }
+        }
+      },
+      "TooManyRequests": {
+        "description": "Connection limit exceeded for this client",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+        }
       }
     },
     "headers": {
@@ -742,39 +962,56 @@
         "description": "Aggregate metrics and the refresh watermark for the reporting read model.",
         "additionalProperties": true
       },
-      "AuditVerifyInput": {
+      "ExportJobInput": {
         "type": "object",
+        "required": ["format"],
         "properties": {
-          "fromId": { "type": "string", "description": "Optional audit record id to start verification from" },
-          "toId": { "type": "string", "description": "Optional audit record id to stop verification at" }
-        }
-      },
-      "AuditVerifyResult": {
-        "type": "object",
-        "required": ["valid", "checked"],
-        "properties": {
-          "valid": { "type": "boolean" },
-          "checked": { "type": "integer", "description": "Number of audit records verified" },
-          "firstBrokenId": { "type": "string", "description": "Id of the first record whose digest failed verification" },
-          "keyIds": {
-            "type": "array",
-            "description": "Signing key ids encountered while walking the chain",
-            "items": { "type": "string" }
+          "format": {
+            "type": "string",
+            "enum": ["csv", "ndjson"],
+            "description": "Serialization format of the export artifact"
+          },
+          "resource": {
+            "type": "string",
+            "description": "Logical dataset to export (e.g. tags, activity)"
+          },
+          "filters": {
+            "type": "object",
+            "description": "Optional dataset-specific filters",
+            "additionalProperties": true
           }
         }
       },
-      "AuditEvent": {
+      "ExportJob": {
         "type": "object",
-        "required": ["id", "action", "createdAt", "keyId", "digest"],
+        "required": ["id", "status", "format", "createdAt"],
         "properties": {
           "id": { "type": "string" },
-          "action": { "type": "string" },
-          "actorId": { "type": "string" },
+          "status": {
+            "type": "string",
+            "enum": ["queued", "running", "succeeded", "failed", "cancelled", "expired"]
+          },
+          "format": { "type": "string", "enum": ["csv", "ndjson"] },
+          "resource": { "type": "string" },
+          "progress": {
+            "type": "object",
+            "description": "Progress of the export job",
+            "properties": {
+              "processed": { "type": "integer", "minimum": 0 },
+              "total": { "type": "integer", "minimum": 0 },
+              "percent": { "type": "number", "minimum": 0, "maximum": 100 }
+            }
+          },
+          "ownerId": { "type": "string" },
           "createdAt": { "type": "string", "format": "date-time" },
-          "keyId": { "type": "string", "description": "Signing key version used for this record's digest" },
-          "digest": { "type": "string", "description": "Keyed digest (HMAC) over the canonical payload and previous digest" },
-          "prevDigest": { "type": "string", "description": "Digest of the preceding audit record, linking the chain" },
-          "details": { "type": "object", "additionalProperties": true, "description": "Redacted event details" }
+          "startedAt": { "type": "string", "format": "date-time" },
+          "completedAt": { "type": "string", "format": "date-time" },
+          "expiresAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the downloadable artifact expires; after this the download returns 410 Gone"
+          },
+          "error": { "type": "string" }
         }
       },
       "StatsRefreshStatus": {
@@ -936,6 +1173,60 @@
           "totalPages": { "type": "integer" },
           "currentPage": { "type": "integer" }
         }
+      },
+      "BulkTagCreateInput": {
+        "type": "object",
+        "required": ["batchId", "items"],
+        "properties": {
+          "batchId": {
+            "type": "string",
+            "description": "Client-supplied stable batch identifier; retries with the same value are idempotent"
+          },
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 100,
+            "description": "Items are persisted atomically and returned in request order",
+            "items": { "$ref": "#/components/schemas/BulkTagCreateItemInput" }
+          }
+        }
+      },
+      "BulkTagCreateItemInput": {
+        "type": "object",
+        "required": ["externalId", "username", "address"],
+        "properties": {
+          "externalId": {
+            "type": "string",
+            "description": "Client-supplied stable item identifier; repeating it with identical content is idempotent, differing content is rejected with 409 Conflict"
+          },
+          "username": { "type": "string" },
+          "address": { "type": "string" }
+        }
+      },
+      "BulkTagCreateResult": {
+        "type": "object",
+        "required": ["batchId", "items"],
+        "properties": {
+          "batchId": { "type": "string" },
+          "items": {
+            "type": "array",
+            "description": "Created items in the same order as the request",
+            "items": { "$ref": "#/components/schemas/BulkTagCreateItemResult" }
+          }
+        }
+      },
+      "BulkTagCreateItemResult": {
+        "type": "object",
+        "required": ["externalId", "status"],
+        "properties": {
+          "externalId": { "type": "string" },
+          "status": { "type": "string", "enum": ["created", "existing"] },
+          "tag": { "$ref": "#/components/schemas/Tag" }
+        }
+      },
+      "PaymentEventStream": {
+        "type": "string",
+        "description": "SSE stream. Each `payment.status` event carries an `id` (reconnect cursor), `event` name, and JSON `data` with `version`, `sequence`, `paymentId`, and `status`. Heartbeats are sent as SSE comments (`: heartbeat`)."
       },
       "RestoreTagInput": {
         "type": "object",
