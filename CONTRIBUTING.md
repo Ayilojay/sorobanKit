@@ -36,6 +36,27 @@ supported state versions, keep the following in mind:
   boundaries, expected failures (including unsupported layouts), and
   recovery or concurrency behavior where relevant.
 
+## Background jobs and long-running exports
+
+Features that run work in the background (for example, large administrative
+exports) must meet the following expectations:
+
+- **Durable job model.** Persist job records (status, progress, ownership,
+  timestamps) so jobs survive process restarts and can be inspected later.
+- **Ownership checks.** Enforce that only the job's owner (or an authorized
+  administrator) can read progress, cancel, or download artifacts.
+- **Bounded concurrency.** Limit how many jobs run at once and stream output
+  to artifact storage rather than buffering entire results in memory.
+- **Cancellation.** Support cooperative cancellation and reflect the cancelled
+  state in the job record and any in-flight progress reporting.
+- **Expiring artifacts.** Downloads must expire; record and enforce artifact
+  expiration and clean up stale artifacts.
+- **Tests.** Focused automated tests should cover the success path, boundary
+  conditions (size limits, expiration edges), expected failures (unauthorized
+  access, cancellation), and concurrency or recovery behavior where relevant.
+- **Documentation and contracts.** Update OpenAPI/Postman collections and
+  operational or API documentation whenever job endpoints or payloads change.
+
 ## Pull requests
 
 - Keep changes scoped to the issue being addressed.

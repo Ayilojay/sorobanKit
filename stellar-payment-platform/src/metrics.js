@@ -104,6 +104,103 @@ const redisConnectionsActive = new client.Gauge({
   },
 });
 
+// ---------------------------------------------------------------------------
+// Large administrative export jobs
+//
+// Exports run as durable background jobs with bounded worker concurrency. The
+// metrics below let operators watch job health (creation, terminal outcomes,
+// queue depth vs. running workers) and artifact sizes without scraping the
+// database.
+// ---------------------------------------------------------------------------
+
+// Counter: export jobs by lifecycle transition. `status` is one of
+// created | completed | failed | cancelled | expired.
+const exportJobsCounter = new client.Counter({
+  name: 'stellar_tags_export_jobs_total',
+  help: 'Total number of administrative export jobs by lifecycle status',
+  labelNames: ['status'],
+});
+
+// Gauge: export jobs currently executing on a worker (bounded by the worker
+// concurrency limit) and jobs waiting in the queue.
+const exportJobsRunning = new client.Gauge({
+  name: 'stellar_tags_export_jobs_running',
+  help: 'Administrative export jobs currently running on a worker',
+});
+
+const exportJobsQueued = new client.Gauge({
+  name: 'stellar_tags_export_jobs_queued',
+  help: 'Administrative export jobs waiting to be picked up by a worker',
+});
+
+// Histogram: wall-clock duration of export jobs in seconds, from start of
+// processing to terminal state. Buckets span short exports through multi-minute
+// large exports.
+const exportJobDuration = new client.Histogram({
+  name: 'stellar_tags_export_job_duration_seconds',
+  help: 'Administrative export job duration in seconds',
+  labelNames: ['status'],
+  buckets: [0.1, 0.5, 1, 5, 15, 30, 60, 120, 300, 600],
+});
+
+// Histogram: size of the produced export artifact in bytes, so operators can
+// see how large exports grow and size artifact storage accordingly.
+const exportArtifactSize = new client.Histogram({
+  name: 'stellar_tags_export_artifact_size_bytes',
+  help: 'Size of produced administrative export artifacts in bytes',
+  buckets: [
+    1024,
+    10 * 1024,
+    100 * 1024,
+    1024 * 1024,
+    10 * 1024 * 1024,
+    100 * 1024 * 1024,
+    1024 * 1024 * 1024,
+  ],
+});
+
+const EXPORT_JOB_STATUSES = ['created', 'completed', 'failed', 'cancelled', 'expired'];
+
+/**
+ * Records an export job lifecycle transition. Unknown statuses are ignored so a
+ * stray value can never create unbounded label cardinality.
+ */
+function recordExportJobStatus(status) {
+  if (!EXPORT_JOB_STATUSES.includes(status)) return;
+  exportJobsCounter.inc({ status });
+}
+
+/**
+ * Records the terminal duration of an export job. `status` should be one of
+ * completed | failed | cancelled.
+ */
+function observeExportJobDuration(status, seconds) {
+  if (!EXPORT_JOB_STATUSES.includes(status)) return;
+  if (!Number.isFinite(seconds) || seconds < 0) return;
+  exportJobDuration.observe({ status }, seconds);
+}
+
+/**
+ * Records the size of a produced export artifact in bytes.
+ */
+function observeExportArtifactSize(bytes) {
+  if (!Number.isFinite(bytes) || bytes < 0) return;
+  exportArtifactSize.observe(bytes);
+}
+
+/**
+ * Updates the running/queued export job gauges. Values are clamped to
+ * non-negative numbers so a transient bad read cannot poison the gauges.
+ */
+function setExportJobQueueDepth({ running, queued } = {}) {
+  if (running !== undefined) {
+    exportJobsRunning.set(Number.isFinite(running) && running > 0 ? running : 0);
+  }
+  if (queued !== undefined) {
+    exportJobsQueued.set(Number.isFinite(queued) && queued > 0 ? queued : 0);
+  }
+}
+
 /**
  * Express middleware that tracks request count and latency.
  * Attach to app BEFORE route handlers.
@@ -158,4 +255,13 @@ module.exports = {
   dbPoolConnectionsIdle,
   dbPoolQueriesWaiting,
   redisConnectionsActive,
+  exportJobsCounter,
+  exportJobsRunning,
+  exportJobsQueued,
+  exportJobDuration,
+  exportArtifactSize,
+  recordExportJobStatus,
+  observeExportJobDuration,
+  observeExportArtifactSize,
+  setExportJobQueueDepth,
 };
