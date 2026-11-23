@@ -10,6 +10,75 @@ const HelpPage = lazy(() => import('./views/HelpPage.jsx'));
 const AnalyticsPage = lazy(() => import('./views/AnalyticsPage.jsx'));
 const HistoryPage = lazy(() => import('./views/HistoryPage.jsx'));
 const RegistrationPage = lazy(() => import('./views/RegistrationPage.jsx'));
+const PaymentDetail = lazy(() => import('./views/PaymentDetail.jsx'));
+
+/**
+ * Stable, shareable route patterns. Routes only ever carry non-secret
+ * identifiers (payment/operation ids). Bearer tokens, signing material and
+ * other credentials must never be placed in the URL.
+ */
+const ROUTES = {
+  dashboard: '/',
+  register: '/register',
+  history: '/history',
+  analytics: '/analytics',
+  help: '/help',
+  paymentDetail: '/payments/:id',
+};
+
+const PAYMENT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+
+/**
+ * Parse a pathname into a route descriptor.
+ * @param {string} pathname
+ * @returns {{ name: string, params: Record<string, string> }}
+ */
+function parseRoute(pathname) {
+  const path = (pathname || '/').replace(/\/+$/, '') || '/';
+
+  if (path === '/') {
+    return { name: 'dashboard', params: {} };
+  }
+
+  const staticRoutes = {
+    '/register': 'register',
+    '/history': 'history',
+    '/analytics': 'analytics',
+    '/help': 'help',
+  };
+  if (staticRoutes[path]) {
+    return { name: staticRoutes[path], params: {} };
+  }
+
+  const paymentMatch = path.match(/^\/payments\/([^/]+)$/);
+  if (paymentMatch) {
+    let id = paymentMatch[1];
+    try {
+      id = decodeURIComponent(id);
+    } catch (err) {
+      logger.debug('Unable to decode payment id from URL:', err);
+    }
+    if (PAYMENT_ID_PATTERN.test(id)) {
+      return { name: 'paymentDetail', params: { id } };
+    }
+    return { name: 'notFound', params: {} };
+  }
+
+  return { name: 'notFound', params: {} };
+}
+
+/**
+ * Build a shareable path for a route. Only non-secret identifiers are used.
+ * @param {string} name
+ * @param {Record<string, string>} [params]
+ * @returns {string}
+ */
+function buildPath(name, params = {}) {
+  if (name === 'paymentDetail' && params.id) {
+    return `/payments/${encodeURIComponent(params.id)}`;
+  }
+  return ROUTES[name] || ROUTES.dashboard;
+}
 
 const DEFAULT_LOCALE = 'en';
 const LOCALE_STORAGE_KEY = 'payment-dashboard.locale';
@@ -330,7 +399,7 @@ function clearPendingPaymentRef() {
 }
 
 function App() {
-const [activeView, setActiveView] = useState('dashboard')
+  const [route, setRoute] = useState(() => parseRoute(window.location.pathname));
   const [userPublicKey, setUserPublicKey] = useState(() => {
     return readStoredWalletKey()
   })
@@ -365,6 +434,31 @@ const [activeView, setActiveView] = useState('dashboard')
       logger.debug('Unable to persist locale:', err);
     }
   }, []);
+
+  // Keep the route in sync with browser back/forward and manual refreshes.
+  useEffect(() => {
+    const handlePopState = () => {
+      setRoute(parseRoute(window.location.pathname));
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
+
+  /**
+   * Navigate to a named route, pushing history so refresh and back/forward
+   * restore the same view. Never accepts credentials in params.
+   * @param {string} name
+   * @param {Record<string, string>} [params]
+   */
+  const handleNavigate = useCallback((name, params = {}) => {
+    const path = buildPath(name, params);
+    if (window.location.pathname !== path) {
+      window.history.pushState({}, '', path);
+    }
+    setRoute(parseRoute(path));
+  }, []);
+
+  const activeView = route.name;
 
   useEffect(() => {
     document.documentElement.lang = locale;
@@ -549,12 +643,49 @@ const [activeView, setActiveView] = useState('dashboard')
     clearStoredWalletKey()
     setUserPublicKey('')
     setBalance(null);
+    // Drafts are bound to the account; discard them on disconnect.
+    clearPendingPaymentRef();
   };
 
   /** @type {[number | null, (value: number | null) => void]} */
   const [balance, setBalance] = useState(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [balanceError, setBalanceError] = useState("");
+
+  const renderRoute = () => {
+    switch (route.name) {
+      case 'paymentDetail':
+        return (
+          <PaymentDetail
+            paymentId={route.params.id}
+            userPublicKey={userPublicKey}
+            onNavigate={handleNavigate}
+            t={t}
+          />
+        );
+      case 'register':
+        return <RegistrationPage userPublicKey={userPublicKey} />;
+      case 'history':
+        return <HistoryPage userPublicKey={userPublicKey} />;
+      case 'analytics':
+        return <AnalyticsPage userPublicKey={userPublicKey} />;
+      case 'help':
+        return <HelpPage />;
+      case 'notFound':
+        return (
+          <div className="route-not-found" role="alert">
+            <h2>Page not found</h2>
+            <p>The page you requested does not exist or is no longer available.</p>
+            <button type="button" onClick={() => handleNavigate('dashboard')}>
+              Go to dashboard
+            </button>
+          </div>
+        );
+      case 'dashboard':
+      default:
+        return <Dashboard userPublicKey={userPublicKey} onNavigate={handleNavigate} />;
+    }
+  };
 
   const load
 

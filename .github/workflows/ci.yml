@@ -6,7 +6,31 @@ on:
   pull_request:
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.detect.outputs.build }}
+      abi: ${{ steps.detect.outputs.abi }}
+      full: ${{ steps.detect.outputs.full }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Detect changed workspaces and dependency fan-out
+        id: detect
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: npm run ci:detect-changes -- --base "$BASE_SHA" --head "$HEAD_SHA" --github-output "$GITHUB_OUTPUT"
+
   build:
+    needs: changes
+    if: needs.changes.outputs.build == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,6 +44,8 @@ jobs:
       - run: npm run typecheck
 
   abi-compat:
+    needs: changes
+    if: needs.changes.outputs.abi == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

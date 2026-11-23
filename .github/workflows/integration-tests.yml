@@ -5,11 +5,89 @@ on:
     paths:
       - 'payment_router/src/**'
       - 'tests/e2e/**'
+      - 'tests/integration/**'
       - '.github/workflows/integration-tests.yml'
 
 jobs:
+  changes:
+    name: Detect Changed Workspaces
+    runs-on: ubuntu-latest
+    outputs:
+      integration: ${{ steps.detect.outputs.integration }}
+      e2e: ${{ steps.detect.outputs.e2e }}
+      full_suite: ${{ steps.detect.outputs.full_suite }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed workspaces and dependency fan-out
+        id: detect
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # Full-suite fallback when the diff cannot be computed reliably.
+          full_suite=false
+          integration=false
+          e2e=false
+
+          if [ -z "${BASE_SHA:-}" ] || [ -z "${HEAD_SHA:-}" ]; then
+            echo "Missing base/head SHA; falling back to full suite" >&2
+            full_suite=true
+          elif ! git fetch --no-tags --depth=1 origin "$BASE_SHA" 2>/dev/null; then
+            echo "Unable to fetch base SHA; falling back to full suite" >&2
+            full_suite=true
+          else
+            changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" || true)"
+            if [ -z "$changed" ]; then
+              echo "No changed files detected; falling back to full suite" >&2
+              full_suite=true
+            fi
+          fi
+
+          if [ "$full_suite" = "true" ]; then
+            integration=true
+            e2e=true
+          else
+            while IFS= read -r file; do
+              [ -z "$file" ] && continue
+              case "$file" in
+                # Root configuration, lockfiles, and shared schemas/bindings fan out to everything.
+                package.json|package-lock.json|npm-shrinkwrap.json|yarn.lock|pnpm-lock.yaml|tsconfig*.json|jest.config*|docker-compose*.yml|docker-compose*.yaml|Dockerfile*|.github/workflows/*)
+                  full_suite=true
+                  integration=true
+                  e2e=true
+                  ;;
+                # Shared schemas and generated bindings fan out to all dependent workspaces.
+                schemas/*|bindings/*|packages/schemas/*|packages/bindings/*|shared/*)
+                  integration=true
+                  e2e=true
+                  ;;
+                # Integration workspace and its dependencies.
+                payment_router/src/*|payment_router/Cargo.toml|payment_router/Cargo.lock|tests/integration/*)
+                  integration=true
+                  ;;
+                # E2E workspace and its dependencies.
+                tests/e2e/*|src/*|api/*|server/*)
+                  e2e=true
+                  ;;
+              esac
+            done <<< "$changed"
+          fi
+
+          echo "integration=$integration" >> "$GITHUB_OUTPUT"
+          echo "e2e=$e2e" >> "$GITHUB_OUTPUT"
+          echo "full_suite=$full_suite" >> "$GITHUB_OUTPUT"
+
   integration-tests:
     name: Soroban Integration Tests
+    needs: changes
+    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.full_suite == 'true'
     runs-on: ubuntu-latest
 
     steps:
@@ -45,6 +123,8 @@ jobs:
 
   e2e-tests:
     name: End-to-End Flow Tests
+    needs: changes
+    if: needs.changes.outputs.e2e == 'true' || needs.changes.outputs.full_suite == 'true'
     runs-on: ubuntu-latest
 
     steps:

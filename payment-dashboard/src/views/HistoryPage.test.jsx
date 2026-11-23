@@ -200,3 +200,74 @@ describe('HistoryPage pagination', () => {
     await waitFor(() => expect(screen.queryByText('Loading transactions...')).toBeNull());
   });
 });
+
+describe('HistoryPage shared states', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('renders the shared empty state (not an error) when there are no transactions', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => makeHorizonResponse([], null),
+    }));
+    vi.stubGlobal('matchMedia', () => ({ matches: false, addListener: noop, removeListener: noop }));
+
+    renderPage();
+
+    const emptyState = await screen.findByRole('status');
+    expect(emptyState.textContent).toMatch(/no transactions/i);
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByText(/failed to load/i)).toBeNull();
+  });
+
+  it('renders an accessible error state with a retry action when the request fails', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 500, json: async () => ({}) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => makeHorizonResponse([makeRecord(1)], null),
+      });
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('matchMedia', () => ({ matches: false, addListener: noop, removeListener: noop }));
+
+    renderPage();
+
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toMatch(/failed to load/i);
+
+    const retryBtn = screen.getByRole('button', { name: /retry/i });
+    fireEvent.click(retryBtn);
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull());
+    expect(await screen.findByText(/GSENDER111/)).toBeTruthy();
+  });
+
+  it('preserves the current page content when a secondary request fails', async () => {
+    const page1 = Array.from({ length: 50 }, (_, i) => makeRecord(i + 1));
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => makeHorizonResponse(page1, 'cursor-page-2'),
+      })
+      .mockResolvedValueOnce({ ok: false, status: 503, json: async () => ({}) });
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('matchMedia', () => ({ matches: false, addListener: noop, removeListener: noop }));
+
+    renderPage();
+
+    const nextBtn = await screen.findByRole('button', { name: /next/i });
+    fireEvent.click(nextBtn);
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    // The previously loaded records remain visible alongside a non-blocking notice.
+    expect(screen.getByText(/GSENDER111/)).toBeTruthy();
+    const notice = await screen.findByRole('alert');
+    expect(notice.textContent).toMatch(/failed to load/i);
+    expect(screen.getByRole('button', { name: /retry/i })).toBeTruthy();
+  });
+});

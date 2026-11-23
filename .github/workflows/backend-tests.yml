@@ -6,7 +6,39 @@ on:
       - main
 
 jobs:
+  # Path-aware change detection. Emits `backend` (true when the backend
+  # workspace or anything it depends on changed) and `full` (true when the
+  # change set is uncertain and the full suite must run as a fallback).
+  # See .github/scripts/detect-changes.js for the dependency graph rules.
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.detect.outputs.backend }}
+      full: ${{ steps.detect.outputs.full }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Detect changed workspaces
+        id: detect
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node .github/scripts/detect-changes.js
+
   backend-tests:
+    needs: detect-changes
+    # Run when the backend workspace (or a dependency of it) changed, or when
+    # change detection could not classify the diff and we fall back to the
+    # full suite.
+    if: needs.detect-changes.outputs.backend == 'true' || needs.detect-changes.outputs.full == 'true'
     runs-on: ubuntu-latest
 
     strategy:

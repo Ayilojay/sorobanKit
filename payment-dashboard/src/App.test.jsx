@@ -2,8 +2,21 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react';
 import App from './App';
 
+const mockNavigate = vi.fn();
+let mockPathname = '/';
+
+vi.mock('react-router-dom', async () => {
+  const actual = await vi.importActual('react-router-dom');
+  return {
+    ...actual,
+    useNavigate: () => mockNavigate,
+    useLocation: () => ({ pathname: mockPathname, search: '', hash: '', state: null }),
+  };
+});
+
 const STORAGE_KEY = 'stellar_dashboard_wallet_pubkey';
 const PENDING_KEY = 'stellar_dashboard_pending_payment';
+const DRAFT_KEY = 'stellar_dashboard_payment_draft';
 const TEST_PUBLIC_KEY = 'GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUV';
 const OTHER_PUBLIC_KEY = 'GZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ';
 
@@ -23,6 +36,7 @@ describe('App wallet persistence', () => {
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
+    mockPathname = '/';
   });
 
   afterEach(() => {
@@ -79,6 +93,7 @@ describe('App network mismatch signing guard', () => {
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
+    mockPathname = '/';
   });
 
   afterEach(() => {
@@ -127,6 +142,7 @@ describe('App pre-sign simulation review', () => {
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
+    mockPathname = '/';
     localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
     freighterApi.isConnected.mockResolvedValue({ isConnected: true });
     freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
@@ -183,6 +199,7 @@ describe('App human-readable review from exact transaction XDR', () => {
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
+    mockPathname = '/';
     localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
     freighterApi.isConnected.mockResolvedValue({ isConnected: true });
     freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
@@ -250,6 +267,7 @@ describe('App pending payment resume after reload', () => {
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
+    mockPathname = '/';
     localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
     freighterApi.isConnected.mockResolvedValue({ isConnected: true });
     freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
@@ -341,5 +359,262 @@ describe('App pending payment resume after reload', () => {
     await waitFor(() => {
       expect(localStorage.getItem(PENDING_KEY)).toBeNull();
     });
+  });
+});
+
+describe('App payment detail deep links', () => {
+  const PAYMENT_ID = 'pay_abc123';
+
+  beforeEach(() => {
+    localStorage.clear();
+    vi.clearAllMocks();
+    mockPathname = `/payments/${PAYMENT_ID}`;
+    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
+    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
+    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
+    freighterApi.getNetwork.mockResolvedValue({ network: 'TESTNET' });
+  });
+
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+    mockPathname = '/';
+  });
+
+  it('renders the payment detail view for an authorized deep link', async () => {
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    expect(await screen.findByText(new RegExp(PAYMENT_ID))).toBeTruthy();
+    expect(screen.queryByText(/not found/i)).toBeNull();
+  });
+
+  it('restores the same detail view on refresh without leaking credentials into the URL', async () => {
+    const { unmount } = render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+    expect(await screen.findByText(new RegExp(PAYMENT_ID))).toBeTruthy();
+
+    unmount();
+    render(<App />);
+
+    expect(await screen.findByText(new RegExp(PAYMENT_ID))).toBeTruthy();
+    expect(mockPathname).not.toMatch(/token|secret|signature|bearer/i);
+  });
+
+  it('shows a not-found state for an unknown payment id', async () => {
+    mockPathname = '/payments/does-not-exist';
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    expect(await screen.findByText(/not found/i)).toBeTruthy();
+  });
+
+  it('shows an expired state for an expired payment link', async () => {
+    mockPathname = '/payments/pay_expired';
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    expect(await screen.findByText(/expired/i)).toBeTruthy();
+  });
+
+  it('preserves back and forward navigation between dashboard and detail', async () => {
+    const { rerender } = render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+    expect(await screen.findByText(new RegExp(PAYMENT_ID))).toBeTruthy();
+
+    mockPathname = '/';
+    rerender(<App />);
+    expect(await screen.findByRole('button', { name: /pay|send/i })).toBeTruthy();
+
+    mockPathname = `/payments/${PAYMENT_ID}`;
+    rerender(<App />);
+    expect(await screen.findByText(new RegExp(PAYMENT_ID))).toBeTruthy();
+  });
+});
+
+describe('App payment draft lifecycle', () => {
+  const draft = {
+    version: 1,
+    account: TEST_PUBLIC_KEY,
+    network: 'TESTNET',
+    destination: OTHER_PUBLIC_KEY,
+    amount: '10',
+    asset: 'XLM',
+    memo: 'invoice-42',
+  };
+
+  beforeEach(() => {
+    localStorage.clear();
+    vi.clearAllMocks();
+    mockPathname = '/';
+    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
+    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
+    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
+    freighterApi.getNetwork.mockResolvedValue({ network: 'TESTNET' });
+  });
+
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  it('restores a compatible draft bound to the current account and network', async () => {
+    localStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    expect(await screen.findByDisplayValue(OTHER_PUBLIC_KEY)).toBeTruthy();
+    expect(localStorage.getItem(DRAFT_KEY)).toBeTruthy();
+  });
+
+  it('discards a draft saved under a different account', async () => {
+    localStorage.setItem(
+      DRAFT_KEY,
+      JSON.stringify({ ...draft, account: OTHER_PUBLIC_KEY }),
+    );
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(localStorage.getItem(DRAFT_KEY)).toBeNull();
+    });
+  });
+
+  it('discards a draft saved under a different network', async () => {
+    localStorage.setItem(
+      DRAFT_KEY,
+      JSON.stringify({ ...draft, network: 'PUBLIC' }),
+    );
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(localStorage.getItem(DRAFT_KEY)).toBeNull();
+    });
+  });
+
+  it('discards an expired draft', async () => {
+    localStorage.setItem(
+      DRAFT_KEY,
+      JSON.stringify({ ...draft, savedAt: Date.now() - 1000 * 60 * 60 * 24 * 30 }),
+    );
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(localStorage.getItem(DRAFT_KEY)).toBeNull();
+    });
+  });
+
+  it('never persists secret fields in the draft', async () => {
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    const destinationInput = await screen.findByLabelText(/destination/i);
+    fireEvent.change(destinationInput, { target: { value: OTHER_PUBLIC_KEY } });
+
+    await waitFor(() => {
+      const raw = localStorage.getItem(DRAFT_KEY);
+      expect(raw).toBeTruthy();
+      expect(raw).not.toMatch(/secret|signature|bearer|privateKey/i);
+    });
+  });
+
+  it('clears the draft when the user explicitly discards it', async () => {
+    localStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    const clearButton = await screen.findByRole('button', { name: /clear|discard|delete/i });
+    clearButton.click();
+
+    await waitFor(() => {
+      expect(localStorage.getItem(DRAFT_KEY)).toBeNull();
+    });
+  });
+});
+
+describe('App shared state rendering', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    vi.clearAllMocks();
+    mockPathname = '/';
+    localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
+    freighterApi.isConnected.mockResolvedValue({ isConnected: true });
+    freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
+    freighterApi.getNetwork.mockResolvedValue({ network: 'TESTNET' });
+  });
+
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  it('announces a loading state with an accessible status role', async () => {
+    render(<App />);
+
+    expect(await screen.findByRole('status')).toBeTruthy();
+  });
+
+  it('distinguishes an empty result from an error', async () => {
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    expect(await screen.findByText(/no payments|nothing to show/i)).toBeTruthy();
+    expect(screen.queryByText(/something went wrong|error/i)).toBeNull();
+  });
+
+  it('offers a retry action when a primary request fails', async () => {
+    freighterApi.getNetwork.mockRejectedValue(new Error('Network unavailable'));
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    expect(await screen.findByRole('button', { name: /retry|try again/i })).toBeTruthy();
+  });
+
+  it('keeps usable content visible when a secondary request fails', async () => {
+    render(<App />);
+
+    await waitFor(() => {
+      expect(freighterApi.getPublicKey).toHaveBeenCalled();
+    });
+
+    expect(await screen.findByText(new RegExp(TEST_PUBLIC_KEY.slice(0, 6)))).toBeTruthy();
+    expect(await screen.findByText(/some data|partial|unavailable/i)).toBeTruthy();
   });
 });

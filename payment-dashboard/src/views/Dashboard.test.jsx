@@ -72,7 +72,14 @@ import Dashboard from './Dashboard';
 
 const PUBLIC_KEY = 'GABC1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890AB';
 const RECIPIENT_KEY = 'GBOB1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890AB';
+const OTHER_PUBLIC_KEY = 'GXYZ1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890AB';
+const DRAFT_STORAGE_KEY = 'stellar-tags:payment-draft';
 const noop = () => {};
+
+const readStoredDraft = () => {
+  const raw = window.localStorage.getItem(DRAFT_STORAGE_KEY);
+  return raw ? JSON.parse(raw) : null;
+};
 
 const SIGNING_CANCELLED_MSG =
   'Transaction signing was cancelled or failed — no transaction was submitted.';
@@ -98,6 +105,7 @@ describe('Dashboard – signing-failure path', () => {
     cleanup();
     vi.clearAllMocks();
     vi.unstubAllGlobals();
+    window.localStorage.clear();
   });
 
   /** Set up the federation fetch mock and the route_payment simulation. */
@@ -241,5 +249,193 @@ describe('Dashboard – signing-failure path', () => {
     await waitFor(() => expect(mockToastError).toHaveBeenCalled());
 
     expect(mockToastSuccess).not.toHaveBeenCalled();
+  });
+});
+
+describe('Dashboard – payment draft lifecycle', () => {
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    vi.unstubAllGlobals();
+    window.localStorage.clear();
+  });
+
+  const setupDraftMocks = () => {
+    vi.stubGlobal('matchMedia', () => ({
+      matches: false,
+      addListener: noop,
+      removeListener: noop,
+    }));
+
+    vi.stubGlobal(
+      'fetch',
+      vi
+        .fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          headers: new Headers({ 'Content-Type': 'application/json' }),
+          json: async () => ({ status: 'UP' }),
+          text: async () => JSON.stringify({ status: 'UP' }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          headers: new Headers({ 'Content-Type': 'application/json' }),
+          json: async () => ({ address: PUBLIC_KEY, username: 'alice' }),
+          text: async () => JSON.stringify({ address: PUBLIC_KEY, username: 'alice' }),
+        })
+        .mockResolvedValue({
+          ok: true,
+          headers: new Headers({ 'Content-Type': 'application/json' }),
+          json: async () => ({ account_id: RECIPIENT_KEY }),
+          text: async () => JSON.stringify({ account_id: RECIPIENT_KEY }),
+        }),
+    );
+  };
+
+  it('persists only non-secret draft fields bound to the account', async () => {
+    setupDraftMocks();
+    renderDashboard();
+
+    fireEvent.change(screen.getByPlaceholderText('username or wallet address'), {
+      target: { value: 'alice*localhost' },
+    });
+    fireEvent.change(screen.getByPlaceholderText('0.00'), {
+      target: { value: '10' },
+    });
+
+    await waitFor(() => expect(readStoredDraft()).not.toBeNull());
+
+    const draft = readStoredDraft();
+    expect(draft.account).toBe(PUBLIC_KEY);
+    expect(draft.recipient).toBe('alice*localhost');
+    expect(draft.amount).toBe('10');
+    expect(draft).not.toHaveProperty('secret');
+    expect(draft).not.toHaveProperty('signedXdr');
+    expect(draft).not.toHaveProperty('xdr');
+  });
+
+  it('restores a compatible draft on mount', async () => {
+    setupDraftMocks();
+    window.localStorage.setItem(
+      DRAFT_STORAGE_KEY,
+      JSON.stringify({
+        account: PUBLIC_KEY,
+        network: 'testnet',
+        recipient: 'bob*localhost',
+        amount: '3',
+        savedAt: Date.now(),
+      }),
+    );
+
+    renderDashboard();
+
+    await waitFor(() =>
+      expect(screen.getByPlaceholderText('username or wallet address').value).toBe(
+        'bob*localhost',
+      ),
+    );
+    expect(screen.getByPlaceholderText('0.00').value).toBe('3');
+  });
+
+  it('discards a draft saved for a different account', async () => {
+    setupDraftMocks();
+    window.localStorage.setItem(
+      DRAFT_STORAGE_KEY,
+      JSON.stringify({
+        account: OTHER_PUBLIC_KEY,
+        network: 'testnet',
+        recipient: 'bob*localhost',
+        amount: '3',
+        savedAt: Date.now(),
+      }),
+    );
+
+    renderDashboard();
+
+    await waitFor(() => expect(readStoredDraft()).toBeNull());
+    expect(screen.getByPlaceholderText('username or wallet address').value).toBe('');
+  });
+
+  it('discards an expired draft', async () => {
+    setupDraftMocks();
+    window.localStorage.setItem(
+      DRAFT_STORAGE_KEY,
+      JSON.stringify({
+        account: PUBLIC_KEY,
+        network: 'testnet',
+        recipient: 'bob*localhost',
+        amount: '3',
+        savedAt: Date.now() - 1000 * 60 * 60 * 24 * 30,
+      }),
+    );
+
+    renderDashboard();
+
+    await waitFor(() => expect(readStoredDraft()).toBeNull());
+    expect(screen.getByPlaceholderText('username or wallet address').value).toBe('');
+  });
+
+  it('clears the stored draft when the clear control is used', async () => {
+    setupDraftMocks();
+    renderDashboard();
+
+    fireEvent.change(screen.getByPlaceholderText('username or wallet address'), {
+      target: { value: 'alice*localhost' },
+    });
+    await waitFor(() => expect(readStoredDraft()).not.toBeNull());
+
+    fireEvent.click(screen.getByRole('button', { name: /clear draft/i }));
+
+    await waitFor(() => expect(readStoredDraft()).toBeNull());
+    expect(screen.getByPlaceholderText('username or wallet address').value).toBe('');
+  });
+});
+
+describe('Dashboard – shared empty/loading/error states', () => {
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    vi.unstubAllGlobals();
+    window.localStorage.clear();
+  });
+
+  it('renders an accessible loading state while resolving recipient details', async () => {
+    vi.stubGlobal('matchMedia', () => ({
+      matches: false,
+      addListener: noop,
+      removeListener: noop,
+    }));
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        headers: new Headers({ 'Content-Type': 'application/json' }),
+        json: async () => ({ status: 'UP' }),
+        text: async () => JSON.stringify({ status: 'UP' }),
+      }),
+    );
+
+    renderDashboard();
+
+    const loading = await screen.findByRole('status');
+    expect(loading.getAttribute('aria-live')).toBe('polite');
+  });
+
+  it('renders an accessible error state with a retry action when the health check fails', async () => {
+    vi.stubGlobal('matchMedia', () => ({
+      matches: false,
+      addListener: noop,
+      removeListener: noop,
+    }));
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockRejectedValue(new Error('network down')),
+    );
+
+    renderDashboard();
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toBeTruthy();
+    expect(screen.getByRole('button', { name: /retry/i })).toBeTruthy();
   });
 });

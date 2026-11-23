@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import freighterApi from '@stellar/freighter-api';
 import toast from 'react-hot-toast';
 import { Client as PaymentRouterClient, networks } from '@stellar-tags/payment-router';
@@ -12,6 +12,18 @@ import RecentAddresses from '../components/RecentAddresses';
 import { useRecentAddresses } from '../useRecentAddresses';
 import { getFederation, getLookup } from '../api/client';
 import {
+  EmptyState,
+  ErrorState,
+  LoadingState,
+  PartialDataNotice,
+} from '../components/StateViews';
+import {
+  clearPaymentDraft,
+  isDraftCompatible,
+  loadPaymentDraft,
+  savePaymentDraft,
+} from '../paymentDraft';
+import {
   API_BASE,
   NAV_STORAGE_KEY,
   TOKEN_ADDRESS,
@@ -22,6 +34,8 @@ import {
   useNavState,
   useWalletMenu,
 } from './shared';
+
+const ACTIVE_NETWORK = networks.testnet.networkPassphrase;
 
 /**
  * @typedef {Object} DashboardProps
@@ -83,6 +97,9 @@ function Dashboard({
   const [isProcessing, setIsProcessing] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isReceiving, setIsReceiving] = useState(false)
+  const [receiveError, setReceiveError] = useState('')
+  const [draftRestored, setDraftRestored] = useState(false)
+  const [draftExpired, setDraftExpired] = useState(false)
   const [activeBalancePanel, setActiveBalancePanel] = useState('')
   const [showBalance, setShowBalance] = useState(true)
   const [receiveAddress, setReceiveAddress] = useState('')
@@ -165,6 +182,37 @@ function Dashboard({
     [recentAddresses],
   );
 
+  // Derived state: whether there is a draft worth surfacing a control for.
+  const hasDraft = useMemo(
+    () => Boolean(nameTag.trim() || amount.trim()),
+    [nameTag, amount],
+  );
+
+  /**
+   * Discard any persisted draft that is not bound to the current account and
+   * network. Drafts are only ever restored for an exact account/network match.
+   */
+  const discardIncompatibleDraft = useCallback(() => {
+    if (!userPublicKey) {
+      clearPaymentDraft();
+      return;
+    }
+    const draft = loadPaymentDraft();
+    if (draft && !isDraftCompatible(draft, userPublicKey, ACTIVE_NETWORK)) {
+      clearPaymentDraft();
+    }
+  }, [userPublicKey]);
+
+  const handleClearDraft = useCallback(() => {
+    clearPaymentDraft();
+    setNameTag('');
+    setAmount('');
+    setDraftRestored(false);
+    setDraftExpired(false);
+    displayMessage('Draft cleared.', '#1F2937', '#F3F4F6');
+    recipientRef.current?.focus();
+  }, []);
+
   /**
    * @param {string} text
    * @param {string} color
@@ -189,8 +237,11 @@ function Dashboard({
       return;
     }
 
+    let cancelled = false;
+
     const loadReceiveDetails = async () => {
       setIsReceiving(true);
+      setReceiveError('');
       displayReceiveMessage(
         "Loading your receive details...",
         "#1F2937",
@@ -199,6 +250,8 @@ function Dashboard({
 
       try {
         const { response, data } = await getLookup(userPublicKey);
+
+        if (cancelled) return;
 
         if (response.ok && data) {
           setReceiveAddress(data.address);
@@ -227,8 +280,13 @@ function Dashboard({
 
         throw new Error(apiErrorMessage(data, `Backend error (${response.status}).`))
       } catch (error){
+        if (cancelled) return;
+        // Keep the raw wallet address usable even when the lookup fails.
         setReceiveAddress(userPublicKey)
         setReceiveTag('')
+        setReceiveError(
+          error instanceof Error ? error.message : 'Unable to load receive details.',
+        )
         displayReceiveMessage(
           error instanceof Error ? error.message : 'Unable to load receive details.',
           '#DC2626',
@@ -236,12 +294,63 @@ function Dashboard({
         )
         onRegistrationStateChange('unknown')
       } finally {
-        setIsReceiving(false);
+        if (!cancelled) setIsReceiving(false);
       }
     };
 
     loadReceiveDetails();
+
+    return () => {
+      cancelled = true;
+    };
   }, [userPublicKey, onRegistrationStateChange]);
+
+  // Restore a compatible, unexpired draft once the wallet is connected.
+  useEffect(() => {
+    if (!userPublicKey) {
+      clearPaymentDraft();
+      return;
+    }
+
+    const draft = loadPaymentDraft();
+    if (!draft) return;
+
+    if (!isDraftCompatible(draft, userPublicKey, ACTIVE_NETWORK)) {
+      clearPaymentDraft();
+      return;
+    }
+
+    if (draft.expired) {
+      clearPaymentDraft();
+      setDraftExpired(true);
+      return;
+    }
+
+    setNameTag(draft.recipient || '');
+    setAmount(draft.amount || '');
+    setDraftRestored(true);
+  }, [userPublicKey]);
+
+  // Persist only non-secret draft fields, bound to the current account and
+  // network. Never persist resolved addresses, signatures or amounts in
+  // stroops.
+  useEffect(() => {
+    if (!userPublicKey) return;
+
+    discardIncompatibleDraft();
+
+    if (!nameTag.trim() && !amount.trim()) {
+      clearPaymentDraft();
+      return;
+    }
+
+    savePaymentDraft({
+      recipient: nameTag,
+      amount,
+      account: userPublicKey,
+      network: ACTIVE_NETWORK,
+    });
+  }, [userPublicKey, nameTag, amount, discardIncompatibleDraft]);
 
   useEffect(() => {
     recipientRef.current?.focus();
@@ -421,7 +530,17 @@ function Dashboard({
         <div className="balance-value">
           {showBalance ? formattedBalance : "••••••"}
         </div>
-        {balanceError && <p className="balance-error">{balanceError}</p>}
+        {isRefreshing && !balanceError && (
+          <LoadingState label="Refreshing balance..." />
+        )}
+        {balanceError && (
+          <ErrorState
+            title="Balance unavailable"
+            message={balanceError}
+            onRetry={onRefreshBalance}
+            retryLabel="Retry balance"
+          />
+        )}
         <button
           type="button"
           onClick={onRefreshBalance}
@@ -462,6 +581,30 @@ function Dashboard({
           inputMode="decimal"
         />
 
+        {draftRestored && (
+          <PartialDataNotice
+            message="Restored a saved draft for this account and network."
+            actionLabel="Clear draft"
+            onAction={handleClearDraft}
+          />
+        )}
+        {draftExpired && (
+          <PartialDataNotice
+            message="Your saved draft expired and was discarded."
+            actionLabel="Dismiss"
+            onAction={() => setDraftExpired(false)}
+          />
+        )}
+        {hasDraft && !draftRestored && (
+          <button
+            type="button"
+            className="draft-clear"
+            onClick={handleClearDraft}
+          >
+            Clear draft
+          </button>
+        )}
+
         <button
           type="button"
           onClick={handleLookup}
@@ -483,10 +626,25 @@ function Dashboard({
       <section className="receive-panel">
         <h2>Receive</h2>
         {isReceiving ? (
-          <p>Loading...</p>
+          <LoadingState label="Loading your receive details..." />
         ) : (
           <>
-            <p>{receiveTag ? formatUsername(receiveTag) : receiveAddress}</p>
+            {receiveAddress ? (
+              <p>{receiveTag ? formatUsername(receiveTag) : receiveAddress}</p>
+            ) : (
+              <EmptyState
+                title="No receive details yet"
+                message="Connect your wallet to load your username or address."
+              />
+            )}
+            {receiveError && (
+              <ErrorState
+                title="Could not load your username"
+                message={receiveError}
+                onRetry={() => onRegistrationStateChange('unknown')}
+                retryLabel="Retry lookup"
+              />
+            )}
             {receiveStatus.text && (
               <p
                 className="status-message"

@@ -1,8 +1,13 @@
 import { Fragment, useCallback, useEffect, useState } from 'react';
 import NetworkBadge from '../NetworkBadge';
 import ScrollToTop from '../ScrollToTop';
-import LoadingSpinner from '../LoadingSpinner';
 import MobileNav from './MobileNav';
+import {
+  EmptyState,
+  ErrorState,
+  LoadingState,
+  PartialDataNotice,
+} from '../states';
 import { NAV_STORAGE_KEY, formatShortAddress, useNavState, useWalletMenu } from './shared';
 
 /**
@@ -81,6 +86,7 @@ function HistoryPage({
   const [isConnecting, setIsConnecting] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [historyError, setHistoryError] = useState("");
+  const [partialError, setPartialError] = useState("");
   /** @type {[HistoryEntry[], (value: HistoryEntry[] | ((prev: HistoryEntry[]) => HistoryEntry[])) => void]} */
   const [history, setHistory] = useState([]);
   /** @type {[string | null, (value: string | null | ((prev: string | null) => string | null)) => void]} */
@@ -126,9 +132,8 @@ function HistoryPage({
 
       await Promise.resolve();
       setIsLoading(true);
-      setHistory([]);
-      setHasMore(false);
       setHistoryError("");
+      setPartialError("");
       try {
         const url = `${HORIZON_BASE}/transactions/export?account=${encodeURIComponent(userPublicKey)}&page=${pageNumber}&limit=${PAGE_LIMIT}`;
         const response = await fetch(url, { signal, cache: "no-store" });
@@ -255,9 +260,18 @@ function HistoryPage({
         setHistory(formatted);
       } catch (error) {
         if (error instanceof Error && error.name !== "AbortError") {
-          setHistoryError(
-            error.message || "Unable to load transaction history.",
-          );
+          const message =
+            error.message || "Unable to load transaction history.";
+          // Preserve already-loaded rows when a refresh fails; only surface a
+          // full-page error when there is nothing usable to show.
+          setHistory((current) => {
+            if (current.length > 0) {
+              setPartialError(message);
+              return current;
+            }
+            setHistoryError(message);
+            return current;
+          });
         }
       } finally {
         setIsLoading(false);
@@ -432,24 +446,36 @@ function HistoryPage({
               </button>
             </div>
           )}
-          {userPublicKey && isLoading && (
-            <div className="wallet-status" aria-live="polite">
-              <LoadingSpinner label="Loading transactions..." />
-            </div>
+          {userPublicKey && isLoading && history.length === 0 && (
+            <LoadingState label="Loading transactions..." />
           )}
           {userPublicKey && historyError && (
-            <div className="wallet-status">{historyError}</div>
+            <ErrorState
+              title="Unable to load transaction history"
+              description={historyError}
+              onRetry={() => setRefreshIndex((value) => value + 1)}
+              retryLabel="Retry"
+            />
+          )}
+          {userPublicKey && partialError && (
+            <PartialDataNotice
+              title="Some history may be out of date"
+              description={partialError}
+              onRetry={() => setRefreshIndex((value) => value + 1)}
+            />
           )}
           {userPublicKey &&
             !isLoading &&
             !historyError &&
             history.length === 0 && (
-              <div className="wallet-status">
-                No transactions found for this wallet.
-              </div>
+              <EmptyState
+                title="No transactions found"
+                description="No transactions found for this wallet."
+                actionLabel="Refresh"
+                onAction={() => setRefreshIndex((value) => value + 1)}
+              />
             )}
           {userPublicKey &&
-            !isLoading &&
             !historyError &&
             history.length > 0 && (
               <table className="history-table">
@@ -527,7 +553,7 @@ function HistoryPage({
                 </tbody>
               </table>
             )}
-          {userPublicKey && !historyError && (
+          {userPublicKey && !historyError && history.length > 0 && (
             <div className="pagination-controls">
               <button
                 type="button"

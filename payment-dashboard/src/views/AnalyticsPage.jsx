@@ -7,6 +7,12 @@ import NetworkBadge from '../NetworkBadge';
 import ScrollToTop from '../ScrollToTop';
 import MobileNav from './MobileNav';
 import {
+  EmptyState,
+  ErrorState,
+  LoadingState,
+  PartialDataNotice,
+} from '../components/StateViews';
+import {
   ANALYTICS_MAX_PAGES,
   ANALYTICS_PAGE_LIMIT,
   ANALYTICS_REFRESH_MS,
@@ -60,6 +66,9 @@ function AnalyticsPage({
   });
   /** @type {[string | null, (value: string | null) => void]} */
   const [loadError, setLoadError] = useState(null);
+  /** @type {[string[], (value: string[]) => void]} */
+  const [partialErrors, setPartialErrors] = useState([]);
+  const [isLoading, setIsLoading] = useState(true);
   const [retryCount, setRetryCount] = useState(0);
   const {
     menuRef,
@@ -249,6 +258,29 @@ function AnalyticsPage({
       return totalDelta / deltaCount;
     };
 
+    /**
+     * @param {() => Promise<number | null>} loader
+     * @param {string} label
+     * @returns {Promise<{ value: number | null, error: string | null }>}
+     */
+    const settleMetric = async (loader, label) => {
+      try {
+        return { value: await loader(), error: null };
+      } catch (error) {
+        if (error instanceof Error && error.name === "AbortError") {
+          throw error;
+        }
+
+        return {
+          value: null,
+          error:
+            error instanceof Error && error.message
+              ? `${label}: ${error.message}`
+              : `${label}: failed to load.`,
+        };
+      }
+    };
+
     const loadMetrics = async () => {
       if (currentController) {
         currentController.abort();
@@ -261,9 +293,18 @@ function AnalyticsPage({
       try {
         const [routingVolume, avgConfirmation, successRate] = await Promise.all(
           [
-            loadRoutingVolume(sinceMs, controller.signal),
-            loadAvgConfirmation(sinceMs, controller.signal),
-            loadSuccessRate(sinceMs, controller.signal),
+            settleMetric(
+              () => loadRoutingVolume(sinceMs, controller.signal),
+              "Flow volume",
+            ),
+            settleMetric(
+              () => loadAvgConfirmation(sinceMs, controller.signal),
+              "Avg confirmation",
+            ),
+            settleMetric(
+              () => loadSuccessRate(sinceMs, controller.signal),
+              "Routing reliability",
+            ),
           ],
         );
 
@@ -271,12 +312,21 @@ function AnalyticsPage({
           return;
         }
 
+        const failures = [routingVolume, avgConfirmation, successRate]
+          .map((result) => result.error)
+          .filter((message) => Boolean(message));
+
         setAnalyticsMetrics({
-          routingVolume,
-          avgConfirmation,
-          successRate,
+          routingVolume: routingVolume.value,
+          avgConfirmation: avgConfirmation.value,
+          successRate: successRate.value,
         });
-        setLoadError(null);
+        setPartialErrors(failures);
+        setLoadError(
+          failures.length === 3
+            ? failures[0] ?? "Failed to load analytics."
+            : null,
+        );
       } catch (error) {
         if (
           !isActive ||
@@ -290,12 +340,16 @@ function AnalyticsPage({
           avgConfirmation: null,
           successRate: null,
         });
+        setPartialErrors([]);
         setLoadError(
           error instanceof Error && error.message
             ? error.message
             : "Failed to load analytics.",
         );
       } finally {
+        if (isActive) {
+          setIsLoading(false);
+        }
         if (currentController === controller) {
           currentController = null;
         }
@@ -337,6 +391,15 @@ function AnalyticsPage({
     analyticsMetrics.successRate === null
       ? fallbackValue
       : analyticsMetrics.successRate.toFixed(1);
+  const hasAnyMetric =
+    analyticsMetrics.routingVolume !== null ||
+    analyticsMetrics.avgConfirmation !== null ||
+    analyticsMetrics.successRate !== null;
+  const isEmptyResult = !isLoading && !loadError && !hasAnyMetric;
+  const retryAnalytics = () => {
+    setIsLoading(true);
+    setRetryCount((count) => count + 1);
+  };
 
   return (
     <div className={`dashboard ${isNavOpen ? "nav-open" : ""}`}>
@@ -442,22 +505,41 @@ function AnalyticsPage({
           </div>
         </section>
 
-        {loadError && (
-          <section className="card reveal" role="alert">
-            <p className="field-error">
-              Unable to load analytics: {loadError}
-            </p>
-            <button
-              type="button"
-              className="connect-pill"
-              onClick={() => setRetryCount((count) => count + 1)}
-            >
-              Retry
-            </button>
-          </section>
+        {isLoading && !hasAnyMetric && (
+          <LoadingState
+            title="Loading analytics"
+            message="Fetching routing volume, confirmation speed, and reliability."
+          />
         )}
 
-        {!loadError && (
+        {loadError && (
+          <ErrorState
+            title="Unable to load analytics"
+            message={loadError}
+            onRetry={retryAnalytics}
+            retryLabel="Retry"
+          />
+        )}
+
+        {!loadError && partialErrors.length > 0 && (
+          <PartialDataNotice
+            title="Some analytics are unavailable"
+            messages={partialErrors}
+            onRetry={retryAnalytics}
+            retryLabel="Refresh analytics"
+          />
+        )}
+
+        {!loadError && isEmptyResult && (
+          <EmptyState
+            title="No analytics in this window"
+            message="No routing activity was recorded in the last hour. Metrics will appear once traffic resumes."
+            actionLabel="Refresh"
+            onAction={retryAnalytics}
+          />
+        )}
+
+        {!loadError && !isEmptyResult && (
           <section className="grid columns-3">
             <div className="card reveal">
               <div className="card-header">
