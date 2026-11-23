@@ -1,4 +1,4 @@
-FROM node:20-alpine AS base
+FROM node:26-alpine AS base
 WORKDIR /app
 ENV NPM_CONFIG_AUDIT=false \
 	NPM_CONFIG_FUND=false \
