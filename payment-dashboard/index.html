@@ -5,14 +5,46 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://localhost:5000; img-src 'self' data:; font-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'"
+      content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://localhost:5000; img-src 'self' data:; font-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'"
     />
-    <link rel="manifest" href="/manifest.json" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="color-scheme" content="light dark" />
     <meta name="theme-color" content="#0f172a" />
-    <title>Payment Dashboard</title>
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Payment Dashboard" />
     <link rel="manifest" href="/manifest.json" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <title>Payment Dashboard</title>
+    <script>
+      (function () {
+        var THEME_COLORS = { light: '#f8fafc', dark: '#0f172a' };
+        var stored = null;
+        try {
+          stored = window.localStorage.getItem('theme');
+        } catch (e) {
+          stored = null;
+        }
+        if (stored !== 'light' && stored !== 'dark' && stored !== 'system') {
+          stored = 'system';
+        }
+        var prefersDark = false;
+        try {
+          prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+        } catch (e) {
+          prefersDark = false;
+        }
+        var resolved = stored === 'system' ? (prefersDark ? 'dark' : 'light') : stored;
+        var root = document.documentElement;
+        root.dataset.theme = resolved;
+        root.style.colorScheme = resolved;
+        var meta = document.querySelector('meta[name="theme-color"]');
+        if (meta) {
+          meta.setAttribute('content', THEME_COLORS[resolved] || THEME_COLORS.dark);
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
