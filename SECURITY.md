@@ -117,4 +117,35 @@ This policy applies to the Stellar Tags repository, including the frontend,
 backend, and Soroban contracts. Vulnerabilities in third-party dependencies
 should be reported upstream, though we appreciate a heads-up if they affect us.
 
+## Threat Model
+
+Our threat model documents the assets we protect, the trust boundaries between
+components, the capabilities we assume of attackers, and the mitigations and
+owners for each area. It covers:
+
+- **Wallet signing** — how transaction intent is presented to and approved by
+  the user's wallet, and what we assume the wallet enforces.
+- **Admin actions** — privileged operations in the backend and their
+  authorization and audit requirements.
+- **Webhooks** — inbound and outbound event delivery, signature verification,
+  and replay protection.
+- **Persistence** — the database and its access controls, migrations, and
+  backup/recovery expectations.
+- **RPC** — how we communicate with Stellar RPC/Horizon and how we handle
+  untrusted or inconsistent responses.
+- **Contract governance** — the Soroban contracts, their upgrade/admin paths,
+  and the trust placed in contract state.
+
+Read the full document at [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
+
+### Reporting expectations
+
+When reporting an issue, please tell us which trust boundary or component you
+believe is affected (for example, "wallet signing" or "webhooks"). This helps us
+route the report to the right owner and triage it faster. Please do **not**
+include working exploit code, live credentials, or instructions that could be
+used to attack production users; a clear description of the impact and the
+conditions required is sufficient. We will coordinate any proof-of-concept
+details privately through the advisory.
+
 Thank you for helping keep Stellar Tags and its users safe.

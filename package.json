@@ -15,6 +15,7 @@
     "test:property": "jest --config jest.property.config.js",
     "test:all": "npm test --workspace=payment-dashboard && npm test --workspace=stellar-payment-platform && cd payment_router && cargo test",
     "repair:payments": "node scripts/repair-payments.js",
+    "dev:bootstrap": "node scripts/dev-bootstrap.js",
     "contract:build": "node scripts/deploy.js build",
     "contract:deploy": "node scripts/deploy.js deploy",
     "contract:upgrade": "node scripts/deploy.js upgrade",
