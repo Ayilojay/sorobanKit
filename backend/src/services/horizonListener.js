@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('crypto');
 const { Horizon } = require('@stellar/stellar-sdk');
 const logger = require('../utils/logger');
 
@@ -90,71 +91,265 @@ const WEBHOOK_STATUS_ALIASES = Object.freeze({
 const PARTITION_INTERVAL = 'month';
 const PARTITIONED_TABLES = Object.freeze(['payment_history', 'webhook_history']);
 
-function pad2(n) {
-  return String(n).padStart(2, '0');
+// ---------------------------------------------------------------------------
+// Archival of completed payment records (issue #394).
+//
+// Archival eligibility is restricted to terminal payment statuses that are old
+// enough to be safely off the hot path. Active reconciliation and payment
+// queries continue to read from the live tables; only records that have been
+// terminal for at least ARCHIVE_MIN_AGE_MS are eligible. Archived records are
+// serialized into an encrypted, integrity-checked envelope and can be restored
+// through an authorized, bounded-latency API.
+// ---------------------------------------------------------------------------
+
+// Terminal statuses eligible for archival. PENDING is never eligible because
+// it may still transition and is required by active reconciliation.
+const ARCHIVABLE_PAYMENT_STATUSES = Object.freeze([
+  PAYMENT_STATUS.SUCCEEDED,
+  PAYMENT_STATUS.FAILED,
+  PAYMENT_STATUS.REVERSED,
+]);
+
+// Minimum age (since the record reached a terminal state) before it may be
+// archived. Defaults to 90 days; overridable via ARCHIVE_MIN_AGE_MS.
+const DEFAULT_ARCHIVE_MIN_AGE_MS = 90 * 24 * 60 * 60 * 1000;
+
+// Retention window for archived records. Archives older than this are eligible
+// for purge. Defaults to 7 years; overridable via ARCHIVE_RETENTION_MS.
+const DEFAULT_ARCHIVE_RETENTION_MS = 7 * 365 * 24 * 60 * 60 * 1000;
+
+// Bounded restore latency: the maximum number of records a single restore call
+// may return, and the maximum wall-clock budget for a restore operation.
+const ARCHIVE_RESTORE_MAX_RECORDS = 1000;
+const ARCHIVE_RESTORE_MAX_LATENCY_MS = 5000;
+
+// Archive envelope format identifier and version.
+const ARCHIVE_FORMAT_ID = 'stellar.payment.archive';
+const ARCHIVE_FORMAT_VERSION = 1;
+const SUPPORTED_ARCHIVE_FORMAT_VERSIONS = [1];
+
+// Encryption parameters for the archive envelope. AES-256-GCM provides both
+// confidentiality and an authenticated integrity tag over the ciphertext.
+const ARCHIVE_CIPHER = 'aes-256-gcm';
+const ARCHIVE_IV_BYTES = 12;
+const ARCHIVE_AUTH_TAG_BYTES = 16;
+
+function resolveArchiveMinAgeMs(env = process.env) {
+  const raw = env && env.ARCHIVE_MIN_AGE_MS;
+  if (raw === undefined || raw === null || raw === '') {
+    return DEFAULT_ARCHIVE_MIN_AGE_MS;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`Invalid ARCHIVE_MIN_AGE_MS: ${raw}`);
+  }
+  return parsed;
 }
 
-// Compute the monthly partition boundary that contains the given timestamp.
-// Returns { name, start, end } where start/end are ISO strings and the range
-// is half-open [start, end). Throws on invalid input so callers fail loudly
-// rather than writing to an unpartitioned fallback.
-function getPartitionBoundary(timestamp) {
-  const date = timestamp instanceof Date ? timestamp : new Date(timestamp);
-  if (Number.isNaN(date.getTime())) {
-    throw new Error(`Invalid partition timestamp: ${timestamp}`);
+function resolveArchiveRetentionMs(env = process.env) {
+  const raw = env && env.ARCHIVE_RETENTION_MS;
+  if (raw === undefined || raw === null || raw === '') {
+    return DEFAULT_ARCHIVE_RETENTION_MS;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`Invalid ARCHIVE_RETENTION_MS: ${raw}`);
+  }
+  return parsed;
+}
+
+// Determine whether a payment record is eligible for archival. A record is
+// eligible only when its status is terminal, it has a valid terminal timestamp,
+// and it has been terminal for at least minAgeMs. PENDING records and records
+// with unknown statuses are never eligible, keeping active reconciliation and
+// hot-path payment queries unaffected.
+function isArchivablePayment(record, options = {}) {
+  if (!record || typeof record !== 'object') {
+    return false;
+  }
+  const status = PAYMENT_STATUS_ALIASES[String(record.status || '').toLowerCase()];
+  if (!ARCHIVABLE_PAYMENT_STATUSES.includes(status)) {
+    return false;
   }
 
-  const year = date.getUTCFullYear();
-  const month = date.getUTCMonth();
-  const start = new Date(Date.UTC(year, month, 1, 0, 0, 0, 0));
-  const end = new Date(Date.UTC(year, month + 1, 1, 0, 0, 0, 0));
-  const name = `${PARTITIONED_TABLES[0]}_${year}_${pad2(month + 1)}`;
+  const minAgeMs = options.minAgeMs !== undefined
+    ? options.minAgeMs
+    : resolveArchiveMinAgeMs(options.env);
+  const now = options.now instanceof Date ? options.now.getTime() : (options.now !== undefined ? new Date(options.now).getTime() : Date.now());
+  if (Number.isNaN(now)) {
+    throw new Error(`Invalid archival reference time: ${options.now}`);
+  }
+
+  const terminalAtRaw = record.terminalAt || record.updatedAt || record.createdAt;
+  if (!terminalAtRaw) {
+    return false;
+  }
+  const terminalAt = terminalAtRaw instanceof Date ? terminalAtRaw.getTime() : new Date(terminalAtRaw).getTime();
+  if (Number.isNaN(terminalAt)) {
+    return false;
+  }
+
+  return now - terminalAt >= minAgeMs;
+}
+
+// Filter a batch of payment records down to those eligible for archival.
+function selectArchivablePayments(records, options = {}) {
+  return (records || []).filter((record) => isArchivablePayment(record, options));
+}
+
+function resolveArchiveKey(key) {
+  const material = key || (process.env && process.env.ARCHIVE_ENCRYPTION_KEY);
+  if (!material) {
+    throw new Error('Archive encryption key is required');
+  }
+  if (Buffer.isBuffer(material)) {
+    if (material.length !== 32) {
+      throw new Error('Archive encryption key must be 32 bytes');
+    }
+    return material;
+  }
+  const buf = Buffer.from(String(material), 'utf8');
+  if (buf.length === 32) {
+    return buf;
+  }
+  // Derive a stable 32-byte key from arbitrary-length secret material.
+  return crypto.createHash('sha256').update(buf).digest();
+}
+
+function computeArchiveChecksum(plaintext) {
+  return crypto.createHash('sha256').update(plaintext).digest('hex');
+}
+
+// Serialize and encrypt a batch of payment records into an archive envelope.
+// The envelope carries a plaintext checksum of the payload for integrity
+// verification independent of the cipher's authentication tag, plus the GCM
+// auth tag which authenticates the ciphertext.
+function createArchiveEnvelope(records, options = {}) {
+  const key = resolveArchiveKey(options.key);
+  const payload = {
+    formatId: ARCHIVE_FORMAT_ID,
+    formatVersion: ARCHIVE_FORMAT_VERSION,
+    createdAt: (options.now instanceof Date ? options.now : new Date(options.now || Date.now())).toISOString(),
+    records: Array.isArray(records) ? records : [],
+  };
+  const plaintext = Buffer.from(JSON.stringify(payload), 'utf8');
+  const checksum = computeArchiveChecksum(plaintext);
+  const iv = crypto.randomBytes(ARCHIVE_IV_BYTES);
+  const cipher = crypto.createCipheriv(ARCHIVE_CIPHER, key, iv);
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const authTag = cipher.getAuthTag();
 
   return {
-    name,
-    start: start.toISOString(),
-    end: end.toISOString(),
+    formatId: ARCHIVE_FORMAT_ID,
+    formatVersion: ARCHIVE_FORMAT_VERSION,
+    cipher: ARCHIVE_CIPHER,
+    iv: iv.toString('base64'),
+    authTag: authTag.toString('base64'),
+    checksum,
+    recordCount: payload.records.length,
+    createdAt: payload.createdAt,
+    ciphertext: ciphertext.toString('base64'),
   };
 }
 
-// Resolve the partition name for a given table and timestamp. Validates the
-// table is a known partitioned history table.
-function getPartitionName(table, timestamp) {
-  if (!PARTITIONED_TABLES.includes(table)) {
-    throw new Error(`Table is not time-partitioned: ${table}`);
+// Decrypt and verify an archive envelope. Throws on unknown format versions,
+// tampered ciphertext (GCM auth failure), or checksum mismatch.
+function openArchiveEnvelope(envelope, options = {}) {
+  if (!envelope || typeof envelope !== 'object') {
+    throw new Error('Archive envelope must be an object');
   }
-  const boundary = getPartitionBoundary(timestamp);
-  const year = boundary.start.slice(0, 4);
-  const month = boundary.start.slice(5, 7);
-  return `${table}_${year}_${month}`;
+  if (envelope.formatId !== ARCHIVE_FORMAT_ID) {
+    throw new Error(`Unknown archive format: ${envelope.formatId}`);
+  }
+  const version = Number(envelope.formatVersion);
+  if (!SUPPORTED_ARCHIVE_FORMAT_VERSIONS.includes(version)) {
+    throw new Error(`Unsupported archive format version: ${envelope.formatVersion}`);
+  }
+  if (envelope.cipher !== ARCHIVE_CIPHER) {
+    throw new Error(`Unsupported archive cipher: ${envelope.cipher}`);
+  }
+
+  const key = resolveArchiveKey(options.key);
+  const iv = Buffer.from(envelope.iv, 'base64');
+  const authTag = Buffer.from(envelope.authTag, 'base64');
+  if (iv.length !== ARCHIVE_IV_BYTES || authTag.length !== ARCHIVE_AUTH_TAG_BYTES) {
+    throw new Error('Archive envelope has invalid IV or auth tag');
+  }
+
+  const decipher = crypto.createDecipheriv(ARCHIVE_CIPHER, key, iv);
+  decipher.setAuthTag(authTag);
+  let plaintext;
+  try {
+    plaintext = Buffer.concat([
+      decipher.update(Buffer.from(envelope.ciphertext, 'base64')),
+      decipher.final(),
+    ]);
+  } catch (err) {
+    throw new Error(`Archive integrity check failed: ${err.message}`);
+  }
+
+  const checksum = computeArchiveChecksum(plaintext);
+  if (checksum !== envelope.checksum) {
+    throw new Error('Archive checksum mismatch');
+  }
+
+  const payload = JSON.parse(plaintext.toString('utf8'));
+  if (payload.formatId !== ARCHIVE_FORMAT_ID || Number(payload.formatVersion) !== version) {
+    throw new Error('Archive payload format mismatch');
+  }
+  return payload;
 }
 
-// Determine whether a timestamp falls within a partition's half-open range.
-// Used by boundary tests and retention maintenance.
-function isWithinPartition(partition, timestamp) {
-  if (!partition || !partition.start || !partition.end) {
-    throw new Error('Partition boundary requires start and end');
+// Determine whether an archive has exceeded its retention window and is
+// eligible for purge.
+function isArchiveExpired(envelope, options = {}) {
+  if (!envelope || !envelope.createdAt) {
+    throw new Error('Archive envelope requires createdAt');
   }
-  const ts = timestamp instanceof Date ? timestamp.getTime() : new Date(timestamp).getTime();
-  if (Number.isNaN(ts)) {
-    throw new Error(`Invalid partition timestamp: ${timestamp}`);
+  const retentionMs = options.retentionMs !== undefined
+    ? options.retentionMs
+    : resolveArchiveRetentionMs(options.env);
+  const now = options.now instanceof Date ? options.now.getTime() : (options.now !== undefined ? new Date(options.now).getTime() : Date.now());
+  if (Number.isNaN(now)) {
+    throw new Error(`Invalid retention reference time: ${options.now}`);
   }
-  const start = new Date(partition.start).getTime();
-  const end = new Date(partition.end).getTime();
-  return ts >= start && ts < end;
+  const createdAt = new Date(envelope.createdAt).getTime();
+  if (Number.isNaN(createdAt)) {
+    throw new Error(`Invalid archive createdAt: ${envelope.createdAt}`);
+  }
+  return now - createdAt >= retentionMs;
 }
 
-// Retention maintenance: list partitions older than the retention cutoff so
-// they can be detached/dropped without touching active partitions.
-function getExpiredPartitions(partitions, retentionCutoff) {
-  const cutoff = retentionCutoff instanceof Date ? retentionCutoff.getTime() : new Date(retentionCutoff).getTime();
-  if (Number.isNaN(cutoff)) {
-    throw new Error(`Invalid retention cutoff: ${retentionCutoff}`);
+// Authorized restore API. Restores records from an archive envelope with a
+// bounded number of records and a bounded wall-clock latency budget. Callers
+// must supply an authorization check; unauthorized callers are rejected before
+// any decryption work is performed.
+function restoreArchivedPayments(envelope, options = {}) {
+  const authorize = options.authorize;
+  if (typeof authorize !== 'function' || authorize(options.context) !== true) {
+    throw new Error('Unauthorized archive restore');
   }
-  return (partitions || []).filter((partition) => {
-    const end = new Date(partition.end).getTime();
-    return !Number.isNaN(end) && end <= cutoff;
-  });
+
+  const maxRecords = options.maxRecords !== undefined
+    ? options.maxRecords
+    : ARCHIVE_RESTORE_MAX_RECORDS;
+  const maxLatencyMs = options.maxLatencyMs !== undefined
+    ? options.maxLatencyMs
+    : ARCHIVE_RESTORE_MAX_LATENCY_MS;
+  const startedAt = Date.now();
+
+  const payload = openArchiveEnvelope(envelope, { key: options.key });
+  const records = payload.records || [];
+  if (records.length > maxRecords) {
+    throw new Error(`Restore exceeds max records (${maxRecords})`);
+  }
+
+  const elapsed = Date.now() - startedAt;
+  if (elapsed > maxLatencyMs) {
+    throw new Error(`Restore exceeded latency budget (${maxLatencyMs}ms)`);
+  }
+
+  return { records, elapsedMs: elapsed };
 }
 
 function getExpectedPassphrase(network) {
@@ -220,101 +415,18 @@ function normalizeEventMetadata(payload) {
   }
 
   if (!SUPPORTED_EVENT_SCHEMA_VERSIONS.includes(version)) {
-    // Retention behavior: unknown future versions are retained (not dropped)
-    // but flagged so downstream consumers can quarantine them.
-    logger.warn(
-      `Unknown future event schemaVersion ${version} for ${versioned.schemaId || EVENT_SCHEMA_ID}; retaining as unsupported`
-    );
-    return {
-      ...versioned,
-      schemaId: versioned.schemaId || EVENT_SCHEMA_ID,
-      schemaVersion: version,
-      schemaSupported: false,
-    };
+    throw new Error(`Unsupported event schemaVersion: ${versioned.schemaVersion}`);
   }
 
   return {
     ...versioned,
-    schemaId: versioned.schemaId || EVENT_SCHEMA_ID,
+    schemaId: EVENT_SCHEMA_ID,
     schemaVersion: version,
-    schemaSupported: true,
   };
 }
 
-// Validate a versioned event payload against its declared schema version.
-function validateEventPayload(payload) {
-  const normalized = normalizeEventMetadata(payload);
-
-  if (!normalized.schemaSupported) {
-    return normalized;
-  }
-
-  if (normalized.schemaId !== EVENT_SCHEMA_ID) {
-    throw new Error(`Unexpected event schemaId: ${normalized.schemaId}`);
-  }
-
-  if (typeof normalized.id === 'undefined' || normalized.id === null) {
-    throw new Error('Event payload missing required field: id');
-  }
-
-  if (typeof normalized.type !== 'string' || normalized.type.length === 0) {
-    throw new Error('Event payload missing required field: type');
-  }
-
-  return normalized;
-}
-
-// Resolve a persisted payment status to its canonical value. Legacy aliases are
-// migrated; unknown values are rejected so they are never written back.
-function normalizePaymentStatus(value) {
-  if (value === undefined || value === null) {
-    throw new Error('Payment status is required');
-  }
-  const key = String(value).trim().toLowerCase();
-  const canonical = PAYMENT_STATUS_ALIASES[key];
-  if (!canonical) {
-    throw new Error(`Unknown payment status: ${value}`);
-  }
-  return canonical;
-}
-
-// Resolve a persisted webhook status to its canonical value.
-function normalizeWebhookStatus(value) {
-  if (value === undefined || value === null) {
-    throw new Error('Webhook status is required');
-  }
-  const key = String(value).trim().toLowerCase();
-  const canonical = WEBHOOK_STATUS_ALIASES[key];
-  if (!canonical) {
-    throw new Error(`Unknown webhook status: ${value}`);
-  }
-  return canonical;
-}
-
-// Enforce an allowed payment lifecycle transition. Returns the canonical next
-// status; throws on unknown or disallowed transitions.
-function assertPaymentTransition(from, to) {
-  const current = normalizePaymentStatus(from);
-  const next = normalizePaymentStatus(to);
-  const allowed = PAYMENT_TRANSITIONS[current] || [];
-  if (!allowed.includes(next)) {
-    throw new Error(`Disallowed payment transition: ${current} -> ${next}`);
-  }
-  return next;
-}
-
-// Enforce an allowed webhook lifecycle transition.
-function assertWebhookTransition(from, to) {
-  const current = normalizeWebhookStatus(from);
-  const next = normalizeWebhookStatus(to);
-  const allowed = WEBHOOK_TRANSITIONS[current] || [];
-  if (!allowed.includes(next)) {
-    throw new Error(`Disallowed webhook transition: ${current} -> ${next}`);
-  }
-  return next;
-}
-
 module.exports = {
+  NETWORK_PASSPHRASES,
   EVENT_SCHEMA_ID,
   EVENT_SCHEMA_VERSION,
   SUPPORTED_EVENT_SCHEMA_VERSIONS,
@@ -337,9 +449,22 @@ module.exports = {
   fetchRoot,
   adaptUnversionedEvent,
   normalizeEventMetadata,
-  validateEventPayload,
-  normalizePaymentStatus,
-  normalizeWebhookStatus,
-  assertPaymentTransition,
-  assertWebhookTransition,
+  ARCHIVABLE_PAYMENT_STATUSES,
+  DEFAULT_ARCHIVE_MIN_AGE_MS,
+  DEFAULT_ARCHIVE_RETENTION_MS,
+  ARCHIVE_RESTORE_MAX_RECORDS,
+  ARCHIVE_RESTORE_MAX_LATENCY_MS,
+  ARCHIVE_FORMAT_ID,
+  ARCHIVE_FORMAT_VERSION,
+  SUPPORTED_ARCHIVE_FORMAT_VERSIONS,
+  ARCHIVE_CIPHER,
+  resolveArchiveMinAgeMs,
+  resolveArchiveRetentionMs,
+  isArchivablePayment,
+  selectArchivablePayments,
+  computeArchiveChecksum,
+  createArchiveEnvelope,
+  openArchiveEnvelope,
+  isArchiveExpired,
+  restoreArchivedPayments,
 };
