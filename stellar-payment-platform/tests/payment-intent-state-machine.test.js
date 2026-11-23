@@ -17,6 +17,17 @@ const {
 
 const { ApiError } = require('../src/errors/ApiError');
 
+const {
+  SUBMISSION_TO_FINALITY_BUCKETS_SECONDS,
+  RECONCILIATION_BACKLOG_OBJECTIVE_SECONDS,
+  observeSubmissionToFinality,
+  setOldestUnreconciledIntentAge,
+  recordReconciliationBacklog,
+  resetLedgerMetricsForTests,
+  renderLedgerMetrics,
+  getLedgerMetricSamples,
+} = require('../src/observability/ledgerMetrics');
+
 const ALL_STATUSES = ['PENDING', 'PROCESSING', 'COMPLETED', 'FAILED', 'CANCELLED'];
 
 /**
@@ -206,6 +217,250 @@ describe('payment intent state machine', () => {
       expect(rejected).toHaveLength(1);
       expect(rejected[0].reason.code).toBe('CONFLICT');
       expect(rejected[0].reason.status).toBe(409);
+    });
+  });
+});
+
+describe('ledger observability metrics', () => {
+  beforeEach(() => {
+    resetLedgerMetricsForTests();
+  });
+
+  describe('submission-to-finality histogram', () => {
+    it('exposes documented bucket boundaries in ascending order', () => {
+      expect(Array.isArray(SUBMISSION_TO_FINALITY_BUCKETS_SECONDS)).toBe(true);
+      expect(SUBMISSION_TO_FINALITY_BUCKETS_SECONDS.length).toBeGreaterThan(0);
+      for (let i = 1; i < SUBMISSION_TO_FINALITY_BUCKETS_SECONDS.length; i += 1) {
+        expect(SUBMISSION_TO_FINALITY_BUCKETS_SECONDS[i]).toBeGreaterThan(
+          SUBMISSION_TO_FINALITY_BUCKETS_SECONDS[i - 1],
+        );
+      }
+    });
+
+    it('records an observation with only network/operation/status labels', () => {
+      observeSubmissionToFinality({
+        network: 'testnet',
+        operation: 'payment_intent',
+        status: 'COMPLETED',
+        seconds: 3.5,
+      });
+
+      const samples = getLedgerMetricSamples('submission_to_finality_seconds');
+      expect(samples.length).toBeGreaterThan(0);
+      for (const sample of samples) {
+        expect(Object.keys(sample.labels).sort()).toEqual(
+          ['network', 'operation', 'status'].sort(),
+        );
+        expect(sample.labels.network).toBe('testnet');
+        expect(sample.labels.operation).toBe('payment_intent');
+        expect(sample.labels.status).toBe('COMPLETED');
+      }
+    });
+
+    it('places observations in the correct cumulative bucket', () => {
+      observeSubmissionToFinality({
+        network: 'testnet',
+        operation: 'payment_intent',
+        status: 'COMPLETED',
+        seconds: 3.5,
+      });
+
+      const samples = getLedgerMetricSamples('submission_to_finality_seconds');
+      const buckets = samples.filter((s) => s.type === 'histogram_bucket');
+      const firstBoundary = SUBMISSION_TO_FINALITY_BUCKETS_SECONDS[0];
+
+      for (const bucket of buckets) {
+        const le = Number(bucket.labels.le);
+        if (le >= 3.5) {
+          expect(bucket.value).toBe(1);
+        } else {
+          expect(bucket.value).toBe(0);
+        }
+      }
+      expect(firstBoundary).toBeGreaterThan(0);
+    });
+
+    it('treats an observation exactly on a bucket boundary as inclusive', () => {
+      const boundary = SUBMISSION_TO_FINALITY_BUCKETS_SECONDS[0];
+      observeSubmissionToFinality({
+        network: 'testnet',
+        operation: 'payment_intent',
+        status: 'COMPLETED',
+        seconds: boundary,
+      });
+
+      const samples = getLedgerMetricSamples('submission_to_finality_seconds');
+      const bucket = samples.find(
+        (s) => s.type === 'histogram_bucket' && Number(s.labels.le) === boundary,
+      );
+      expect(bucket).toBeDefined();
+      expect(bucket.value).toBe(1);
+    });
+
+    it('accumulates multiple observations into the +Inf bucket', () => {
+      for (const seconds of [0.5, 2, 30]) {
+        observeSubmissionToFinality({
+          network: 'mainnet',
+          operation: 'payment_intent',
+          status: 'COMPLETED',
+          seconds,
+        });
+      }
+
+      const samples = getLedgerMetricSamples('submission_to_finality_seconds');
+      const infBucket = samples.find(
+        (s) => s.type === 'histogram_bucket' && s.labels.le === '+Inf',
+      );
+      expect(infBucket).toBeDefined();
+      expect(infBucket.value).toBe(3);
+    });
+
+    it('keeps series separate per network', () => {
+      observeSubmissionToFinality({
+        network: 'mainnet',
+        operation: 'payment_intent',
+        status: 'COMPLETED',
+        seconds: 1,
+      });
+      observeSubmissionToFinality({
+        network: 'testnet',
+        operation: 'payment_intent',
+        status: 'COMPLETED',
+        seconds: 1,
+      });
+
+      const samples = getLedgerMetricSamples('submission_to_finality_seconds');
+      const networks = new Set(samples.map((s) => s.labels.network));
+      expect(networks).toEqual(new Set(['mainnet', 'testnet']));
+    });
+
+    it('rejects observations with missing or invalid labels', () => {
+      expect(() =>
+        observeSubmissionToFinality({ operation: 'payment_intent', status: 'COMPLETED', seconds: 1 }),
+      ).toThrow();
+      expect(() =>
+        observeSubmissionToFinality({ network: 'testnet', status: 'COMPLETED', seconds: 1 }),
+      ).toThrow();
+      expect(() =>
+        observeSubmissionToFinality({ network: 'testnet', operation: 'payment_intent', seconds: 1 }),
+      ).toThrow();
+    });
+
+    it('rejects user identifiers smuggled into labels', () => {
+      expect(() =>
+        observeSubmissionToFinality({
+          network: 'testnet',
+          operation: 'payment_intent',
+          status: 'COMPLETED',
+          seconds: 1,
+          userId: 'user_123',
+        }),
+      ).toThrow();
+      expect(() =>
+        observeSubmissionToFinality({
+          network: 'testnet',
+          operation: 'payment_intent',
+          status: 'COMPLETED',
+          seconds: 1,
+          intentId: 'pi_test_1',
+        }),
+      ).toThrow();
+    });
+
+    it('rejects negative or non-finite durations', () => {
+      for (const seconds of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+        expect(() =>
+          observeSubmissionToFinality({
+            network: 'testnet',
+            operation: 'payment_intent',
+            status: 'COMPLETED',
+            seconds,
+          }),
+        ).toThrow();
+      }
+    });
+  });
+
+  describe('oldest unreconciled intent age gauge', () => {
+    it('documents a positive reconciliation backlog objective', () => {
+      expect(RECONCILIATION_BACKLOG_OBJECTIVE_SECONDS).toBeGreaterThan(0);
+    });
+
+    it('sets the gauge per network', () => {
+      setOldestUnreconciledIntentAge({ network: 'mainnet', seconds: 42 });
+      setOldestUnreconciledIntentAge({ network: 'testnet', seconds: 7 });
+
+      const samples = getLedgerMetricSamples('oldest_unreconciled_intent_age_seconds');
+      const byNetwork = Object.fromEntries(
+        samples.map((s) => [s.labels.network, s.value]),
+      );
+      expect(byNetwork.mainnet).toBe(42);
+      expect(byNetwork.testnet).toBe(7);
+    });
+
+    it('accepts zero age when the backlog is empty', () => {
+      setOldestUnreconciledIntentAge({ network: 'mainnet', seconds: 0 });
+      const samples = getLedgerMetricSamples('oldest_unreconciled_intent_age_seconds');
+      expect(samples).toHaveLength(1);
+      expect(samples[0].value).toBe(0);
+    });
+
+    it('only uses the network label', () => {
+      setOldestUnreconciledIntentAge({ network: 'mainnet', seconds: 5 });
+      const samples = getLedgerMetricSamples('oldest_unreconciled_intent_age_seconds');
+      for (const sample of samples) {
+        expect(Object.keys(sample.labels)).toEqual(['network']);
+      }
+    });
+
+    it('rejects missing network, negative ages, and extra labels', () => {
+      expect(() => setOldestUnreconciledIntentAge({ seconds: 5 })).toThrow();
+      expect(() =>
+        setOldestUnreconciledIntentAge({ network: 'mainnet', seconds: -1 }),
+      ).toThrow();
+      expect(() =>
+        setOldestUnreconciledIntentAge({ network: 'mainnet', seconds: 5, intentId: 'pi_1' }),
+      ).toThrow();
+    });
+
+    it('records backlog breaches against the documented objective', () => {
+      const below = recordReconciliationBacklog({
+        network: 'mainnet',
+        seconds: RECONCILIATION_BACKLOG_OBJECTIVE_SECONDS - 1,
+      });
+      const above = recordReconciliationBacklog({
+        network: 'mainnet',
+        seconds: RECONCILIATION_BACKLOG_OBJECTIVE_SECONDS + 1,
+      });
+
+      expect(below.breached).toBe(false);
+      expect(above.breached).toBe(true);
+    });
+
+    it('treats age exactly at the objective as not breached', () => {
+      const result = recordReconciliationBacklog({
+        network: 'mainnet',
+        seconds: RECONCILIATION_BACKLOG_OBJECTIVE_SECONDS,
+      });
+      expect(result.breached).toBe(false);
+    });
+  });
+
+  describe('rendering', () => {
+    it('renders Prometheus text without user identifiers', () => {
+      observeSubmissionToFinality({
+        network: 'testnet',
+        operation: 'payment_intent',
+        status: 'COMPLETED',
+        seconds: 2,
+      });
+      setOldestUnreconciledIntentAge({ network: 'testnet', seconds: 10 });
+
+      const text = renderLedgerMetrics();
+      expect(text).toContain('submission_to_finality_seconds');
+      expect(text).toContain('oldest_unreconciled_intent_age_seconds');
+      expect(text).not.toMatch(/user_?id/i);
+      expect(text).not.toMatch(/intent_?id/i);
     });
   });
 });

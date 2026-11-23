@@ -1,5 +1,17 @@
 FROM node:20-alpine
 
+# Tooling required by the fault-injection and cold-start test stacks:
+# - bash: entrypoint scripts that delay dependencies / gate worker activation
+# - curl: readiness and health probes
+# - netcat-openbsd: wait-for-port helpers used to model delayed Postgres/Redis
+# - postgresql-client / redis: connectivity checks against disposable services
+RUN apk add --no-cache \
+    bash \
+    curl \
+    netcat-openbsd \
+    postgresql-client \
+    redis
+
 WORKDIR /app
 
 COPY package*.json ./
@@ -13,4 +25,8 @@ COPY . .
 # Matches PORT in the api-test service and its healthcheck.
 EXPOSE 5001
 
-CMD ["node", "server.js"]
+# Allow the test stacks to override the startup command so they can delay
+# dependencies and gate worker activation. Defaults to the normal server.
+ENV STARTUP_COMMAND="node server.js"
+
+CMD ["sh", "-c", "$STARTUP_COMMAND"]

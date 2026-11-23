@@ -12,7 +12,16 @@ services:
     dockerContext: .
     autoDeployTrigger: commit
     plan: starter
-    healthCheckPath: /health
+    # Route traffic only once the service is ready to serve it. The readiness
+    # probe (/health/ready) reports 200 only after initialization has completed
+    # and required dependencies (e.g. the database) are reachable, so Render
+    # keeps the previous instance serving traffic until the new one is ready.
+    # Startup and liveness are handled separately:
+    #   - /health/startup: succeeds once initialization completes; a generous
+    #     startup grace period ensures slow boots are not killed.
+    #   - /health/live:    succeeds as long as the process is not deadlocked;
+    #     failures cause the process to be restarted.
+    healthCheckPath: /health/ready
     envVars:
       - key: NODE_ENV
         value: production
@@ -24,6 +33,19 @@ services:
       # serving traffic with an out-of-sync schema.
       - key: MIGRATION_POLICY
         value: strict
+      # Probe semantics: initialization must complete within the startup grace
+      # period before liveness/readiness are enforced. Keep this generous so
+      # slow startups (migrations, cold caches) are not killed.
+      - key: HEALTH_STARTUP_GRACE_MS
+        value: "120000"
+      # Liveness: the process is considered deadlocked/unhealthy if it fails to
+      # respond within this window, triggering a restart.
+      - key: HEALTH_LIVENESS_TIMEOUT_MS
+        value: "5000"
+      # Readiness: dependencies (database) must respond within this window for
+      # the instance to be considered ready to receive traffic.
+      - key: HEALTH_READINESS_TIMEOUT_MS
+        value: "3000"
       - key: DATABASE_URL
         fromDatabase:
           name: stellar-tags-db
