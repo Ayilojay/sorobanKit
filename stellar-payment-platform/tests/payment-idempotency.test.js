@@ -5,10 +5,18 @@ const request = require('supertest');
 
 const mockPaymentIntentCreate = jest.fn();
 const mockTransaction = jest.fn();
+const mockIdempotencyFindUnique = jest.fn();
+const mockIdempotencyCreate = jest.fn();
+const mockIdempotencyDelete = jest.fn();
 
 jest.mock('../prismaClient', () => ({
   prisma: {
     paymentIntent: { create: mockPaymentIntentCreate },
+    idempotencyRecord: {
+      findUnique: mockIdempotencyFindUnique,
+      create: mockIdempotencyCreate,
+      delete: mockIdempotencyDelete,
+    },
     $transaction: mockTransaction,
   },
 }));
@@ -29,12 +37,48 @@ const baseIntent = {
 };
 
 describe('payment intent creation idempotency', () => {
+  // In-memory store emulating the unique constraint on the idempotency key.
+  let idempotencyStore;
+
   beforeEach(() => {
     jest.clearAllMocks();
+    idempotencyStore = new Map();
+
     mockPaymentIntentCreate.mockImplementation(({ data }) =>
       Promise.resolve({ id: 'intent-1', externalId: data.externalId, metadata: data.metadata }),
     );
-    mockTransaction.mockImplementation((operations) => Promise.all(operations));
+
+    mockIdempotencyFindUnique.mockImplementation(({ where }) =>
+      Promise.resolve(idempotencyStore.get(where.key) || null),
+    );
+
+    mockIdempotencyCreate.mockImplementation(({ data }) => {
+      if (idempotencyStore.has(data.key)) {
+        const err = new Error('Unique constraint failed on the fields: (`key`)');
+        err.code = 'P2002';
+        return Promise.reject(err);
+      }
+      const record = { ...data };
+      idempotencyStore.set(data.key, record);
+      return Promise.resolve(record);
+    });
+
+    mockIdempotencyDelete.mockImplementation(({ where }) => {
+      idempotencyStore.delete(where.key);
+      return Promise.resolve({});
+    });
+
+    // Transaction boundary: on failure, roll back any idempotency record
+    // written during the transaction so no orphaned record remains.
+    mockTransaction.mockImplementation(async (operations) => {
+      const snapshot = new Map(idempotencyStore);
+      try {
+        return await Promise.all(operations);
+      } catch (err) {
+        idempotencyStore = snapshot;
+        throw err;
+      }
+    });
   });
 
   const buildApp = () => {

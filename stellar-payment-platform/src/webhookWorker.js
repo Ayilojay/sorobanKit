@@ -549,7 +549,45 @@ const formatAsset = (payment) => {
   return `${payment.asset_code}:${payment.asset_issuer}`;
 };
 
-const dispatchPaymentWebhooks = async ({ prisma, poolGetFn, payment, queue }) => {
+const buildPaymentWebhookPayload = (payment, recipientAddress) => ({
+  event: 'payment.received',
+  event_id: `${payment.transaction_hash || ''}-${payment.id || crypto.randomBytes(8).toString('hex')}`,
+  timestamp: new Date().toISOString(),
+  network: process.env.HORIZON_NETWORK || 'testnet',
+  data: {
+    transaction_hash: payment.transaction_hash || null,
+    from: payment.from || null,
+    to: recipientAddress,
+    amount: payment.amount || null,
+    asset: formatAsset(payment),
+    asset_type: payment.asset_type || 'native',
+    asset_code: payment.asset_code || null,
+    asset_issuer: payment.asset_issuer || null,
+    created_at: payment.created_at || null,
+    paging_token: payment.paging_token || null,
+    metadata: payment.metadata ?? null,
+  },
+});
+
+/**
+ * Dispatch payment webhooks.
+ *
+ * When `prisma` is provided the domain event is first persisted to the
+ * transactional outbox (versioned row) so it survives crashes and can be
+ * reconciled. The outbox row is then dispatched (bounded retries) and, on
+ * success, the legacy BullMQ delivery is enqueued for each subscribed webhook.
+ *
+ * Passing `{ outboxOnly: true }` skips the BullMQ enqueue entirely, which is
+ * useful when the outbox dispatcher itself performs the HTTP delivery.
+ */
+const dispatchPaymentWebhooks = async ({
+  prisma,
+  poolGetFn,
+  payment,
+  queue,
+  outboxOnly = false,
+  tx,
+}) => {
   if (!payment || (payment.type !== 'payment' && payment.type_i !== 1)) return;
 
   const recipientAddress = payment.to;
@@ -558,37 +596,111 @@ const dispatchPaymentWebhooks = async ({ prisma, poolGetFn, payment, queue }) =>
   const webhooks = await fetchWebhooksForAddress(prisma, poolGetFn, recipientAddress);
   if (!webhooks.length) return;
 
-  const payload = {
-    event: 'payment.received',
-    event_id: `${payment.transaction_hash || ''}-${payment.id || crypto.randomBytes(8).toString('hex')}`,
-    timestamp: new Date().toISOString(),
-    network: process.env.HORIZON_NETWORK || 'testnet',
-    data: {
-      transaction_hash: payment.transaction_hash || null,
-      from: payment.from || null,
-      to: recipientAddress,
-      amount: payment.amount || null,
-      asset: formatAsset(payment),
-      asset_type: payment.asset_type || 'native',
-      asset_code: payment.asset_code || null,
-      asset_issuer: payment.asset_issuer || null,
-      created_at: payment.created_at || null,
-      paging_token: payment.paging_token || null,
-      metadata: payment.metadata ?? null,
-    },
-  };
+  const payload = buildPaymentWebhookPayload(payment, recipientAddress);
 
-  const deliveryQueue = queue || getWebhookQueue();
-  await Promise.all(webhooks.map(async (webhook) => {
+  const subscribedWebhooks = webhooks.filter((webhook) => {
     if (!webhookEventMatches(webhook, payload.event)) {
       logger.info(`[webhook-worker] Skipping webhook id=${webhook.id} url=${webhook.url} for event=${payload.event} due to subscription filter`);
-      return;
+      return false;
     }
+    return true;
+  });
+
+  if (!subscribedWebhooks.length) return;
+
+  // ── Transactional outbox ────────────────────────────────────────────────
+  // Persist the domain event in the same transaction as the domain change so
+  // it is never lost if the process crashes before the queue enqueue.
+  let outboxEvent = null;
+  if (prisma) {
+    try {
+      outboxEvent = await enqueueOutboxEvent(prisma, {
+        eventType: payload.event,
+        aggregateType: 'payment',
+        aggregateId: payment.id || payment.transaction_hash || payload.event_id,
+        payload: {
+          ...payload,
+          webhook_ids: subscribedWebhooks.map((w) => w.id),
+        },
+        tx,
+      });
+      logger.info(
+        `[outbox] Persisted event=${payload.event_id} outbox_id=${outboxEvent?.id} version=${outboxEvent?.version}`,
+      );
+    } catch (error) {
+      logger.error(`[outbox] Failed to persist event=${payload.event_id}: ${error.message}`);
+      throw error;
+    }
+  }
+
+  if (outboxOnly) return outboxEvent;
+
+  const deliveryQueue = queue || getWebhookQueue();
+  await Promise.all(subscribedWebhooks.map(async (webhook) => {
     await enqueueWebhookDelivery(webhook, payload, deliveryQueue);
     logger.info(
       `[webhook-queue] Enqueued event=${payload.event_id} webhook=${webhook.id} recipient=${recipientAddress}`,
     );
   }));
+
+  return outboxEvent;
+};
+
+/**
+ * Process a single outbox row: deliver to every subscribed webhook and mark
+ * the row processed. Redeliveries are idempotent because BullMQ job ids are
+ * derived from (webhookId, eventId) and the outbox row is only marked
+ * processed once all deliveries are enqueued.
+ */
+const processOutboxEvent = async (prisma, poolRunFn, event, { queue } = {}) => {
+  if (!event) return { ok: false, error: 'missing outbox event' };
+  if (event.status === OUTBOX_STATUS.PROCESSED) {
+    logger.info(`[outbox] Skipping already-processed event=${event.id} version=${event.version}`);
+    return { ok: true, skipped: true };
+  }
+
+  const payload = typeof event.payload === 'string' ? JSON.parse(event.payload) : event.payload;
+  const webhookIds = Array.isArray(payload?.webhook_ids) ? payload.webhook_ids : null;
+
+  try {
+    const webhooks = await prisma.webhook.findMany({
+      where: webhookIds ? { id: { in: webhookIds } } : undefined,
+      select: { id: true, username: true, url: true, secret: true, events: true, failingSince: true },
+    });
+
+    const deliveryQueue = queue || getWebhookQueue();
+    await Promise.all((webhooks || []).map(async (webhook) => {
+      if (!webhookEventMatches(webhook, payload.event)) return;
+      await enqueueWebhookDelivery(webhook, payload, deliveryQueue);
+    }));
+
+    await markOutboxProcessed(prisma, poolRunFn, event.id);
+    logger.info(`[outbox] Processed event=${event.id} version=${event.version}`);
+    return { ok: true };
+  } catch (error) {
+    await markOutboxFailed(prisma, poolRunFn, event.id, error.message);
+    logger.error(`[outbox] Failed event=${event.id} version=${event.version}: ${error.message}`);
+    return { ok: false, error: error.message };
+  }
+};
+
+/**
+ * Drain a batch of pending outbox rows with bounded retries.
+ */
+const dispatchPendingOutboxEvents = async (prisma, poolRunFn, { limit = 50, queue } = {}) => {
+  return dispatchOutboxBatch(prisma, poolRunFn, {
+    limit,
+    maxAttempts: MAX_OUTBOX_ATTEMPTS,
+    handler: (event) => processOutboxEvent(prisma, poolRunFn, event, { queue }),
+  });
+};
+
+/**
+ * Reconciliation query: return outbox rows that are stuck (pending past the
+ * threshold or failed after exhausting retries) so operators can replay them.
+ */
+const getStuckOutboxEvents = async (prisma, poolRunFn, opts = {}) => {
+  return findStuckOutboxEvents(prisma, poolRunFn, opts);
 };
 
 /**
@@ -865,6 +977,10 @@ module.exports = {
   awaitInFlightJobs,
   processWebhookJob,
   applyWebhookPaymentIntentStatus,
+  processOutboxEvent,
+  dispatchPendingOutboxEvents,
+  getStuckOutboxEvents,
+  buildPaymentWebhookPayload,
   sendWebhook,
   computeSignature,
   detectSsrfTarget,
@@ -881,6 +997,7 @@ module.exports = {
   WEBHOOK_SIGNATURE_ALIAS_REMOVAL_DATE,
   WEBHOOK_JOB_OPTIONS,
   MAX_RETRY_BACKLOG_DAYS,
+  MAX_OUTBOX_ATTEMPTS,
   getWebhooksExhaustedRetries,
   moveToDLQ,
   listDLQEntries,

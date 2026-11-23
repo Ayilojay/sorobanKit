@@ -29,6 +29,20 @@ const { logger } = require('./logger');
 const PROJECT_ROOT = path.join(__dirname, '..');
 const PRISMA_BIN = path.join(PROJECT_ROOT, 'node_modules', '.bin', 'prisma');
 
+/** Directory holding the Prisma migration folders. */
+const MIGRATIONS_DIR = path.join(PROJECT_ROOT, 'prisma', 'migrations');
+
+/**
+ * Manifest of applied migration names + checksums. Overridable so tests and
+ * deployments can point at a different location.
+ */
+const MANIFEST_PATH =
+  process.env.MIGRATION_MANIFEST_PATH ||
+  path.join(PROJECT_ROOT, 'prisma', 'migrations.manifest.json');
+
+/** Manifest schema version, bumped if the on-disk format ever changes. */
+const MANIFEST_VERSION = 1;
+
 /** How long to wait for `prisma migrate status` before giving up. */
 const MIGRATION_CHECK_TIMEOUT_MS =
   parseInt(process.env.MIGRATION_CHECK_TIMEOUT_MS, 10) || 30_000;
@@ -460,6 +474,196 @@ function preflightMigrationFile(filePath, params = {}) {
 }
 
 /**
+ * Computes the SHA-256 checksum of a buffer or string.
+ * @param {Buffer|string} data
+ * @returns {string} lowercase hex digest
+ */
+function sha256(data) {
+  return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+/**
+ * Recursively lists every regular file under `dir`, returning paths relative to
+ * `dir` with forward slashes so checksums are stable across platforms.
+ * @param {string} dir
+ * @param {string} [base]
+ * @returns {string[]}
+ */
+function listFilesRecursive(dir, base = dir) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return [];
+    throw err;
+  }
+
+  const files = [];
+  for (const entry of entries) {
+    const abs = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...listFilesRecursive(abs, base));
+    } else if (entry.isFile()) {
+      files.push(path.relative(base, abs).split(path.sep).join('/'));
+    }
+  }
+  return files.sort();
+}
+
+/**
+ * Computes SHA-256 checksums for every file inside each migration folder.
+ *
+ * @param {string} [migrationsDir]
+ * @returns {Array<{ name: string, checksum: string, files: Record<string,string> }>}
+ *   One entry per migration directory, sorted by name. `checksum` is a digest
+ *   over the sorted per-file digests so it changes if any file changes.
+ */
+function computeMigrationChecksums(migrationsDir = MIGRATIONS_DIR) {
+  let entries;
+  try {
+    entries = fs.readdirSync(migrationsDir, { withFileTypes: true });
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return [];
+    throw err;
+  }
+
+  const migrations = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const dir = path.join(migrationsDir, entry.name);
+    const files = {};
+    for (const rel of listFilesRecursive(dir)) {
+      files[rel] = sha256(fs.readFileSync(path.join(dir, rel)));
+    }
+    const combined = Object.keys(files)
+      .sort()
+      .map((rel) => `${rel}:${files[rel]}`)
+      .join('\n');
+    migrations.push({ name: entry.name, checksum: sha256(combined), files });
+  }
+
+  return migrations.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}
+
+/**
+ * Loads the persisted manifest from disk. Returns an empty manifest when the
+ * file is missing or unreadable so callers can treat it as "nothing recorded".
+ *
+ * @param {string} [manifestPath]
+ * @returns {{ version: number, migrations: Array<{ name: string, checksum: string }> }}
+ */
+function loadManifest(manifestPath = MANIFEST_PATH) {
+  try {
+    const raw = fs.readFileSync(manifestPath, 'utf8');
+    const parsed = JSON.parse(raw);
+    const migrations = Array.isArray(parsed && parsed.migrations) ? parsed.migrations : [];
+    return {
+      version: (parsed && parsed.version) || MANIFEST_VERSION,
+      migrations: migrations
+        .filter((m) => m && typeof m.name === 'string' && typeof m.checksum === 'string')
+        .map((m) => ({ name: m.name, checksum: m.checksum })),
+    };
+  } catch (err) {
+    if (err && (err.code === 'ENOENT' || err instanceof SyntaxError)) {
+      return { version: MANIFEST_VERSION, migrations: [] };
+    }
+    throw err;
+  }
+}
+
+/**
+ * Persists the manifest to disk atomically (write temp file + rename).
+ * @param {{ version?: number, migrations: Array<{ name: string, checksum: string }> }} manifest
+ * @param {string} [manifestPath]
+ * @returns {string} the path written
+ */
+function saveManifest(manifest, manifestPath = MANIFEST_PATH) {
+  const payload = {
+    version: manifest.version || MANIFEST_VERSION,
+    migrations: (manifest.migrations || []).map((m) => ({
+      name: m.name,
+      checksum: m.checksum,
+    })),
+  };
+  const tmp = `${manifestPath}.${process.pid}.tmp`;
+  fs.mkdirSync(path.dirname(manifestPath), { recursive: true });
+  fs.writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+  fs.renameSync(tmp, manifestPath);
+  return manifestPath;
+}
+
+/**
+ * Compares the current migration files against the recorded manifest.
+ *
+ * Read-only: never writes to disk or the database.
+ *
+ * @param {{
+ *   migrations?: Array<{ name: string, checksum: string }>,
+ *   manifest?: { migrations: Array<{ name: string, checksum: string }> },
+ * }} [options]
+ * @returns {{
+ *   schemaVersion: string | null,
+ *   changed: string[],
+ *   missing: string[],
+ *   extra: string[],
+ *   unrecorded: string[],
+ *   drift: boolean,
+ * }}
+ */
+function compareManifest({ migrations, manifest } = {}) {
+  const current = migrations || computeMigrationChecksums();
+  const recorded = (manifest || loadManifest()).migrations || [];
+
+  const currentByName = new Map(current.map((m) => [m.name, m.checksum]));
+  const recordedByName = new Map(recorded.map((m) => [m.name, m.checksum]));
+
+  const changed = [];
+  const missing = [];
+  const extra = [];
+  const unrecorded = [];
+
+  for (const [name, checksum] of recordedByName) {
+    if (!currentByName.has(name)) {
+      missing.push(name);
+    } else if (currentByName.get(name) !== checksum) {
+      changed.push(name);
+    }
+  }
+  for (const name of currentByName.keys()) {
+    if (!recordedByName.has(name)) unrecorded.push(name);
+  }
+  for (const name of recordedByName.keys()) {
+    if (!currentByName.has(name)) extra.push(name);
+  }
+
+  // Highest migration name present in the manifest is the deployed version.
+  const appliedNames = recorded.map((m) => m.name).sort();
+  const schemaVersion = appliedNames.length ? appliedNames[appliedNames.length - 1] : null;
+
+  return {
+    schemaVersion,
+    changed: changed.sort(),
+    missing: missing.sort(),
+    extra: extra.sort(),
+    unrecorded: unrecorded.sort(),
+    drift: changed.length > 0 || missing.length > 0,
+  };
+}
+
+/**
+ * Builds a read-only report of the deployed schema version and any checksum
+ * drift. Never mutates the manifest or the database.
+ *
+ * @param {{ migrationsDir?: string, manifestPath?: string }} [options]
+ * @returns {ReturnType<typeof compareManifest>}
+ */
+function getSchemaReport({ migrationsDir = MIGRATIONS_DIR, manifestPath = MANIFEST_PATH } = {}) {
+  const migrations = computeMigrationChecksums(migrationsDir);
+  const manifest = loadManifest(manifestPath);
+  return compareManifest({ migrations, manifest });
+}
+
+/**
  * Resolves the active migration policy from MIGRATION_POLICY, defaulting to
  * the permissive "warn" mode.
  * @returns {'strict' | 'warn' | 'off'}
@@ -585,6 +789,15 @@ async function checkMigrations() {
     return { policy, status: 'skipped', pending: false, drift: false, skipped: true, output: '' };
   }
 
+  // Checksum manifest comparison is read-only and independent of the CLI, so
+  // run it first; a failure here must never block startup.
+  let schemaReport = null;
+  try {
+    schemaReport = getSchemaReport();
+  } catch (err) {
+    logger.warn(err, '[migrate-check] Could not compute migration checksum manifest');
+  }
+
   let raw;
   try {
     raw = await runMigrateStatus();
@@ -592,10 +805,28 @@ async function checkMigrations() {
     // The CLI itself failed to spawn (missing binary, EACCES...). Do not block
     // startup but surface it so operators can investigate.
     logger.warn(err, '[migrate-check] Could not run "prisma migrate status" — skipping check');
-    return { policy, status: 'error', pending: false, drift: false, skipped: true, output: err.message };
+    return {
+      policy,
+      status: 'error',
+      pending: false,
+      drift: false,
+      skipped: true,
+      output: err.message,
+      schemaReport,
+    };
   }
 
-  return { policy, ...classifyStatus(raw), skipped: false };
+  const classified = classifyStatus(raw);
+  // Fold checksum drift into the CLI classification so a changed historical
+  // migration is treated exactly like schema drift.
+  const checksumDrift = Boolean(schemaReport && schemaReport.drift);
+  return {
+    policy,
+    ...classified,
+    drift: classified.drift || checksumDrift,
+    skipped: false,
+    schemaReport,
+  };
 }
 
 /**
@@ -605,7 +836,7 @@ async function checkMigrations() {
  * @returns {{ shouldExit: boolean }}
  */
 function enforceMigrationPolicy(result) {
-  const { policy, status, pending, skipped, output } = result;
+  const { policy, status, pending, skipped, output, schemaReport } = result;
 
   if (skipped) {
     return { shouldExit: false };
@@ -613,7 +844,28 @@ function enforceMigrationPolicy(result) {
 
   const trimmed = (output || '').trim();
 
-  if (status === 'up-to-date') {
+  // Surface the deployed schema version and any checksum drift regardless of
+  // the CLI classification.
+  if (schemaReport) {
+    const version = schemaReport.schemaVersion || '(none recorded)';
+    if (schemaReport.drift) {
+      const details = [];
+      if (schemaReport.changed.length) {
+        details.push(`changed: ${schemaReport.changed.join(', ')}`);
+      }
+      if (schemaReport.missing.length) {
+        details.push(`missing: ${schemaReport.missing.join(', ')}`);
+      }
+      logger.warn(
+        `[migrate-check] Migration checksum drift detected (schema version ${version}). ` +
+          `Historical migration files no longer match the manifest — ${details.join('; ')}.`
+      );
+    } else {
+      logger.info(`[migrate-check] Deployed schema version: ${version}.`);
+    }
+  }
+
+  if (status === 'up-to-date' && !(schemaReport && schemaReport.drift)) {
     logger.info('[migrate-check] Prisma migrations are up to date.');
     return { shouldExit: false };
   }

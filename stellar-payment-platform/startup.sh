@@ -85,7 +85,21 @@ else
   echo "Running database migrations..."
   # Automatically resolve the duplicate soft_deletes migration that failed on Render
   "$PRISMA" migrate resolve --applied 20260829000000_soft_deletes || true
-  "$PRISMA" migrate deploy
+  # Run migrations through the advisory-lock runner so concurrent replicas
+  # serialize: only one instance applies migrations while the others wait for
+  # the lock (bounded by MIGRATION_LOCK_TIMEOUT) and then observe the applied
+  # state. The runner emits structured owner/wait/failure logs and always
+  # releases the lock, including on failure.
+  set +e
+  node src/migrationRunner.js
+  MIGRATION_RUNNER_EXIT=$?
+  set -e
+  if [ "$MIGRATION_RUNNER_EXIT" -ne 0 ]; then
+    echo "ERROR: Migration runner failed with exit code $MIGRATION_RUNNER_EXIT." >&2
+    # Propagate the failure so Docker health checks observe it instead of the
+    # container silently starting against a partially migrated schema.
+    exit "$MIGRATION_RUNNER_EXIT"
+  fi
   echo "Verifying migration status..."
   # Capture the migration check's exit code so a strict-policy drift failure is
   # propagated to Docker instead of being swallowed by `set -e` or npm start.

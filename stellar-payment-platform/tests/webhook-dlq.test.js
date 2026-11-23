@@ -63,6 +63,14 @@ beforeEach(() => {
     count: jest.fn().mockResolvedValue(0),
   };
   prisma.$transaction = jest.fn(async (queries) => Promise.all(queries));
+  prisma.outboxEvent = {
+    findMany: jest.fn().mockResolvedValue([]),
+    findUnique: jest.fn().mockResolvedValue(null),
+    create: jest.fn().mockResolvedValue({}),
+    update: jest.fn().mockResolvedValue({}),
+    updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+    count: jest.fn().mockResolvedValue(0),
+  };
 });
 
 describe('emitQueueHealthMetrics', () => {
@@ -455,5 +463,165 @@ describe('replayFromDLQ', () => {
       ok: false,
       error: 'DLQ entry has already been replayed',
     });
+  });
+});
+
+describe('outbox integration with DLQ (#391)', () => {
+  const buildOutboxEvent = (overrides = {}) => ({
+    id: 'ob-1',
+    eventType: 'payment.received',
+    aggregateType: 'payment',
+    aggregateId: 'pay-1',
+    payload: JSON.stringify({ event: 'payment.received', amount: '10.00' }),
+    version: 1,
+    status: 'PENDING',
+    attempts: 5,
+    maxAttempts: 5,
+    nextAttemptAt: new Date(Date.now() - 60 * 1000),
+    lastError: 'Webhook responded with HTTP 503',
+    processedAt: null,
+    ...overrides,
+  });
+
+  it('promotes outbox events that exhausted retries into the DLQ', async () => {
+    const event = buildOutboxEvent();
+    prisma.outboxEvent.findMany.mockResolvedValue([event]);
+    prisma.webhookDLQ.create.mockResolvedValue({ id: 'dlq-ob-1', outboxEventId: 'ob-1' });
+    prisma.outboxEvent.update.mockResolvedValue({ ...event, status: 'DEAD_LETTERED' });
+
+    const result = await promoteExhaustedOutboxEvents(prisma, async () => {});
+
+    expect(result.promoted).toBe(1);
+    expect(prisma.outboxEvent.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          status: 'PENDING',
+          attempts: expect.objectContaining({ gte: expect.any(Number) }),
+        }),
+      }),
+    );
+    const createData = prisma.webhookDLQ.create.mock.calls[0][0].data;
+    expect(createData.outboxEventId).toBe('ob-1');
+    expect(createData.eventType).toBe('payment.received');
+    expect(createData.failureReason).toContain('outbox');
+    expect(prisma.outboxEvent.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'ob-1' },
+        data: expect.objectContaining({ status: 'DEAD_LETTERED' }),
+      }),
+    );
+  });
+
+  it('does not promote outbox events that still have retries remaining', async () => {
+    prisma.outboxEvent.findMany.mockResolvedValue([]);
+
+    const result = await promoteExhaustedOutboxEvents(prisma, async () => {});
+
+    expect(result.promoted).toBe(0);
+    expect(prisma.webhookDLQ.create).not.toHaveBeenCalled();
+  });
+
+  it('replays an outbox-backed DLQ entry and marks the outbox event processed idempotently', async () => {
+    const entry = {
+      id: 'dlq-ob-1',
+      webhookId: 'wh-1',
+      outboxEventId: 'ob-1',
+      webhookUrl: 'https://example.com/hook',
+      webhookSecret: 'secret-abc',
+      eventType: 'payment.received',
+      eventPayload: JSON.stringify({ event: 'payment.received' }),
+      replayed: false,
+      deliveryAttempts: 0,
+    };
+    const outboxEvent = buildOutboxEvent({ status: 'DEAD_LETTERED' });
+
+    prisma.webhookDLQ.findUnique.mockResolvedValue(entry);
+    prisma.webhookDLQ.update.mockResolvedValue({ ...entry, replayed: true });
+    prisma.outboxEvent.findUnique.mockResolvedValue(outboxEvent);
+    prisma.outboxEvent.updateMany.mockResolvedValue({ count: 1 });
+
+    const result = await replayOutboxEvent(prisma, async () => {}, 'dlq-ob-1');
+
+    expect(result.ok).toBe(true);
+    expect(global.fetch).toHaveBeenCalledWith(
+      entry.webhookUrl,
+      expect.objectContaining({ method: 'POST', body: entry.eventPayload }),
+    );
+    // Idempotent transition guarded on current status
+    expect(prisma.outboxEvent.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          id: 'ob-1',
+          status: expect.objectContaining({ in: expect.any(Array) }),
+        }),
+        data: expect.objectContaining({
+          status: 'PROCESSED',
+          processedAt: expect.any(Date),
+        }),
+      }),
+    );
+  });
+
+  it('treats an already-processed outbox event as an idempotent no-op on replay', async () => {
+    const entry = {
+      id: 'dlq-ob-1',
+      webhookId: 'wh-1',
+      outboxEventId: 'ob-1',
+      webhookUrl: 'https://example.com/hook',
+      webhookSecret: 'secret-abc',
+      eventPayload: JSON.stringify({ event: 'payment.received' }),
+      replayed: false,
+      deliveryAttempts: 0,
+    };
+
+    prisma.webhookDLQ.findUnique.mockResolvedValue(entry);
+    prisma.webhookDLQ.update.mockResolvedValue({ ...entry, replayed: true });
+    prisma.outboxEvent.findUnique.mockResolvedValue(
+      buildOutboxEvent({ status: 'PROCESSED', processedAt: new Date() }),
+    );
+    // Guarded update matches nothing because the event is already processed
+    prisma.outboxEvent.updateMany.mockResolvedValue({ count: 0 });
+
+    const result = await replayOutboxEvent(prisma, async () => {}, 'dlq-ob-1');
+
+    expect(result.ok).toBe(true);
+    expect(result.alreadyProcessed).toBe(true);
+    expect(prisma.outboxEvent.updateMany).toHaveBeenCalled();
+  });
+
+  it('does not mark the outbox event processed when replay delivery fails', async () => {
+    const entry = {
+      id: 'dlq-ob-1',
+      webhookId: 'wh-1',
+      outboxEventId: 'ob-1',
+      webhookUrl: 'https://example.com/hook',
+      webhookSecret: 'secret-abc',
+      eventPayload: JSON.stringify({ event: 'payment.received' }),
+      replayed: false,
+      deliveryAttempts: 1,
+    };
+
+    prisma.webhookDLQ.findUnique.mockResolvedValue(entry);
+    prisma.webhookDLQ.update.mockResolvedValue({ ...entry, deliveryAttempts: 2 });
+    prisma.outboxEvent.findUnique.mockResolvedValue(buildOutboxEvent({ status: 'DEAD_LETTERED' }));
+    global.fetch.mockRejectedValue(new Error('Connection refused'));
+
+    const result = await replayOutboxEvent(prisma, async () => {}, 'dlq-ob-1');
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('Connection refused');
+    expect(prisma.outboxEvent.updateMany).not.toHaveBeenCalled();
+    const updateCall = prisma.webhookDLQ.update.mock.calls[0][0];
+    expect(updateCall.data.deliveryAttempts).toBe(2);
+  });
+
+  it('returns an error when the outbox-backed DLQ entry does not exist', async () => {
+    prisma.webhookDLQ.findUnique.mockResolvedValue(null);
+
+    const result = await replayOutboxEvent(prisma, async () => {}, 'missing');
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe('DLQ entry not found');
+    expect(prisma.outboxEvent.updateMany).not.toHaveBeenCalled();
   });
 });
