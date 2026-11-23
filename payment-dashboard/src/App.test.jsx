@@ -17,8 +17,21 @@ import {
   PAYMENT_COORDINATION_TTL_MS,
 } from './paymentCoordinator';
 
+const mockNavigate = vi.fn();
+let mockPathname = '/';
+
+vi.mock('react-router-dom', async () => {
+  const actual = await vi.importActual('react-router-dom');
+  return {
+    ...actual,
+    useNavigate: () => mockNavigate,
+    useLocation: () => ({ pathname: mockPathname, search: '', hash: '', state: null }),
+  };
+});
+
 const STORAGE_KEY = 'stellar_dashboard_wallet_pubkey';
 const PENDING_KEY = 'stellar_dashboard_pending_payment';
+const DRAFT_KEY = 'stellar_dashboard_payment_draft';
 const TEST_PUBLIC_KEY = 'GABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUV';
 const OTHER_PUBLIC_KEY = 'GZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ';
 
@@ -70,6 +83,7 @@ describe('App wallet persistence', () => {
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
+    mockPathname = '/';
   });
 
   afterEach(() => {
@@ -126,6 +140,7 @@ describe('App network mismatch signing guard', () => {
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
+    mockPathname = '/';
   });
 
   afterEach(() => {
@@ -174,6 +189,7 @@ describe('App pre-sign simulation review', () => {
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
+    mockPathname = '/';
     localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
     freighterApi.isConnected.mockResolvedValue({ isConnected: true });
     freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
@@ -230,6 +246,7 @@ describe('App human-readable review from exact transaction XDR', () => {
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
+    mockPathname = '/';
     localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
     freighterApi.isConnected.mockResolvedValue({ isConnected: true });
     freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });
@@ -297,6 +314,7 @@ describe('App pending payment resume after reload', () => {
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
+    mockPathname = '/';
     localStorage.setItem(STORAGE_KEY, TEST_PUBLIC_KEY);
     freighterApi.isConnected.mockResolvedValue({ isConnected: true });
     freighterApi.getPublicKey.mockResolvedValue({ publicKey: TEST_PUBLIC_KEY });

@@ -37,18 +37,24 @@ vi.mock('@creit.tech/stellar-wallets-kit', () => {
 import RegistrationPage from './RegistrationPage';
 
 const PUBLIC_KEY = 'GABC1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890AB';
+const OTHER_PUBLIC_KEY = 'GXYZ9876543210ZYXWVU9876543210ZYXWVU9876543210ZYXWVU9876543210ZY';
 const noop = () => {};
+
+const DRAFT_STORAGE_KEY = 'payment-dashboard:registration-draft';
+const NETWORK = 'TESTNET';
 
 const SIGNING_CANCELLED_MSG =
   'Transaction signing was cancelled or failed — no transaction was submitted.';
 
-const renderPage = (publicKey = PUBLIC_KEY) =>
+const renderPage = (publicKey = PUBLIC_KEY, extraProps = {}) =>
   render(
     <RegistrationPage
       userPublicKey={publicKey}
       setUserPublicKey={noop}
       onBack={noop}
       onRegistered={noop}
+      network={NETWORK}
+      {...extraProps}
     />,
   );
 
@@ -84,6 +90,7 @@ describe('RegistrationPage – signing-failure path', () => {
     cleanup();
     vi.clearAllMocks();
     vi.unstubAllGlobals();
+    window.localStorage.clear();
   });
 
   /** Fill in a valid username and click Register. */

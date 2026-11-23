@@ -71,7 +71,7 @@ describe('AnalyticsPage', () => {
     vi.unstubAllGlobals();
   });
 
-  it('shows an error banner on fetch failure and clears it after a successful retry', async () => {
+  it('shows an accessible error state on fetch failure and clears it after a successful retry', async () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: false, status: 500 });
     vi.stubGlobal('fetch', fetchMock);
     vi.stubGlobal('matchMedia', () => ({
@@ -84,6 +84,7 @@ describe('AnalyticsPage', () => {
 
     const alert = await screen.findByRole('alert');
     expect(alert.textContent).toContain('Horizon error (500).');
+    expect(alert.getAttribute('aria-live')).toBe('assertive');
     expect(screen.queryByText('Flow volume')).toBeNull();
 
     const callsBeforeRetry = fetchMock.mock.calls.length;
@@ -97,6 +98,50 @@ describe('AnalyticsPage', () => {
     await waitFor(() => expect(screen.queryByRole('alert')).toBeNull());
     expect(fetchMock.mock.calls.length).toBeGreaterThan(callsBeforeRetry);
     expect(screen.getByText('Flow volume')).toBeTruthy();
+  });
+
+  it('distinguishes an empty result from an error and keeps the page usable', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ _embedded: { records: [] } }),
+    }));
+    vi.stubGlobal('matchMedia', () => ({
+      matches: true,
+      addListener: noop,
+      removeListener: noop,
+    }));
+
+    renderPage();
+
+    const empty = await screen.findByRole('status');
+    expect(empty.textContent).toContain('No activity');
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByText('Flow volume')).toBeTruthy();
+  });
+
+  it('preserves usable content when a secondary request fails', async () => {
+    const fetchMock = vi.fn((url) => {
+      if (String(url).includes('payments')) {
+        return Promise.resolve({ ok: false, status: 503 });
+      }
+      return Promise.resolve({
+        ok: true,
+        json: async () => ({ _embedded: { records: [] } }),
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('matchMedia', () => ({
+      matches: true,
+      addListener: noop,
+      removeListener: noop,
+    }));
+
+    renderPage();
+
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('Horizon error (503).');
+    expect(screen.getByText('Flow volume')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeTruthy();
   });
 
   it('shows the loading fallback while the lazy AnalyticsPage chunk loads', async () => {
@@ -122,7 +167,9 @@ describe('AnalyticsPage', () => {
       </Suspense>,
     );
 
-    expect(screen.getByRole('status').textContent).toBe('Loading analytics...');
+    const status = screen.getByRole('status');
+    expect(status.textContent).toBe('Loading analytics...');
+    expect(status.getAttribute('aria-live')).toBe('polite');
     expect(screen.queryByText('Flow volume')).toBeNull();
 
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
@@ -293,5 +340,45 @@ describe('AnalyticsPage', () => {
     animated.forEach((node) => {
       expect(node.getAttribute('data-reduced-motion')).toBe('false');
     });
+  });
+});
+
+describe('shared state views', () => {
+  afterEach(cleanup);
+
+  it('renders an accessible empty state with a page-specific action', () => {
+    const onAction = vi.fn();
+    render(
+      <EmptyState
+        title="No activity"
+        description="Nothing to show yet."
+        actionLabel="Refresh"
+        onAction={onAction}
+      />,
+    );
+
+    const status = screen.getByRole('status');
+    expect(status.getAttribute('aria-live')).toBe('polite');
+    expect(screen.getByText('No activity')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+    expect(onAction).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders an accessible error state with retry', () => {
+    const onRetry = vi.fn();
+    render(<ErrorState message="Horizon error (500)." onRetry={onRetry} />);
+
+    const alert = screen.getByRole('alert');
+    expect(alert.getAttribute('aria-live')).toBe('assertive');
+    expect(alert.textContent).toContain('Horizon error (500).');
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(onRetry).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders an accessible loading state', () => {
+    render(<LoadingState label="Loading analytics..." />);
+    const status = screen.getByRole('status');
+    expect(status.getAttribute('aria-live')).toBe('polite');
+    expect(status.textContent).toContain('Loading analytics...');
   });
 });

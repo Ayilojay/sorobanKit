@@ -73,7 +73,14 @@ import Dashboard from './Dashboard';
 
 const PUBLIC_KEY = 'GABC1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890AB';
 const RECIPIENT_KEY = 'GBOB1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890AB';
+const OTHER_PUBLIC_KEY = 'GXYZ1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890AB';
+const DRAFT_STORAGE_KEY = 'stellar-tags:payment-draft';
 const noop = () => {};
+
+const readStoredDraft = () => {
+  const raw = window.localStorage.getItem(DRAFT_STORAGE_KEY);
+  return raw ? JSON.parse(raw) : null;
+};
 
 const SIGNING_CANCELLED_MSG =
   'Transaction signing was cancelled or failed — no transaction was submitted.';
@@ -129,6 +136,7 @@ describe('Dashboard – signing-failure path', () => {
     cleanup();
     vi.clearAllMocks();
     vi.unstubAllGlobals();
+    window.localStorage.clear();
   });
 
   /** Set up the federation fetch mock and the route_payment simulation. */

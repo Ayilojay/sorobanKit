@@ -8,6 +8,12 @@ import ScrollToTop from '../ScrollToTop';
 import MobileNav from './MobileNav';
 import Dialog from '../Dialog';
 import {
+  EmptyState,
+  ErrorState,
+  LoadingState,
+  PartialDataNotice,
+} from '../components/StateViews';
+import {
   ANALYTICS_MAX_PAGES,
   ANALYTICS_PAGE_LIMIT,
   ANALYTICS_REFRESH_MS,
@@ -71,6 +77,9 @@ function AnalyticsPage({
   });
   /** @type {[string | null, (value: string | null) => void]} */
   const [loadError, setLoadError] = useState(null);
+  /** @type {[string[], (value: string[]) => void]} */
+  const [partialErrors, setPartialErrors] = useState([]);
+  const [isLoading, setIsLoading] = useState(true);
   const [retryCount, setRetryCount] = useState(0);
   const [isLoading, setIsLoading] = useState(true);
   const [isOffline, setIsOffline] = useState(
@@ -287,6 +296,29 @@ function AnalyticsPage({
       return totalDelta / deltaCount;
     };
 
+    /**
+     * @param {() => Promise<number | null>} loader
+     * @param {string} label
+     * @returns {Promise<{ value: number | null, error: string | null }>}
+     */
+    const settleMetric = async (loader, label) => {
+      try {
+        return { value: await loader(), error: null };
+      } catch (error) {
+        if (error instanceof Error && error.name === "AbortError") {
+          throw error;
+        }
+
+        return {
+          value: null,
+          error:
+            error instanceof Error && error.message
+              ? `${label}: ${error.message}`
+              : `${label}: failed to load.`,
+        };
+      }
+    };
+
     const loadMetrics = async () => {
       if (currentController) {
         currentController.abort();
@@ -301,9 +333,18 @@ function AnalyticsPage({
       try {
         const [routingVolume, avgConfirmation, successRate] = await Promise.all(
           [
-            loadRoutingVolume(sinceMs, controller.signal),
-            loadAvgConfirmation(sinceMs, controller.signal),
-            loadSuccessRate(sinceMs, controller.signal),
+            settleMetric(
+              () => loadRoutingVolume(sinceMs, controller.signal),
+              "Flow volume",
+            ),
+            settleMetric(
+              () => loadAvgConfirmation(sinceMs, controller.signal),
+              "Avg confirmation",
+            ),
+            settleMetric(
+              () => loadSuccessRate(sinceMs, controller.signal),
+              "Routing reliability",
+            ),
           ],
         );
 
@@ -311,10 +352,14 @@ function AnalyticsPage({
           return;
         }
 
+        const failures = [routingVolume, avgConfirmation, successRate]
+          .map((result) => result.error)
+          .filter((message) => Boolean(message));
+
         setAnalyticsMetrics({
-          routingVolume,
-          avgConfirmation,
-          successRate,
+          routingVolume: routingVolume.value,
+          avgConfirmation: avgConfirmation.value,
+          successRate: successRate.value,
         });
         setLoadError(null);
         setCachedAt(null);
@@ -383,6 +428,15 @@ function AnalyticsPage({
     analyticsMetrics.successRate === null
       ? fallbackValue
       : analyticsMetrics.successRate.toFixed(1);
+  const hasAnyMetric =
+    analyticsMetrics.routingVolume !== null ||
+    analyticsMetrics.avgConfirmation !== null ||
+    analyticsMetrics.successRate !== null;
+  const isEmptyResult = !isLoading && !loadError && !hasAnyMetric;
+  const retryAnalytics = () => {
+    setIsLoading(true);
+    setRetryCount((count) => count + 1);
+  };
 
   const freshnessLabel =
     cachedAt === null
@@ -545,7 +599,7 @@ function AnalyticsPage({
           </section>
         )}
 
-        {!loadError && (
+        {!loadError && !isEmptyResult && (
           <section className="grid columns-3">
             <div className="card reveal" data-testid="analytics-metric-volume">
               <div className="card-header">

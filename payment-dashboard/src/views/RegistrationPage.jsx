@@ -5,6 +5,104 @@ import { useConnectivity } from '../hooks/useConnectivity';
 
 const USERNAME_REGEX = /^[a-zA-Z0-9]/;
 
+const DRAFT_STORAGE_KEY = 'stellar-pay:registration-draft';
+const DRAFT_SCHEMA_VERSION = 1;
+const DRAFT_TTL_MS = 1000 * 60 * 60 * 24; // 24 hours
+
+/**
+ * Resolve the active Stellar network identifier used to bind drafts.
+ * @returns {string}
+ */
+function resolveNetwork() {
+  const env = /** @type {any} */ (import.meta)?.env || {};
+  return env.VITE_STELLAR_NETWORK || env.VITE_NETWORK || 'testnet';
+}
+
+/**
+ * @typedef {Object} RegistrationDraft
+ * @property {number} version
+ * @property {string} account
+ * @property {string} network
+ * @property {string} username
+ * @property {string} memoType
+ * @property {string} memo
+ * @property {number} savedAt
+ */
+
+/**
+ * Read a persisted draft, discarding anything that is malformed, expired,
+ * or bound to a different account/network. Never stores secrets.
+ * @param {string} account
+ * @param {string} network
+ * @returns {RegistrationDraft | null}
+ */
+function readDraft(account, network) {
+  if (typeof window === 'undefined' || !window.localStorage) return null;
+  let raw;
+  try {
+    raw = window.localStorage.getItem(DRAFT_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+  if (!raw) return null;
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    clearDraft();
+    return null;
+  }
+
+  const isValidShape =
+    parsed &&
+    typeof parsed === 'object' &&
+    parsed.version === DRAFT_SCHEMA_VERSION &&
+    typeof parsed.account === 'string' &&
+    typeof parsed.network === 'string' &&
+    typeof parsed.username === 'string' &&
+    typeof parsed.memoType === 'string' &&
+    typeof parsed.memo === 'string' &&
+    typeof parsed.savedAt === 'number';
+
+  if (!isValidShape) {
+    clearDraft();
+    return null;
+  }
+
+  const expired = Date.now() - parsed.savedAt > DRAFT_TTL_MS;
+  const incompatible = parsed.account !== account || parsed.network !== network;
+
+  if (expired || incompatible) {
+    clearDraft();
+    return null;
+  }
+
+  return /** @type {RegistrationDraft} */ (parsed);
+}
+
+/**
+ * Persist only non-secret draft fields.
+ * @param {RegistrationDraft} draft
+ */
+function writeDraft(draft) {
+  if (typeof window === 'undefined' || !window.localStorage) return;
+  try {
+    window.localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(draft));
+  } catch {
+    // Storage may be unavailable (private mode, quota). Drafts are best-effort.
+  }
+}
+
+function clearDraft() {
+  if (typeof window === 'undefined' || !window.localStorage) return;
+  try {
+    window.localStorage.removeItem(DRAFT_STORAGE_KEY);
+  } catch {
+    // Ignore storage failures.
+  }
+}
+
 /**
  * @typedef {Object} RegistrationPageProps
  * @property {string} userPublicKey
@@ -86,23 +184,80 @@ function RegistrationPage({
 
   useEffect(() => {
     if (!userPublicKey) {
+      setHasDraft(false);
       return;
     }
 
-    const checkExisting = async () => {
-      try {
-        const { response, data } = await getLookup(userPublicKey);
+    const draft = readDraft(userPublicKey, network);
+    if (!draft) {
+      setHasDraft(false);
+      return;
+    }
 
-        if (response.ok && data?.username) {
-          onRegistered();
-        }
-      } catch {
-        // Ignore lookup errors in registration view.
+    setUsername(draft.username);
+    setMemoType(draft.memoType);
+    setMemo(draft.memo);
+    setHasDraft(true);
+    setDraftNotice("Restored your saved registration draft.");
+    draftRestoredRef.current = true;
+  }, [userPublicKey, network]);
+
+  // Persist non-secret draft fields as the user edits.
+  useEffect(() => {
+    if (!userPublicKey) return;
+    if (!username && !memoType && !memo) {
+      clearDraft();
+      setHasDraft(false);
+      return;
+    }
+
+    writeDraft({
+      version: DRAFT_SCHEMA_VERSION,
+      account: userPublicKey,
+      network,
+      username,
+      memoType,
+      memo,
+      savedAt: Date.now(),
+    });
+    setHasDraft(true);
+  }, [userPublicKey, network, username, memoType, memo]);
+
+  const handleClearDraft = useCallback(() => {
+    clearDraft();
+    setHasDraft(false);
+    setDraftNotice("Draft cleared.");
+    setUsername("");
+    setMemoType("");
+    setMemo("");
+    setUsernameError("");
+    setMemoError("");
+  }, []);
+
+  const checkExisting = useCallback(async () => {
+    if (!userPublicKey) return;
+    setIsCheckingExisting(true);
+    setLookupError("");
+    try {
+      const { response, data } = await getLookup(userPublicKey);
+
+      if (response.ok && data?.username) {
+        onRegistered();
       }
-    };
-
-    checkExisting();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setLookupError(message || "Unable to check existing registration.");
+    } finally {
+      setIsCheckingExisting(false);
+    }
   }, [userPublicKey, onRegistered]);
+
+  useEffect(() => {
+    if (!userPublicKey) {
+      return;
+    }
+    checkExisting();
+  }, [userPublicKey, checkExisting]);
 
   // 2. Updated to use the universal walletKit modal instead of Freighter specifically
   const handleConnect = async () => {

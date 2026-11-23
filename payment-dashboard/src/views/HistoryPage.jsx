@@ -1,8 +1,13 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
 import NetworkBadge from '../NetworkBadge';
 import ScrollToTop from '../ScrollToTop';
-import LoadingSpinner from '../LoadingSpinner';
 import MobileNav from './MobileNav';
+import {
+  EmptyState,
+  ErrorState,
+  LoadingState,
+  PartialDataNotice,
+} from '../states';
 import { NAV_STORAGE_KEY, formatShortAddress, useNavState, useWalletMenu } from './shared';
 import { useFocusAnnouncement } from '../focusAnnouncement';
 import { getApiErrorMessage } from '../apiErrorCatalog';
@@ -217,8 +222,6 @@ function HistoryPage({
 
       await Promise.resolve();
       setIsLoading(true);
-      setHistory([]);
-      setHasMore(false);
       setHistoryError("");
       setIsFromCache(false);
       try {
@@ -579,10 +582,8 @@ function HistoryPage({
               </button>
             </div>
           )}
-          {userPublicKey && isLoading && (
-            <div className="wallet-status" aria-live="polite">
-              <LoadingSpinner label="Loading transactions..." />
-            </div>
+          {userPublicKey && isLoading && history.length === 0 && (
+            <LoadingState label="Loading transactions..." />
           )}
           {userPublicKey && historyError && (
             <div className="wallet-status" data-testid="history-error">
@@ -598,7 +599,6 @@ function HistoryPage({
               </div>
             )}
           {userPublicKey &&
-            !isLoading &&
             !historyError &&
             history.length > 0 && (
               <table className="history-table" data-testid="history-table">
