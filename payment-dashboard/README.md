@@ -53,6 +53,44 @@ If the page is reloaded while a payment is in flight, the dashboard restores pro
 - **No resubmission**: resuming performs a read-only status lookup against the server using the stored reference. The payment is never re-sent on reload.
 - **Cleared on completion or mismatch**: the reference is removed once the operation reaches a terminal state (success or failure), or when it is invalid, unreadable, or does not match the current account/network.
 
+## Feature flags
+
+Remotely delivered feature flags are validated against a typed schema before they are used. The schema defines the allowed flag names and the allowed value types for each flag.
+
+- **Typed schema**: only known flag names are accepted, and each flag's value must match its declared type. Unknown flags and values of the wrong type are ignored.
+- **Safe fallback**: if the remote configuration is missing, malformed, or stale, the dashboard falls back to the compiled-in defaults for every flag. A malformed payload never disables the dashboard or partially applies invalid values.
+- **No secrets**: flags are client-visible, so they must never carry secrets, credentials, or sensitive data. Only non-sensitive toggles and configuration belong in the flag payload.
+- **Stale configuration**: a payload that fails validation is discarded as a whole and the last known-good/default values are used.
+
+## API error catalog
+
+API error codes are mapped to user-facing guidance through a single central catalog. Each entry defines:
+
+- **Message**: an actionable, accessible description of what went wrong and what the user can do next.
+- **Remediation**: the concrete next step (for example, retry, re-authenticate, or contact support).
+- **Retry behavior**: whether the operation is safe to retry automatically, retry manually, or not at all.
+- **Reference ID**: a safe, opaque reference identifier that can be quoted to support. Reference IDs never contain server internals, stack traces, or sensitive data.
+
+Unknown or unmapped codes fall back to a generic safe message that does not expose server internals. The fallback still offers a reference ID and a retry recommendation.
+
+## Focus and announcement management
+
+Focus and screen-reader announcements are centralized so navigation and form flows behave consistently.
+
+- **Route changes**: after a route change, focus moves to the new route's heading so keyboard and screen-reader users start at the top of the new content.
+- **Async results**: success and failure of mutations are announced through polite live regions.
+- **Background refreshes**: background data refreshes do not steal focus and do not trigger announcements, so users are not interrupted while typing or reading.
+- **Consistency**: the same manager is used for navigation and form flows, so focus and announcement behavior does not diverge between features.
+
+## Cross-tab payment coordination
+
+Multiple browser tabs coordinate payment submission so that a payment is never submitted twice.
+
+- **Non-sensitive references only**: tabs share only a non-sensitive operation reference (an operation id plus a schema version) through browser storage. Payment payloads, amounts, and signing material are never shared across tabs.
+- **Expiry**: coordination state carries a time-to-live. Stale entries are treated as absent and cleaned up, so an abandoned tab cannot block or duplicate a later attempt.
+- **Backend idempotency**: correctness ultimately relies on backend idempotency. If a tab finds an in-flight operation for the same payment, it resumes or warns the user instead of starting a new attempt.
+- **Resume or warn**: a tab that detects an in-flight operation resumes status tracking or warns the user that a payment is already in progress, rather than triggering a duplicate payment attempt.
+
 ## Expanding the ESLint configuration
 
 If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.

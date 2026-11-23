@@ -1,3 +1,5 @@
+import { useRouteFocus } from "../focus/useRouteFocus";
+
 /**
  * @typedef {Object} MobileNavProps
  * @property {string} active
@@ -21,12 +23,25 @@ function MobileNav({
   onRegisterClick,
   canRegister,
 }) {
+  const { focusRouteHeading } = useRouteFocus();
+
+  /**
+   * Wrap a navigation handler so the centralized focus manager moves focus to
+   * the destination route heading once the navigation has been triggered.
+   * @param {() => void} handler
+   * @returns {() => void}
+   */
+  const navigate = (handler) => () => {
+    handler();
+    focusRouteHeading();
+  };
+
   return (
     <nav className="mobile-nav" aria-label="Primary">
       <button
         type="button"
         className={active === "dashboard" ? "is-active" : ""}
-        onClick={onDashboardClick}
+        onClick={navigate(onDashboardClick)}
         aria-current={active === "dashboard" ? "page" : undefined}
       >
         <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -37,7 +52,7 @@ function MobileNav({
       <button
         type="button"
         className={active === "history" ? "is-active" : ""}
-        onClick={onHistoryClick}
+        onClick={navigate(onHistoryClick)}
         aria-current={active === "history" ? "page" : undefined}
       >
         <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -48,7 +63,7 @@ function MobileNav({
       <button
         type="button"
         className={active === "analytics" ? "is-active" : ""}
-        onClick={onAnalyticsClick}
+        onClick={navigate(onAnalyticsClick)}
         aria-current={active === "analytics" ? "page" : undefined}
       >
         <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -59,7 +74,7 @@ function MobileNav({
       <button
         type="button"
         className={active === "help" ? "is-active" : ""}
-        onClick={onHelpClick}
+        onClick={navigate(onHelpClick)}
         aria-current={active === "help" ? "page" : undefined}
       >
         <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -72,7 +87,7 @@ function MobileNav({
         <button
           type="button"
           className={active === "register" ? "is-active" : ""}
-          onClick={onRegisterClick}
+          onClick={navigate(onRegisterClick)}
           aria-current={active === "register" ? "page" : undefined}
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">

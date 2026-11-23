@@ -4,6 +4,7 @@ import { toast, Toaster } from "react-hot-toast";
 import logger from "./logger";
 import LoadingSpinner from './components/LoadingSpinner';
 import { HORIZON_BASE, API_BASE, walletKit } from './views/shared';
+import { loadFeatureFlags } from './featureFlags';
 
 const Dashboard = lazy(() => import('./views/Dashboard.jsx'));
 const HelpPage = lazy(() => import('./views/HelpPage.jsx'));
@@ -338,6 +339,34 @@ const [activeView, setActiveView] = useState('dashboard')
   const [isOffline, setIsOffline] = useState(!navigator.onLine);
   const [isShortcutsOpen, setIsShortcutsOpen] = useState(false);
   const [locale, setLocale] = useState(() => resolveInitialLocale());
+  const [featureFlags, setFeatureFlags] = useState(() => loadFeatureFlags().flags);
+
+  // Load remotely delivered feature flags once on mount, validating them
+  // against the typed schema and falling back to defaults on any failure.
+  useEffect(() => {
+    let cancelled = false;
+
+    loadFeatureFlags({ fetchImpl: withRequestId })
+      .then((result) => {
+        if (cancelled) {
+          return;
+        }
+        if (result.source !== 'remote') {
+          logger.debug('Feature flags using fallback source:', result.source);
+        }
+        setFeatureFlags(result.flags);
+      })
+      .catch((err) => {
+        if (cancelled) {
+          return;
+        }
+        logger.error('Unexpected feature flag load failure:', err);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const t = useCallback(
     (key, values) => {

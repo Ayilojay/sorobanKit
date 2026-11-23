@@ -4,6 +4,7 @@ import './index.css'
 import './App.css'
 import App from './App.jsx'
 import ErrorBoundary from './ErrorBoundary.jsx'
+import { LiveAnnouncer } from './a11y/focusManager.jsx'
 
 const rootElement = document.getElementById('root')
 
@@ -14,7 +15,9 @@ if (!rootElement) {
 createRoot(rootElement).render(
   <StrictMode>
     <ErrorBoundary>
-      <App />
+      <LiveAnnouncer>
+        <App />
+      </LiveAnnouncer>
     </ErrorBoundary>
   </StrictMode>,
 )
