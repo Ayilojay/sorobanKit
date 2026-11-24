@@ -18,6 +18,10 @@ const {
   rollbackArtifact,
   preflightReleaseManifest,
   runSmokeChecks,
+  generateProvenance,
+  verifyProvenance,
+  verifyImageSignature,
+  runCanaryRollout,
 } = require('./deploy');
 
 const makeReleaseFixture = (overrides = {}) => {
@@ -560,4 +564,321 @@ test('smoke checks prevent duplicate test transactions under concurrent invocati
   assert.equal(submissions, 1);
   assert.equal(first.ok, true);
   assert.equal(second.ok, true);
+});
+
+const makeProvenanceFixture = (overrides = {}) => {
+  const digest = crypto.createHash('sha256').update('provenance artifact').digest('hex');
+  return {
+    digest,
+    sourceCommit: 'a'.repeat(40),
+    workflowIdentity:
+      'https://github.com/example/sorobankit/.github/workflows/release.yml@refs/heads/main',
+    toolchain: { node: '20.11.1', rust: '1.77.0', soroban: '21.0.0' },
+    artifactName: 'backend.wasm',
+    ...overrides,
+  };
+};
+
+test('provenance attestation binds source commit, workflow identity, toolchain, and digest', () => {
+  const fixture = makeProvenanceFixture();
+  const attestation = generateProvenance(fixture);
+
+  assert.equal(attestation.digest, fixture.digest);
+  assert.equal(attestation.source_commit, fixture.sourceCommit);
+  assert.equal(attestation.workflow_identity, fixture.workflowIdentity);
+  assert.deepEqual(attestation.toolchain, fixture.toolchain);
+  assert.equal(attestation.artifact_name, fixture.artifactName);
+  assert.equal(attestation.schema_version, 1);
+  assert.match(attestation.signature, /^[0-9a-f]{64}$/);
+
+  const verified = verifyProvenance({
+    attestation,
+    expected: {
+      digest: fixture.digest,
+      sourceCommit: fixture.sourceCommit,
+      workflowIdentity: fixture.workflowIdentity,
+      toolchain: fixture.toolchain,
+    },
+  });
+  assert.equal(verified.ok, true);
+  assert.equal(verified.digest, fixture.digest);
+});
+
+test('provenance verification fails when the artifact digest does not match', () => {
+  const fixture = makeProvenanceFixture();
+  const attestation = generateProvenance(fixture);
+
+  assert.throws(
+    () =>
+      verifyProvenance({
+        attestation,
+        expected: {
+          digest: 'f'.repeat(64),
+          sourceCommit: fixture.sourceCommit,
+          workflowIdentity: fixture.workflowIdentity,
+          toolchain: fixture.toolchain,
+        },
+      }),
+    /digest/
+  );
+});
+
+test('provenance verification fails when the source commit or workflow identity differs', () => {
+  const fixture = makeProvenanceFixture();
+  const attestation = generateProvenance(fixture);
+  const expected = {
+    digest: fixture.digest,
+    sourceCommit: fixture.sourceCommit,
+    workflowIdentity: fixture.workflowIdentity,
+    toolchain: fixture.toolchain,
+  };
+
+  assert.throws(
+    () => verifyProvenance({ attestation, expected: { ...expected, sourceCommit: 'b'.repeat(40) } }),
+    /source commit/
+  );
+  assert.throws(
+    () =>
+      verifyProvenance({
+        attestation,
+        expected: { ...expected, workflowIdentity: 'https://github.com/evil/workflow.yml' },
+      }),
+    /workflow identity/
+  );
+});
+
+test('provenance verification rejects malformed and missing attestations', () => {
+  const fixture = makeProvenanceFixture();
+  const expected = {
+    digest: fixture.digest,
+    sourceCommit: fixture.sourceCommit,
+    workflowIdentity: fixture.workflowIdentity,
+    toolchain: fixture.toolchain,
+  };
+
+  assert.throws(() => verifyProvenance({ attestation: null, expected }), /missing/);
+  assert.throws(() => verifyProvenance({ expected }), /missing/);
+
+  const attestation = generateProvenance(fixture);
+  assert.throws(
+    () => verifyProvenance({ attestation: { ...attestation, signature: 'not-a-signature' }, expected }),
+    /malformed/
+  );
+  assert.throws(
+    () => verifyProvenance({ attestation: { ...attestation, schema_version: 99 }, expected }),
+    /malformed/
+  );
+  assert.throws(
+    () =>
+      verifyProvenance({
+        attestation: { ...attestation, digest: 'f'.repeat(64) },
+        expected,
+      }),
+    /malformed|signature/
+  );
+});
+
+const makeSignatureFixture = (overrides = {}) => {
+  const digest = `sha256:${crypto.createHash('sha256').update('image').digest('hex')}`;
+  return {
+    image: `ghcr.io/example/sorobankit-backend@${digest}`,
+    digest,
+    workloadIdentity:
+      'https://github.com/example/sorobankit/.github/workflows/release.yml@refs/heads/main',
+    ...overrides,
+  };
+};
+
+test('image signature verification accepts a signed immutable digest', () => {
+  const fixture = makeSignatureFixture();
+  const signature = crypto
+    .createHash('sha256')
+    .update(`${fixture.digest}:${fixture.workloadIdentity}`)
+    .digest('hex');
+
+  const result = verifyImageSignature({
+    image: fixture.image,
+    workloadIdentity: fixture.workloadIdentity,
+    signatures: [{ digest: fixture.digest, identity: fixture.workloadIdentity, signature }],
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.digest, fixture.digest);
+});
+
+test('image signature verification rejects unsigned images and digest mismatches', () => {
+  const fixture = makeSignatureFixture();
+  const signature = crypto
+    .createHash('sha256')
+    .update(`${fixture.digest}:${fixture.workloadIdentity}`)
+    .digest('hex');
+
+  assert.throws(
+    () =>
+      verifyImageSignature({
+        image: fixture.image,
+        workloadIdentity: fixture.workloadIdentity,
+        signatures: [],
+      }),
+    /unsigned/
+  );
+
+  assert.throws(
+    () =>
+      verifyImageSignature({
+        image: fixture.image,
+        workloadIdentity: fixture.workloadIdentity,
+        signatures: [
+          { digest: `sha256:${'0'.repeat(64)}`, identity: fixture.workloadIdentity, signature },
+        ],
+      }),
+    /digest/
+  );
+
+  assert.throws(
+    () =>
+      verifyImageSignature({
+        image: fixture.image,
+        workloadIdentity: fixture.workloadIdentity,
+        signatures: [{ digest: fixture.digest, identity: 'other-identity', signature }],
+      }),
+    /identity/
+  );
+});
+
+test('image signature verification supports audited break-glass recovery', () => {
+  const fixture = makeSignatureFixture();
+  const audit = [];
+
+  assert.throws(
+    () =>
+      verifyImageSignature({
+        image: fixture.image,
+        workloadIdentity: fixture.workloadIdentity,
+        signatures: [],
+        breakGlass: { approver: 'alice' },
+        audit: (entry) => audit.push(entry),
+      }),
+    /unsigned/
+  );
+
+  const result = verifyImageSignature({
+    image: fixture.image,
+    workloadIdentity: fixture.workloadIdentity,
+    signatures: [],
+    breakGlass: { approver: 'alice', reason: 'signing service outage' },
+    audit: (entry) => audit.push(entry),
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.break_glass, true);
+  assert.equal(audit.length, 1);
+  assert.equal(audit[0].approver, 'alice');
+  assert.equal(audit[0].reason, 'signing service outage');
+
+  assert.throws(
+    () =>
+      verifyImageSignature({
+        image: fixture.image,
+        workloadIdentity: fixture.workloadIdentity,
+        signatures: [],
+        breakGlass: { reason: 'no approver' },
+        audit: () => {},
+      }),
+    /approver/
+  );
+});
+
+const makeCanaryFixture = (overrides = {}) => ({
+  deploymentId: 'deploy-canary-1',
+  baselineDigest: 'a'.repeat(64),
+  canaryDigest: 'b'.repeat(64),
+  policy: {
+    trafficPercent: 10,
+    evaluationWindowMs: 1000,
+    maxErrorRate: 0.01,
+    maxP99LatencyMs: 500,
+  },
+  ...overrides,
+});
+
+test('canary rollout promotes when metrics stay within policy', async () => {
+  const fixture = makeCanaryFixture();
+  const audit = [];
+  const result = await runCanaryRollout({
+    ...fixture,
+    collectMetrics: async () => ({ errorRate: 0.001, p99LatencyMs: 200 }),
+    audit: (entry) => audit.push(entry),
+  });
+  assert.equal(result.promoted, true);
+  assert.equal(result.rolledBack, false);
+  assert.equal(result.digest, fixture.canaryDigest);
+  assert.ok(audit.some((entry) => entry.action === 'promote'));
+});
+
+test('canary rollout halts and rolls back when latency or error thresholds breach', async () => {
+  const fixture = makeCanaryFixture();
+
+  const latency = await runCanaryRollout({
+    ...fixture,
+    collectMetrics: async () => ({ errorRate: 0.0, p99LatencyMs: 900 }),
+    audit: () => {},
+  });
+  assert.equal(latency.promoted, false);
+  assert.equal(latency.rolledBack, true);
+  assert.equal(latency.digest, fixture.baselineDigest);
+  assert.match(latency.reason, /latency/);
+
+  const errors = await runCanaryRollout({
+    ...fixture,
+    collectMetrics: async () => ({ errorRate: 0.5, p99LatencyMs: 100 }),
+    audit: () => {},
+  });
+  assert.equal(errors.promoted, false);
+  assert.equal(errors.rolledBack, true);
+  assert.match(errors.reason, /error/);
+});
+
+test('canary rollout records an audited manual override', async () => {
+  const fixture = makeCanaryFixture();
+  const audit = [];
+  const result = await runCanaryRollout({
+    ...fixture,
+    collectMetrics: async () => ({ errorRate: 0.5, p99LatencyMs: 900 }),
+    override: { approver: 'dave', reason: 'known upstream incident' },
+    audit: (entry) => audit.push(entry),
+  });
+  assert.equal(result.promoted, true);
+  assert.equal(result.overridden, true);
+  assert.ok(audit.some((entry) => entry.action === 'override' && entry.approver === 'dave'));
+
+  await assert.rejects(
+    runCanaryRollout({
+      ...fixture,
+      collectMetrics: async () => ({ errorRate: 0, p99LatencyMs: 100 }),
+      override: { reason: 'no approver' },
+      audit: () => {},
+    }),
+    /approver/
+  );
+});
+
+test('canary rollout is safe under concurrent invocation for the same deployment', async () => {
+  const fixture = makeCanaryFixture();
+  let promotions = 0;
+  const options = {
+    ...fixture,
+    collectMetrics: async () => ({ errorRate: 0, p99LatencyMs: 100 }),
+    audit: () => {},
+    promote: async () => {
+      promotions += 1;
+    },
+  };
+
+  const [first, second] = await Promise.all([
+    runCanaryRollout(options),
+    runCanaryRollout(options),
+  ]);
+  assert.equal(promotions, 1);
+  assert.equal(first.promoted, true);
+  assert.equal(second.promoted, true);
+  assert.equal(first.digest, second.digest);
 });

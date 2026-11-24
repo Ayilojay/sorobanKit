@@ -285,9 +285,47 @@ documented reconciliation objective (all intents reconciled within 15 minutes).
 - New labels must be reviewed by the owning team and documented in this file
   before being added to any recording rule or alert.
 
+
+- **Connection Pool Exhaustion**: Alert when
+=======
+## Canary Rollout Dashboard
+
+The canary rollout panels visualize the health of a canary deployment against
+its stable baseline and show whether the automated rollback gates have halted
+promotion. They are imported with the same dashboard JSON and the same
+`${DS_PROMETHEUS}` datasource input as the panels above.
+
+### Canary Panels
+
+| Panel | Metric | Description |
+| --- | --- | --- |
+| Canary Traffic Share | `stellar_tags_canary_traffic_share` | Fraction of eligible requests routed to the canary, by `stage`. Compare against the configured stage weight. |
+| Canary Error Rate | `stellar_tags_canary_requests_total` | Error ratio per `variant` (`stable`, `canary`), computed over the evaluation window. Yellow at the policy warning threshold, red at the rollback threshold. |
+| Canary Latency (p95 / p99) | `stellar_tags_canary_request_duration_seconds` | Histogram quantiles per `variant` and `route`, over the evaluation window. Yellow at the warning threshold, red at the rollback threshold. |
+| Gate Evaluation Result | `stellar_tags_canary_gate_evaluations_total` | Count of gate evaluations by `result` (`pass`, `fail`) and `gate` (`error_rate`, `latency`). |
+| Rollback Events | `stellar_tags_canary_rollbacks_total` | Count of automated and manual rollbacks by `trigger` (`error_rate`, `latency`, `manual`). |
+| Manual Overrides | `stellar_tags_canary_overrides_total` | Count of audited manual promote/halt/rollback overrides by `action` and `actor`. |
+
+### Using the panels during a rollout
+
+1. **Before promotion**: confirm the canary is receiving the expected traffic
+   share for the current stage and that the error-rate and latency panels are
+   below their warning thresholds for at least one full evaluation window.
+2. **During the evaluation window**: watch the gate evaluation panel. A `fail`
+   result halts promotion automatically; the rollback panel increments when the
+   canary is rolled back. Do not manually promote while a gate is failing.
+3. **After a rollback**: the rollback event and the triggering gate identify
+   which indicator breached policy. Correlate with logs and traces by trace id
+   before re-attempting the rollout.
+4. **Manual overrides**: any promote, halt, or rollback performed by an operator
+   is recorded in the manual overrides panel with the acting identity. Overrides
+   are audited; use them only to stop a rollout, never to bypass a failing gate.
+
 ## Alerting Suggestions
 
 Create Grafana alerts on the following to catch pool exhaustion early:
+
+- **Connection Pool Exhaustion**: Alert when
 =======
 
 - **Connection Pool Exhaustion**: Alert when

@@ -2,6 +2,237 @@
 'use strict';
 
 /**
+ * check-pinned-images.js
+ *
+ * Verifies that every container base image referenced by the repository is
+ * pinned to an immutable digest (`@sha256:<64 hex>`).
+ *
+ * Scanned inputs (relative to the target directory):
+ *   - Dockerfile
+ *   - Dockerfile-backend
+ *   - docker-compose.yml (and docker-compose.yaml)
+ *
+ * Rules:
+ *   - `FROM <image>` lines in Dockerfiles must reference a digest.
+ *   - `image: <image>` entries in compose files must reference a digest.
+ *   - `FROM` lines using a prior build stage (`FROM builder`) are skipped.
+ *   - `scratch` is allowed (it is not a registry image).
+ *   - `ARG`-substituted references (containing `$`) are reported as
+ *     violations because they cannot be verified statically.
+ *
+ * Usage:
+ *   node scripts/ci/check-pinned-images.js [--dir <path>]
+ *
+ * Exit codes:
+ *   0 - all base images are pinned by digest
+ *   1 - one or more violations found
+ *   2 - usage / IO error
+ */
+
+const fs = require('fs');
+const path = require('path');
+
+const DIGEST_RE = /@sha256:[0-9a-f]{64}$/i;
+const FROM_RE = /^\s*FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+\S+)?\s*$/i;
+const IMAGE_RE = /^\s*image:\s*["']?([^"'\s#]+)["']?\s*(?:#.*)?$/i;
+
+const DEFAULT_FILES = [
+  'Dockerfile',
+  'Dockerfile-backend',
+  'docker-compose.yml',
+  'docker-compose.yaml',
+];
+
+/**
+ * Determine whether an image reference is pinned by digest.
+ * @param {string} ref
+ * @returns {boolean}
+ */
+function isPinnedByDigest(ref) {
+  return DIGEST_RE.test(ref);
+}
+
+/**
+ * Check a single image reference.
+ * @param {string} ref
+ * @param {Set<string>} [buildStages] names of previously declared build stages
+ * @returns {{ ok: boolean, reason?: string }}
+ */
+function checkImageRef(ref, buildStages) {
+  if (!ref) {
+    return { ok: false, reason: 'empty image reference' };
+  }
+  if (ref === 'scratch') {
+    return { ok: true };
+  }
+  if (buildStages && buildStages.has(ref.toLowerCase())) {
+    return { ok: true };
+  }
+  if (ref.includes('$')) {
+    return {
+      ok: false,
+      reason: `image "${ref}" uses variable substitution and cannot be verified`,
+    };
+  }
+  if (!isPinnedByDigest(ref)) {
+    return {
+      ok: false,
+      reason: `image "${ref}" is not pinned to an @sha256:<64 hex> digest`,
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * Scan a Dockerfile's contents for unpinned base images.
+ * @param {string} content
+ * @param {string} filePath
+ * @returns {Array<{ file: string, line: number, ref: string, reason: string }>}
+ */
+function scanDockerfile(content, filePath) {
+  const violations = [];
+  const buildStages = new Set();
+  const lines = content.split(/\r?\n/);
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const match = FROM_RE.exec(line);
+    if (!match) continue;
+
+    const ref = match[1];
+    const result = checkImageRef(ref, buildStages);
+    if (!result.ok) {
+      violations.push({ file: filePath, line: i + 1, ref, reason: result.reason });
+    }
+
+    const asMatch = /^\s*FROM\s+(?:--platform=\S+\s+)?\S+\s+AS\s+(\S+)\s*$/i.exec(line);
+    if (asMatch) {
+      buildStages.add(asMatch[1].toLowerCase());
+    }
+  }
+
+  return violations;
+}
+
+/**
+ * Scan a compose file's contents for unpinned images.
+ * @param {string} content
+ * @param {string} filePath
+ * @returns {Array<{ file: string, line: number, ref: string, reason: string }>}
+ */
+function scanComposeFile(content, filePath) {
+  const violations = [];
+  const lines = content.split(/\r?\n/);
+
+  for (let i = 0; i < lines.length; i++) {
+    const match = IMAGE_RE.exec(lines[i]);
+    if (!match) continue;
+
+    const ref = match[1];
+    const result = checkImageRef(ref);
+    if (!result.ok) {
+      violations.push({ file: filePath, line: i + 1, ref, reason: result.reason });
+    }
+  }
+
+  return violations;
+}
+
+/**
+ * Scan a single file, dispatching on its name.
+ * @param {string} content
+ * @param {string} filePath
+ * @returns {Array<{ file: string, line: number, ref: string, reason: string }>}
+ */
+function scanFileContent(content, filePath) {
+  const base = path.basename(filePath).toLowerCase();
+  if (base === 'dockerfile' || base.startsWith('dockerfile-')) {
+    return scanDockerfile(content, filePath);
+  }
+  if (base === 'docker-compose.yml' || base === 'docker-compose.yaml') {
+    return scanComposeFile(content, filePath);
+  }
+  return [];
+}
+
+/**
+ * Check all known container definition files in a directory.
+ * @param {string} dir
+ * @returns {Array<{ file: string, line: number, ref: string, reason: string }>}
+ */
+function checkPinnedImages(dir) {
+  const violations = [];
+  for (const name of DEFAULT_FILES) {
+    const filePath = path.join(dir, name);
+    if (!fs.existsSync(filePath)) continue;
+    const content = fs.readFileSync(filePath, 'utf8');
+    violations.push(...scanFileContent(content, filePath));
+  }
+  return violations;
+}
+
+function parseArgs(argv) {
+  const args = { dir: '.' };
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--dir' && argv[i + 1]) {
+      args.dir = argv[++i];
+    } else if (argv[i] === '--help' || argv[i] === '-h') {
+      args.help = true;
+    }
+  }
+  return args;
+}
+
+function main(argv) {
+  const args = parseArgs(argv);
+  if (args.help) {
+    process.stdout.write(
+      'Usage: node scripts/ci/check-pinned-images.js [--dir <path>]\n'
+    );
+    return 0;
+  }
+
+  let violations;
+  try {
+    violations = checkPinnedImages(args.dir);
+  } catch (err) {
+    process.stderr.write(`check-pinned-images: ${err.message}\n`);
+    return 2;
+  }
+
+  if (violations.length === 0) {
+    process.stdout.write('check-pinned-images: all base images are pinned.\n');
+    return 0;
+  }
+
+  process.stderr.write(
+    `check-pinned-images: found ${violations.length} unpinned base image(s):\n`
+  );
+  for (const v of violations) {
+    process.stderr.write(`  ${v.file}:${v.line}: ${v.reason}\n`);
+  }
+  process.stderr.write(
+    '\nPin base images to a full digest, e.g.:\n' +
+      '  FROM node:20-bookworm-slim@sha256:<64 hex>\n'
+  );
+  return 1;
+}
+
+module.exports = {
+  isPinnedByDigest,
+  checkImageRef,
+  scanDockerfile,
+  scanComposeFile,
+  scanFileContent,
+  checkPinnedImages,
+  main,
+};
+
+if (require.main === module) {
+  process.exit(main(process.argv.slice(2)));
+}
+
+/**
  * check-action-pins.js
  *
  * Verifies that every external GitHub Actions `uses:` reference in

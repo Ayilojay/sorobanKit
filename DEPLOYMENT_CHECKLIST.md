@@ -14,6 +14,50 @@ Use this checklist for every deployment. Do not skip steps.
 - [ ] Record the promoted digest in the release notes / deployment record so
       staging and production can be verified as byte-identical.
 
+## Build Provenance
+
+- [ ] Confirm the release workflow published a provenance attestation for the
+      backend, dashboard, and contract artifacts, binding the source commit,
+      workflow identity, toolchain versions, and artifact digest.
+- [ ] Verify the attestation against the promoted digest before promotion:
+      `gh attestation verify <artifact> --repo <owner>/<repo> --source-digest <commit>`
+      (or the documented equivalent). The verification must succeed for the
+      exact digest being promoted.
+- [ ] **Digest mismatch fails validation:** if the attested digest does not
+      match the promoted digest, or verification fails, stop the deployment.
+      Do not promote, do not override, and open an incident to investigate the
+      artifact.
+
+## Image Signing
+
+- [ ] Confirm the image digest was signed using workload identity (keyless /
+      OIDC-based signing). No long-lived repository signing keys are used.
+- [ ] Verify the signature at deploy time before rollout:
+      `cosign verify <image>@sha256:<digest> --certificate-identity <workflow-identity> --certificate-oidc-issuer <issuer>`
+      (or the documented equivalent). Deployment must be blocked if
+      verification fails.
+- [ ] Confirm the deploy pipeline enforces signature verification and cannot
+      deploy an unsigned or unverifiable digest.
+
+### Break-Glass: Signing Unavailable
+
+- [ ] If the signing service / identity provider is unavailable, do **not**
+      deploy an unverified image. Follow the documented break-glass procedure:
+      escalate to the release owner, record the exception with justification
+      and expiry, and re-verify the signature as soon as signing is restored.
+- [ ] Confirm the break-glass exception is audited and time-boxed, and that
+      normal signature verification is re-enabled immediately afterwards.
+
+## Reproducible Build Checks
+
+- [ ] Confirm all base images are pinned by digest (`FROM ...@sha256:...`) and
+      build inputs (lockfiles, toolchain versions) are pinned.
+- [ ] Confirm the build and runtime stages are separated, and the final image
+      contains **no build-only tools** (compilers, package managers, dev
+      dependencies) or credentials.
+- [ ] Confirm reviewed base-image digest updates are automated and require
+      review before merge.
+
 ## Pre-Deployment
 
 - [ ] All changes merged to `main` and CI is green
@@ -99,6 +143,20 @@ documented in the target environment:
       liveness/readiness so slow boots are not restarted prematurely
 - [ ] Confirm readiness failures remove the instance from traffic without
       restarting it, and liveness failures trigger a restart
+
+## Canary Rollout (Backend)
+
+- [ ] Deploy the new backend digest to the canary slice first (documented
+      traffic percentage) and hold the rest on the current stable digest.
+- [ ] Observe the canary for the full evaluation window before promoting.
+- [ ] Confirm user-visible indicators stay within policy thresholds (latency
+      and error-rate thresholds as documented). If any threshold is breached,
+      promotion must halt and the backend must roll back automatically to the
+      previous stable digest.
+- [ ] Any manual override of the canary gate must be recorded in the audit log
+      with the operator, reason, and timestamp.
+- [ ] Confirm the automatic rollback completed and the stable digest is serving
+      all traffic before closing the deployment.
 
 ## Post-Deployment
 

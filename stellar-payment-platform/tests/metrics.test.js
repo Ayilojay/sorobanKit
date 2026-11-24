@@ -775,3 +775,265 @@ describe('Webhook queue health metrics (issue #476)', () => {
     });
   });
 });
+
+// Issue #468 — canary rollout and automated rollback gates. These tests cover
+// the canary metric families, the status endpoint contract, and the threshold
+// boundary behaviour (a value exactly at the limit must not breach policy).
+describe('Canary rollout and rollback gates (issue #468)', () => {
+  let canary;
+
+  beforeAll(() => {
+    canary = require('../services/canary');
+  });
+
+  beforeEach(() => {
+    canary.reset();
+  });
+
+  afterEach(() => {
+    canary.reset();
+  });
+
+  describe('canary metrics exposure', () => {
+    test('exposes canary traffic, error-rate and latency metric families', async () => {
+      const response = await request(app).get('/metrics');
+      expect(response.status).toBe(200);
+      const metricsText = response.text;
+
+      expect(metricsText).toContain('stellar_tags_canary_requests_total');
+      expect(metricsText).toContain('stellar_tags_canary_error_rate');
+      expect(metricsText).toContain('stellar_tags_canary_latency_p95_seconds');
+      expect(metricsText).toContain('stellar_tags_canary_rollback_total');
+    });
+
+    test('emits HELP and TYPE lines for every canary metric', async () => {
+      const response = await request(app).get('/metrics');
+      const metricsText = response.text;
+
+      for (const name of [
+        'stellar_tags_canary_requests_total',
+        'stellar_tags_canary_error_rate',
+        'stellar_tags_canary_latency_p95_seconds',
+        'stellar_tags_canary_rollback_total',
+      ]) {
+        expect(metricsText).toContain(`# HELP ${name}`);
+        expect(metricsText).toContain(`# TYPE ${name}`);
+      }
+    });
+
+    test('records canary observations with bounded labels', async () => {
+      canary.recordRequest({ cohort: 'canary', statusCode: 200, durationMs: 40 });
+      canary.recordRequest({ cohort: 'canary', statusCode: 500, durationMs: 120 });
+      canary.recordRequest({ cohort: 'stable', statusCode: 200, durationMs: 30 });
+
+      const response = await request(app).get('/metrics');
+      const metricsText = response.text;
+
+      expect(metricsText).toMatch(
+        /stellar_tags_canary_requests_total\{[^}]*cohort="canary"[^}]*\} 2/,
+      );
+      expect(metricsText).toMatch(
+        /stellar_tags_canary_requests_total\{[^}]*cohort="stable"[^}]*\} 1/,
+      );
+    });
+  });
+
+  describe('GET /api/v1/admin/canary/status', () => {
+    const ADMIN_TOKEN = 'test-canary-admin-token';
+
+    afterEach(() => {
+      delete process.env.ADMIN_TOKEN;
+    });
+
+    test('returns the canary status snapshot with the expected fields', async () => {
+      process.env.ADMIN_TOKEN = ADMIN_TOKEN;
+      canary.recordRequest({ cohort: 'canary', statusCode: 200, durationMs: 40 });
+
+      const response = await request(app)
+        .get('/api/v1/admin/canary/status')
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`);
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual(
+        expect.objectContaining({
+          phase: expect.any(String),
+          trafficPercent: expect.any(Number),
+          evaluationWindowSeconds: expect.any(Number),
+          thresholds: expect.objectContaining({
+            errorRate: expect.any(Number),
+            latencyP95Seconds: expect.any(Number),
+          }),
+          observed: expect.objectContaining({
+            errorRate: expect.any(Number),
+            latencyP95Seconds: expect.any(Number),
+          }),
+          breached: expect.any(Boolean),
+        }),
+      );
+    });
+
+    test('returns 401 without a token when ADMIN_TOKEN is configured', async () => {
+      process.env.ADMIN_TOKEN = ADMIN_TOKEN;
+      const response = await request(app).get('/api/v1/admin/canary/status');
+      expect(response.status).toBe(401);
+    });
+
+    test('reports breached=false while indicators are within policy', async () => {
+      process.env.ADMIN_TOKEN = ADMIN_TOKEN;
+      canary.recordRequest({ cohort: 'canary', statusCode: 200, durationMs: 40 });
+
+      const response = await request(app)
+        .get('/api/v1/admin/canary/status')
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`);
+
+      expect(response.status).toBe(200);
+      expect(response.body.breached).toBe(false);
+    });
+
+    test('reports breached=true once the error-rate threshold is exceeded', async () => {
+      process.env.ADMIN_TOKEN = ADMIN_TOKEN;
+      const { thresholds } = canary.getStatus();
+      // Push the observed error rate strictly above the configured limit.
+      for (let i = 0; i < 10; i += 1) {
+        canary.recordRequest({ cohort: 'canary', statusCode: 500, durationMs: 10 });
+      }
+
+      const response = await request(app)
+        .get('/api/v1/admin/canary/status')
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`);
+
+      expect(response.status).toBe(200);
+      expect(response.body.observed.errorRate).toBeGreaterThan(thresholds.errorRate);
+      expect(response.body.breached).toBe(true);
+    });
+  });
+
+  describe('threshold boundaries', () => {
+    test('does not breach when the error rate is exactly at the limit', () => {
+      const { thresholds } = canary.getStatus();
+      // Construct an exact error rate equal to the threshold: e.g. 1 error in
+      // 100 requests when the limit is 0.01.
+      const total = Math.round(1 / thresholds.errorRate);
+      canary.recordRequest({ cohort: 'canary', statusCode: 500, durationMs: 10 });
+      for (let i = 1; i < total; i += 1) {
+        canary.recordRequest({ cohort: 'canary', statusCode: 200, durationMs: 10 });
+      }
+
+      const status = canary.getStatus();
+      expect(status.observed.errorRate).toBeCloseTo(thresholds.errorRate, 6);
+      expect(status.breached).toBe(false);
+    });
+
+    test('breaches when the error rate is just above the limit', () => {
+      const { thresholds } = canary.getStatus();
+      const total = Math.round(1 / thresholds.errorRate);
+      // One extra error pushes the rate above the threshold.
+      for (let i = 0; i < 2; i += 1) {
+        canary.recordRequest({ cohort: 'canary', statusCode: 500, durationMs: 10 });
+      }
+      for (let i = 2; i < total; i += 1) {
+        canary.recordRequest({ cohort: 'canary', statusCode: 200, durationMs: 10 });
+      }
+
+      const status = canary.getStatus();
+      expect(status.observed.errorRate).toBeGreaterThan(thresholds.errorRate);
+      expect(status.breached).toBe(true);
+    });
+
+    test('does not breach when p95 latency is exactly at the limit', () => {
+      const { thresholds } = canary.getStatus();
+      const limitMs = thresholds.latencyP95Seconds * 1000;
+      // All observations at the limit keep p95 at (not above) the threshold.
+      for (let i = 0; i < 20; i += 1) {
+        canary.recordRequest({ cohort: 'canary', statusCode: 200, durationMs: limitMs });
+      }
+
+      const status = canary.getStatus();
+      expect(status.observed.latencyP95Seconds).toBeCloseTo(thresholds.latencyP95Seconds, 6);
+      expect(status.breached).toBe(false);
+    });
+
+    test('breaches when p95 latency exceeds the limit', () => {
+      const { thresholds } = canary.getStatus();
+      const limitMs = thresholds.latencyP95Seconds * 1000;
+      for (let i = 0; i < 20; i += 1) {
+        canary.recordRequest({ cohort: 'canary', statusCode: 200, durationMs: limitMs + 50 });
+      }
+
+      const status = canary.getStatus();
+      expect(status.observed.latencyP95Seconds).toBeGreaterThan(thresholds.latencyP95Seconds);
+      expect(status.breached).toBe(true);
+    });
+
+    test('does not breach when there is no canary traffic yet', () => {
+      const status = canary.getStatus();
+      expect(status.observed.errorRate).toBe(0);
+      expect(status.observed.latencyP95Seconds).toBe(0);
+      expect(status.breached).toBe(false);
+    });
+  });
+
+  describe('automated rollback', () => {
+    test('rolls back and halts promotion when a breach is detected', () => {
+      const { thresholds } = canary.getStatus();
+      for (let i = 0; i < 20; i += 1) {
+        canary.recordRequest({ cohort: 'canary', statusCode: 500, durationMs: 10 });
+      }
+
+      const result = canary.evaluate();
+      expect(result.breached).toBe(true);
+      expect(result.rolledBack).toBe(true);
+      expect(canary.getStatus().phase).toBe('rolled_back');
+      expect(canary.getStatus().trafficPercent).toBe(0);
+      expect(thresholds.errorRate).toBeGreaterThan(0);
+    });
+
+    test('does not roll back while indicators are within policy', () => {
+      canary.recordRequest({ cohort: 'canary', statusCode: 200, durationMs: 10 });
+
+      const result = canary.evaluate();
+      expect(result.breached).toBe(false);
+      expect(result.rolledBack).toBe(false);
+      expect(canary.getStatus().phase).not.toBe('rolled_back');
+    });
+
+    test('records a rollback counter increment', async () => {
+      for (let i = 0; i < 20; i += 1) {
+        canary.recordRequest({ cohort: 'canary', statusCode: 500, durationMs: 10 });
+      }
+      canary.evaluate();
+
+      const response = await request(app).get('/metrics');
+      expect(response.text).toMatch(
+        /stellar_tags_canary_rollback_total(?:\{[^}]*\})? [1-9]\d*/,
+      );
+    });
+  });
+
+  describe('audited manual override', () => {
+    test('records an audit entry for a manual override', () => {
+      const entry = canary.manualOverride({
+        actor: 'ops@example.com',
+        action: 'promote',
+        reason: 'validated in staging',
+      });
+
+      expect(entry).toEqual(
+        expect.objectContaining({
+          actor: 'ops@example.com',
+          action: 'promote',
+          reason: 'validated in staging',
+          at: expect.any(String),
+        }),
+      );
+      expect(canary.getAuditLog()).toEqual(
+        expect.arrayContaining([expect.objectContaining({ actor: 'ops@example.com' })]),
+      );
+    });
+
+    test('rejects a manual override without an actor or reason', () => {
+      expect(() => canary.manualOverride({ action: 'promote', reason: 'x' })).toThrow();
+      expect(() => canary.manualOverride({ actor: 'ops', action: 'promote' })).toThrow();
+    });
+  });
+});

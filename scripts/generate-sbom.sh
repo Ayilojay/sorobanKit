@@ -12,6 +12,12 @@
 # written alongside the SBOM linking the SBOM file, format, source revision,
 # and artifact digest.
 #
+# A build provenance attestation (in-toto statement, SLSA-style) is also
+# written to <artifact>.provenance.json. It binds the artifact subject digest,
+# source revision, workflow identity (from GITHUB_WORKFLOW_REF /
+# GITHUB_REPOSITORY / GITHUB_RUN_* when available), and toolchain versions.
+# The manifest records the provenance file path and digest.
+#
 # Usage:
 #   scripts/generate-sbom.sh --type <node|rust|container> \
 #                            --revision <git-sha> \
@@ -19,7 +25,8 @@
 #                            [--output-dir <dir>] \
 #                            [--name <artifact-name>] \
 #                            [--image <image-ref>] \
-#                            [--project-dir <dir>]
+#                            [--project-dir <dir>] \
+#                            [--provenance | --no-provenance]
 #
 # Options:
 #   --type         Artifact type: node, rust, or container (required)
@@ -30,6 +37,8 @@
 #                  (default: derived from type)
 #   --image        Container image reference (required for --type container)
 #   --project-dir  Project directory (default: repo root for node/rust)
+#   --provenance   Emit <artifact>.provenance.json (default: enabled)
+#   --no-provenance  Skip provenance attestation generation
 #   -h, --help     Show this help
 #
 # Exit codes:
@@ -50,6 +59,7 @@ OUTPUT_DIR="${REPO_ROOT}/sbom"
 ARTIFACT_NAME=""
 IMAGE_REF=""
 PROJECT_DIR=""
+EMIT_PROVENANCE=1
 
 log() { printf '[generate-sbom] %s\n' "$*" >&2; }
 die() { printf '[generate-sbom] ERROR: %s\n' "$*" >&2; exit "${2:-3}"; }
@@ -74,6 +84,8 @@ while [[ $# -gt 0 ]]; do
     --name)        ARTIFACT_NAME="${2:-}"; shift 2 ;;
     --image)       IMAGE_REF="${2:-}"; shift 2 ;;
     --project-dir) PROJECT_DIR="${2:-}"; shift 2 ;;
+    --provenance)  EMIT_PROVENANCE=1; shift ;;
+    --no-provenance) EMIT_PROVENANCE=0; shift ;;
     -h|--help)     usage; exit 0 ;;
     *)             die "unknown argument: $1" 1 ;;
   esac
@@ -114,6 +126,7 @@ OUTPUT_DIR="$(cd "${OUTPUT_DIR}" && pwd)"
 
 SBOM_FILE="${OUTPUT_DIR}/${ARTIFACT_NAME}.cdx.json"
 MANIFEST_FILE="${OUTPUT_DIR}/${ARTIFACT_NAME}.sbom-manifest.json"
+PROVENANCE_FILE="${OUTPUT_DIR}/${ARTIFACT_NAME}.provenance.json"
 RAW_SBOM_FILE="${OUTPUT_DIR}/.${ARTIFACT_NAME}.raw.cdx.json"
 
 cleanup() { rm -f "${RAW_SBOM_FILE}"; }
@@ -212,6 +225,33 @@ SBOM_DIGEST="$(sha256sum "${SBOM_FILE}" | awk '{print $1}')"
 SBOM_SIZE="$(wc -c < "${SBOM_FILE}" | tr -d ' ')"
 GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
+# --- Generate build provenance attestation -----------------------------------
+#
+# The provenance is an in-toto statement whose subject is the artifact digest
+# and whose predicate records the source revision, workflow identity, and
+# toolchain versions. It is written next to the SBOM and referenced from the
+# companion manifest.
+
+if [[ "${EMIT_PROVENANCE}" -eq 1 ]]; then
+  log "writing provenance attestation ${PROVENANCE_FILE}"
+  PROVENANCE_ARGS=(
+    --output "${PROVENANCE_FILE}"
+    --sbom-file "$(basename "${SBOM_FILE}")"
+    --sbom-digest "sha256:${SBOM_DIGEST}"
+    --revision "${SOURCE_REVISION}"
+    --digest "${ARTIFACT_DIGEST}"
+    --artifact-name "${ARTIFACT_NAME}"
+    --artifact-type "${ARTIFACT_TYPE}"
+    --generated-at "${GENERATED_AT}"
+  )
+  if [[ "${ARTIFACT_TYPE}" == "container" ]]; then
+    PROVENANCE_ARGS+=( --image "${IMAGE_REF}" )
+  fi
+  node "${SCRIPT_DIR}/lib/write-provenance.js" "${PROVENANCE_ARGS[@]}"
+  [[ -s "${PROVENANCE_FILE}" ]] || die "provenance generation produced no output" 3
+  PROVENANCE_DIGEST="$(sha256sum "${PROVENANCE_FILE}" | awk '{print $1}')"
+fi
+
 log "writing companion manifest ${MANIFEST_FILE}"
 
 MANIFEST_ARGS=(
@@ -230,6 +270,12 @@ MANIFEST_ARGS=(
 if [[ "${ARTIFACT_TYPE}" == "container" ]]; then
   MANIFEST_ARGS+=( --image "${IMAGE_REF}" )
 fi
+if [[ "${EMIT_PROVENANCE}" -eq 1 ]]; then
+  MANIFEST_ARGS+=(
+    --provenance-file "$(basename "${PROVENANCE_FILE}")"
+    --provenance-digest "sha256:${PROVENANCE_DIGEST}"
+  )
+fi
 
 node "${SCRIPT_DIR}/lib/write-sbom-manifest.js" "${MANIFEST_ARGS[@]}"
 
@@ -237,3 +283,7 @@ log "SBOM written to ${SBOM_FILE}"
 log "manifest written to ${MANIFEST_FILE}"
 printf '%s\n' "${SBOM_FILE}"
 printf '%s\n' "${MANIFEST_FILE}"
+if [[ "${EMIT_PROVENANCE}" -eq 1 ]]; then
+  log "provenance written to ${PROVENANCE_FILE}"
+  printf '%s\n' "${PROVENANCE_FILE}"
+fi

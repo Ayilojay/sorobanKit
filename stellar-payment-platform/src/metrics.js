@@ -255,6 +255,128 @@ const webhookDlqOldestAge = new client.Gauge({
   help: 'Age in seconds of the oldest webhook event in the dead-letter queue (0 when empty)',
 });
 
+// --- Canary rollout metrics ----------------------------------------------
+// These back the automated canary promotion/rollback gate. Every series is
+// labelled by the release version (a bounded, operator-supplied identifier
+// such as "v1.4.2" or a git SHA) so the gate can compare the canary cohort
+// against the stable cohort over the evaluation window. User identifiers must
+// never be used as label values here.
+
+// Counter: requests handled by a release version, split by status class.
+const canaryRequestsTotal = new client.Counter({
+  name: 'stellar_tags_canary_requests_total',
+  help: 'HTTP requests handled per release version, by status class',
+  labelNames: ['version', 'status'],
+});
+
+// Histogram: request latency per release version, bucketed for p95/p99.
+const canaryRequestDuration = new client.Histogram({
+  name: 'stellar_tags_canary_request_duration_seconds',
+  help: 'HTTP request duration in seconds per release version',
+  labelNames: ['version'],
+  buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+});
+
+// Gauge: current error rate (0..1) observed for a release version over the
+// most recent evaluation window. Set by the canary gate evaluator.
+const canaryErrorRate = new client.Gauge({
+  name: 'stellar_tags_canary_error_rate',
+  help: 'Observed error rate (0..1) for a release version over the evaluation window',
+  labelNames: ['version'],
+});
+
+// Gauge: current p95 latency in seconds for a release version over the most
+// recent evaluation window. Set by the canary gate evaluator.
+const canaryP95LatencySeconds = new client.Gauge({
+  name: 'stellar_tags_canary_p95_latency_seconds',
+  help: 'Observed p95 latency in seconds for a release version over the evaluation window',
+  labelNames: ['version'],
+});
+
+// Gauge: traffic share (0..1) currently routed to a release version.
+const canaryTrafficShare = new client.Gauge({
+  name: 'stellar_tags_canary_traffic_share',
+  help: 'Fraction of traffic (0..1) currently routed to a release version',
+  labelNames: ['version'],
+});
+
+// Gauge: gate state for a release version, encoded as an enum:
+// 0 = pending, 1 = promoting, 2 = promoted, 3 = rolled_back, 4 = halted.
+const canaryGateState = new client.Gauge({
+  name: 'stellar_tags_canary_gate_state',
+  help: 'Canary gate state per release version (0=pending,1=promoting,2=promoted,3=rolled_back,4=halted)',
+  labelNames: ['version'],
+});
+
+const CANARY_GATE_STATES = Object.freeze({
+  pending: 0,
+  promoting: 1,
+  promoted: 2,
+  rolled_back: 3,
+  halted: 4,
+});
+
+/**
+ * Records one canary request observation for a release version.
+ * @param {object} params
+ * @param {string} params.version - release version identifier
+ * @param {string|number} params.status - HTTP status code or status class
+ * @param {number} [params.durationSeconds] - observed latency, if any
+ */
+function recordCanaryRequest({ version, status, durationSeconds } = {}) {
+  const versionLabel = version || 'unknown';
+  const statusLabel =
+    typeof status === 'number' ? statusClass(status) : status || 'unknown';
+  canaryRequestsTotal.inc({ version: versionLabel, status: statusLabel });
+  if (typeof durationSeconds === 'number' && Number.isFinite(durationSeconds)) {
+    canaryRequestDuration.observe({ version: versionLabel }, durationSeconds);
+  }
+}
+
+/**
+ * Publishes the evaluated indicators for a release version. Values are
+ * clamped to sane ranges so a bad evaluator input never produces a
+ * misleading gauge.
+ * @param {object} params
+ * @param {string} params.version - release version identifier
+ * @param {number} [params.errorRate] - observed error rate (0..1)
+ * @param {number} [params.p95LatencySeconds] - observed p95 latency
+ * @param {number} [params.trafficShare] - traffic share (0..1)
+ */
+function setCanaryIndicators({ version, errorRate, p95LatencySeconds, trafficShare } = {}) {
+  const versionLabel = version || 'unknown';
+
+  if (typeof errorRate === 'number' && Number.isFinite(errorRate)) {
+    canaryErrorRate.set({ version: versionLabel }, Math.min(Math.max(errorRate, 0), 1));
+  }
+  if (typeof p95LatencySeconds === 'number' && Number.isFinite(p95LatencySeconds)) {
+    canaryP95LatencySeconds.set(
+      { version: versionLabel },
+      Math.max(p95LatencySeconds, 0),
+    );
+  }
+  if (typeof trafficShare === 'number' && Number.isFinite(trafficShare)) {
+    canaryTrafficShare.set(
+      { version: versionLabel },
+      Math.min(Math.max(trafficShare, 0), 1),
+    );
+  }
+}
+
+/**
+ * Publishes the gate state for a release version. Unknown states are ignored
+ * so a typo cannot silently reset a gate to "pending".
+ * @param {object} params
+ * @param {string} params.version - release version identifier
+ * @param {string} params.state - pending | promoting | promoted | rolled_back | halted
+ */
+function setCanaryGateState({ version, state } = {}) {
+  if (!Object.prototype.hasOwnProperty.call(CANARY_GATE_STATES, state)) {
+    return;
+  }
+  canaryGateState.set({ version: version || 'unknown' }, CANARY_GATE_STATES[state]);
+}
+
 /**
  * Records the age of the oldest pending webhook event. Negative or non-finite
  * inputs are clamped to 0 so a clock skew never produces a misleading spike.
@@ -356,4 +478,15 @@ module.exports = {
   sliLatencySeconds,
   ledgerFinalitySeconds,
   oldestUnreconciledIntentAgeSeconds,
+  // Canary rollout metrics
+  CANARY_GATE_STATES,
+  canaryRequestsTotal,
+  canaryRequestDuration,
+  canaryErrorRate,
+  canaryP95LatencySeconds,
+  canaryTrafficShare,
+  canaryGateState,
+  recordCanaryRequest,
+  setCanaryIndicators,
+  setCanaryGateState,
 };

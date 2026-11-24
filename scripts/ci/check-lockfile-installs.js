@@ -28,6 +28,19 @@ const WORKFLOW_DIR = path.join('.github', 'workflows');
 const CONTRIBUTING_FILE = 'CONTRIBUTING.md';
 const LEGACY_PEER_FLAG = '--legacy-peer-deps';
 
+// Dockerfiles that build container images. Each must install dependencies with
+// `npm ci` and pin every base image by digest.
+const DOCKERFILES = [
+  'Dockerfile',
+  'stellar-payment-platform/Dockerfile',
+  'payment-dashboard/Dockerfile',
+];
+
+// A base image is pinned when it references a digest, e.g. `node:20@sha256:...`.
+const PINNED_IMAGE_RE = /@sha256:[a-f0-9]{64}\b/;
+const FROM_RE = /^\s*FROM\s+(\S+)/i;
+=======
+
 function readFileSafe(filePath) {
   try {
     return fs.readFileSync(filePath, 'utf8');
@@ -35,6 +48,30 @@ function readFileSafe(filePath) {
     if (err.code === 'ENOENT') return null;
     throw err;
   }
+}
+
+function listDockerfiles(repoRoot) {
+  return DOCKERFILES.map((rel) => path.join(repoRoot, rel)).filter((p) => fs.existsSync(p));
+}
+
+/**
+ * Extract `FROM` instructions from a Dockerfile. Returns array of
+ * { line, image, pinned }.
+ */
+function extractBaseImages(content) {
+  const results = [];
+  const lines = content.split('\n');
+  for (let i = 0; i < lines.length; i += 1) {
+    const match = lines[i].match(FROM_RE);
+    if (!match) continue;
+    const image = match[1];
+    results.push({
+      line: i + 1,
+      image,
+      pinned: PINNED_IMAGE_RE.test(image),
+    });
+  }
+  return results;
 }
 
 function listWorkflowFiles(repoRoot) {
@@ -170,7 +207,38 @@ function checkLockfileInstalls(repoRoot) {
     }
   }
 
-  // 3. --legacy-peer-deps must be documented in CONTRIBUTING.md.
+  // 3. Dockerfiles must install with `npm ci` and pin base images by digest.
+  const dockerfiles = listDockerfiles(repoRoot);
+  details.dockerfiles = [];
+  for (const dfPath of dockerfiles) {
+    const content = readFileSafe(dfPath);
+    if (content == null) continue;
+    const relPath = path.relative(repoRoot, dfPath);
+    const commands = extractInstallCommands(content);
+    const baseImages = extractBaseImages(content);
+    details.dockerfiles.push({ file: relPath, commands, baseImages });
+
+    for (const cmd of commands) {
+      if (cmd.usesInstall) {
+        errors.push(
+          `Dockerfile ${relPath}:${cmd.line} uses "npm install"; use "npm ci" so container builds are lockfile-reproducible.`
+        );
+      }
+    }
+
+    if (baseImages.length === 0) {
+      warnings.push(`Dockerfile ${relPath} has no FROM instruction.`);
+    }
+    for (const img of baseImages) {
+      if (!img.pinned) {
+        errors.push(
+          `Dockerfile ${relPath}:${img.line} base image "${img.image}" is not pinned by digest; pin it as image@sha256:<digest>.`
+        );
+      }
+    }
+  }
+
+  // 4. --legacy-peer-deps must be documented in CONTRIBUTING.md.
   if (details.legacyPeerDeps.length > 0) {
     const contributingPath = path.join(repoRoot, CONTRIBUTING_FILE);
     const contributing = readFileSafe(contributingPath);
@@ -217,7 +285,9 @@ if (require.main === module) {
 module.exports = {
   checkLockfileInstalls,
   extractInstallCommands,
+  extractBaseImages,
   workflowTargetsWorkspace,
   WORKSPACES,
+  DOCKERFILES,
   LEGACY_PEER_FLAG,
 };

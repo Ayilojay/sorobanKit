@@ -70,6 +70,28 @@ const webhookDlqOldestAgeSeconds = new client.Gauge({
   registers: [register],
 });
 
+const canaryRequestsTotal = new client.Counter({
+  name: 'canary_requests_total',
+  help: 'Total number of requests served by canary version, labelled by outcome',
+  labelNames: ['version', 'status'],
+  registers: [register],
+});
+
+const canaryRequestDurationSeconds = new client.Histogram({
+  name: 'canary_request_duration_seconds',
+  help: 'Canary request duration in seconds',
+  labelNames: ['version', 'status'],
+  buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+  registers: [register],
+});
+
+const canaryErrorRate = new client.Gauge({
+  name: 'canary_error_rate',
+  help: 'Current canary error rate (errors / total requests) for the evaluation window',
+  labelNames: ['version'],
+  registers: [register],
+});
+
 function observeHttpRequest({ method, route, status, durationSeconds }) {
   const labels = { method, route, status: String(status) };
   httpRequestsTotal.inc(labels);
@@ -108,6 +130,20 @@ function setWebhookDlqOldestAge(ageSeconds) {
   webhookDlqOldestAgeSeconds.set(ageSeconds);
 }
 
+function observeCanaryRequest({ version, status, durationSeconds }) {
+  const labels = { version, status: String(status) };
+  canaryRequestsTotal.inc(labels);
+  if (typeof durationSeconds === 'number' && Number.isFinite(durationSeconds)) {
+    canaryRequestDurationSeconds.observe(labels, durationSeconds);
+  }
+}
+
+function setCanaryErrorRate({ version, errorRate }) {
+  if (typeof errorRate === 'number' && Number.isFinite(errorRate)) {
+    canaryErrorRate.set({ version }, errorRate);
+  }
+}
+
 module.exports = {
   register,
   httpRequestsTotal,
@@ -119,6 +155,9 @@ module.exports = {
   webhookDeliveryAttempts,
   webhookDeliveryLatencySeconds,
   webhookDlqOldestAgeSeconds,
+  canaryRequestsTotal,
+  canaryRequestDurationSeconds,
+  canaryErrorRate,
   observeHttpRequest,
   observeWebhookDelivery,
   setWebhookDlqSize,
@@ -126,4 +165,6 @@ module.exports = {
   observeWebhookDeliveryAttempts,
   observeWebhookDeliveryLatency,
   setWebhookDlqOldestAge,
+  observeCanaryRequest,
+  setCanaryErrorRate,
 };

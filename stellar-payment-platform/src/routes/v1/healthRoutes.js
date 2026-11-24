@@ -6,6 +6,7 @@ const { logger } = require('../../logger');
 const { ApiError } = require('../../errors');
 const { HORIZON_BASE } = require('../../services/stellarService');
 const { isReady } = require('../../shutdown');
+const { getCanaryStatus } = require('../../services/canaryService');
 
 const DEFAULT_HORIZON_TIMEOUT_MS = 3000;
 
@@ -158,6 +159,28 @@ module.exports = (redisClient) => {
       status: 'READY',
       timestamp: new Date().toISOString(),
       ...checks,
+    });
+  });
+
+  // Canary status probe: exposes the running version plus the user-visible
+  // indicators (error rate, latency p95) and the canary traffic share so the
+  // deploy script can poll and decide whether to promote or roll back.
+  router.get('/health/canary', (req, res) => {
+    const status = getCanaryStatus();
+    return res.status(200).json({
+      status: status.rolledBack ? 'ROLLED_BACK' : status.promoted ? 'PROMOTED' : 'CANARY',
+      timestamp: new Date().toISOString(),
+      version: status.version,
+      canaryShare: status.canaryShare,
+      errorRate: status.errorRate,
+      latencyP95Ms: status.latencyP95Ms,
+      sampleCount: status.sampleCount,
+      windowMs: status.windowMs,
+      thresholds: status.thresholds,
+      breached: status.breached,
+      manualOverride: status.manualOverride,
+      rolledBack: status.rolledBack,
+      promoted: status.promoted,
     });
   });
 

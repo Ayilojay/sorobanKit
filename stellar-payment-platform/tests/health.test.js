@@ -373,6 +373,164 @@ describe('startup, liveness and readiness probes', () => {
   });
 });
 
+// ── Canary rollout health endpoint ───────────────────────────────────────────
+
+describe('GET /health/canary', () => {
+  const loadCanaryRoutes = (options) => {
+    jest.resetModules();
+    const routes = require('../src/routes/v1/healthRoutes');
+    const app = express();
+    app.use(routes(redisClient, options));
+    app.use(buildErrorHandler(() => false));
+    return app;
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    prisma.$queryRaw.mockResolvedValue([{ 1: 1 }]);
+    redisClient = { ping: jest.fn().mockResolvedValue('PONG') };
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200 });
+  });
+
+  afterEach(() => {
+    jest.resetModules();
+  });
+
+  test('returns 200 with a healthy canary evaluation', async () => {
+    const res = await request(loadCanaryRoutes()).get('/health/canary');
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      status: 'UP',
+      probe: 'canary',
+      promotion: 'allowed',
+    });
+    expect(res.body.window).toMatchObject({
+      sampleCount: expect.any(Number),
+      errorRate: expect.any(Number),
+      p95LatencyMs: expect.any(Number),
+    });
+  });
+
+  test('reports degraded (but still promotable) when indicators are near threshold', async () => {
+    const res = await request(
+      loadCanaryRoutes({
+        canary: {
+          metricsProvider: async () => ({
+            sampleCount: 100,
+            errorRate: 0.02,
+            p95LatencyMs: 400,
+          }),
+          thresholds: { minSamples: 50, maxErrorRate: 0.05, maxP95LatencyMs: 500 },
+        },
+      })
+    ).get('/health/canary');
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ status: 'DEGRADED', promotion: 'allowed' });
+  });
+
+  test('returns 503 and halts promotion when the error-rate threshold is breached', async () => {
+    const res = await request(
+      loadCanaryRoutes({
+        canary: {
+          metricsProvider: async () => ({
+            sampleCount: 100,
+            errorRate: 0.2,
+            p95LatencyMs: 100,
+          }),
+          thresholds: { minSamples: 50, maxErrorRate: 0.05, maxP95LatencyMs: 500 },
+        },
+      })
+    ).get('/health/canary');
+
+    expect(res.status).toBe(503);
+    expect(res.body.error).toMatchObject({
+      code: 'SERVICE_UNAVAILABLE',
+      details: expect.arrayContaining([
+        { field: 'errorRate', message: expect.any(String) },
+      ]),
+    });
+    expect(res.body.promotion).toBe('halted');
+    expect(res.body.rollback).toBe(true);
+  });
+
+  test('returns 503 and halts promotion when the latency threshold is breached', async () => {
+    const res = await request(
+      loadCanaryRoutes({
+        canary: {
+          metricsProvider: async () => ({
+            sampleCount: 100,
+            errorRate: 0,
+            p95LatencyMs: 900,
+          }),
+          thresholds: { minSamples: 50, maxErrorRate: 0.05, maxP95LatencyMs: 500 },
+        },
+      })
+    ).get('/health/canary');
+
+    expect(res.status).toBe(503);
+    expect(res.body.promotion).toBe('halted');
+    expect(res.body.rollback).toBe(true);
+  });
+
+  test('does not breach thresholds before the minimum sample count is reached', async () => {
+    const res = await request(
+      loadCanaryRoutes({
+        canary: {
+          metricsProvider: async () => ({
+            sampleCount: 5,
+            errorRate: 1,
+            p95LatencyMs: 5000,
+          }),
+          thresholds: { minSamples: 50, maxErrorRate: 0.05, maxP95LatencyMs: 500 },
+        },
+      })
+    ).get('/health/canary');
+
+    expect(res.status).toBe(200);
+    expect(res.body.promotion).toBe('allowed');
+  });
+
+  test('returns 503 when the metrics provider fails', async () => {
+    const res = await request(
+      loadCanaryRoutes({
+        canary: {
+          metricsProvider: async () => {
+            throw new Error('metrics backend down');
+          },
+        },
+      })
+    ).get('/health/canary');
+
+    expect(res.status).toBe(503);
+    expect(res.body.error.code).toBe('SERVICE_UNAVAILABLE');
+    expect(res.body.promotion).toBe('halted');
+  });
+
+  test('handles concurrent polling without cross-request state leakage', async () => {
+    const app = loadCanaryRoutes({
+      canary: {
+        metricsProvider: async () => ({
+          sampleCount: 100,
+          errorRate: 0.01,
+          p95LatencyMs: 120,
+        }),
+        thresholds: { minSamples: 50, maxErrorRate: 0.05, maxP95LatencyMs: 500 },
+      },
+    });
+
+    const responses = await Promise.all(
+      Array.from({ length: 10 }, () => request(app).get('/health/canary'))
+    );
+
+    responses.forEach((res) => {
+      expect(res.status).toBe(200);
+      expect(res.body.promotion).toBe('allowed');
+    });
+  });
+});
+
 // ── X-Correlation-ID header assertions for health endpoint ────────────────────
 
 describe('GET /health — X-Correlation-ID header', () => {

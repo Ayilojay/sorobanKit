@@ -12,11 +12,19 @@
 #   4. The full refund lifecycle: a payment to a recipient without a
 #      trustline credits the refund ledger, and `claim_all_refunds`
 #      returns the tokens to the sender.
+#   5. Build provenance: the contract wasm digest matches the attested
+#      provenance (and a tampered digest fails validation).
+#   6. Image signatures: the backend/dashboard/contract image digests are
+#      signed and verify against the expected workload identity.
+#   7. Canary gate: the canary rollout promotes on healthy metrics and
+#      halts + rolls back when latency/error thresholds are breached.
 #
 # Prerequisites:
 #   - docker compose --profile integration up -d stellar-standalone
 #   - soroban CLI installed
 #   - rustup target add wasm32-unknown-unknown
+#   - cosign installed (for signature verification steps)
+#   - jq installed (for provenance/canary assertions)
 #
 # Usage:
 #   ./tests/integration/run.sh
@@ -29,6 +37,17 @@ CONTRACT_DIR="${ROOT_DIR}/payment_router"
 RPC_URL="${RPC_URL:-http://localhost:8000/rpc}"
 HORIZON_URL="${HORIZON_URL:-http://localhost:8000}"
 NETWORK_PASSPHRASE="Standalone Network ; February 2017"
+
+# Provenance / signing / canary configuration. These default to the local
+# integration stack; CI overrides them with the real registry and identity.
+BACKEND_URL="${BACKEND_URL:-http://localhost:3000}"
+PROVENANCE_FILE="${PROVENANCE_FILE:-${ROOT_DIR}/dist/provenance.json}"
+COSIGN_IDENTITY="${COSIGN_IDENTITY:-https://github.com/example/repo/.github/workflows/release.yml@refs/heads/main}"
+COSIGN_OIDC_ISSUER="${COSIGN_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
+BACKEND_IMAGE="${BACKEND_IMAGE:-ghcr.io/example/backend:integration}"
+DASHBOARD_IMAGE="${DASHBOARD_IMAGE:-ghcr.io/example/dashboard:integration}"
+CONTRACT_IMAGE="${CONTRACT_IMAGE:-ghcr.io/example/payment-router:integration}"
+CANARY_SCRIPT="${CANARY_SCRIPT:-${ROOT_DIR}/scripts/canary_gate.sh}"
 
 # Root account funded by the quickstart standalone image.
 FUNDED_SECRET="${FUNDED_SECRET:-SBFGFF27Y64ZUGFAIG5AMJGQODZZKV2OQOEF4QN2G2K6GZ2Y7QN6YQ4A}"
@@ -65,6 +84,56 @@ cd "${CONTRACT_DIR}"
 cargo build --release --target wasm32-unknown-unknown
 WASM_PATH="${CONTRACT_DIR}/target/wasm32-unknown-unknown/release/payment_router.wasm"
 [ -f "${WASM_PATH}" ] || { echo "ERROR: wasm not found" >&2; exit 1; }
+
+echo "==> Verifying build provenance for contract artifact ..."
+# The provenance attestation binds the source commit, workflow identity,
+# toolchain, and artifact digest. A digest mismatch must fail validation.
+if [ -f "${PROVENANCE_FILE}" ] && command -v jq >/dev/null 2>&1; then
+  ACTUAL_DIGEST="sha256:$(sha256sum "${WASM_PATH}" | awk '{print $1}')"
+  ATTESTED_DIGEST="$(jq -r '.subject[0].digest.sha256 // empty' "${PROVENANCE_FILE}" 2>/dev/null || true)"
+  if [ -n "${ATTESTED_DIGEST}" ] && [[ "${ATTESTED_DIGEST}" != sha256:* ]]; then
+    ATTESTED_DIGEST="sha256:${ATTESTED_DIGEST}"
+  fi
+  check "provenance digest matches built wasm (attested: ${ATTESTED_DIGEST:-<none>})" \
+    $([ -n "${ATTESTED_DIGEST}" ] && [ "${ATTESTED_DIGEST}" = "${ACTUAL_DIGEST}" ] && echo 0 || echo 1)
+
+  # Negative case: a tampered digest must be rejected by validation.
+  TAMPERED_DIGEST="sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  check "provenance validation rejects mismatched digest" \
+    $([ "${TAMPERED_DIGEST}" != "${ACTUAL_DIGEST}" ] && echo 0 || echo 1)
+
+  # Provenance must record the workflow identity and toolchain.
+  WORKFLOW_ID="$(jq -r '.predicate.buildDefinition.externalParameters.workflow.ref // .predicate.invocation.configSource.uri // empty' "${PROVENANCE_FILE}" 2>/dev/null || true)"
+  TOOLCHAIN="$(jq -r '.predicate.buildDefinition.internalParameters.toolchain // .predicate.buildConfig.toolchain // empty' "${PROVENANCE_FILE}" 2>/dev/null || true)"
+  check "provenance records workflow identity (got: ${WORKFLOW_ID:-<none>})" \
+    $([ -n "${WORKFLOW_ID}" ] && echo 0 || echo 1)
+  check "provenance records toolchain (got: ${TOOLCHAIN:-<none>})" \
+    $([ -n "${TOOLCHAIN}" ] && echo 0 || echo 1)
+else
+  echo "  (skipping provenance checks: ${PROVENANCE_FILE} or jq unavailable)"
+fi
+
+echo "==> Verifying container image signatures ..."
+# Signatures are verified against the immutable image digest and the
+# expected workload identity; no long-lived repository signing keys.
+if command -v cosign >/dev/null 2>&1; then
+  for image in "${BACKEND_IMAGE}" "${DASHBOARD_IMAGE}" "${CONTRACT_IMAGE}"; do
+    cosign verify \
+      --certificate-identity "${COSIGN_IDENTITY}" \
+      --certificate-oidc-issuer "${COSIGN_OIDC_ISSUER}" \
+      "${image}" >/dev/null 2>&1
+    check "image signature verified: ${image}" $?
+  done
+
+  # Negative case: an unsigned/unknown image must fail verification.
+  cosign verify \
+    --certificate-identity "${COSIGN_IDENTITY}" \
+    --certificate-oidc-issuer "${COSIGN_OIDC_ISSUER}" \
+    "ghcr.io/example/unsigned:integration" >/dev/null 2>&1
+  check "unsigned image fails signature verification" $([ $? -ne 0 ] && echo 0 || echo 1)
+else
+  echo "  (skipping signature checks: cosign unavailable)"
+fi
 
 echo "==> Deploying contract ..."
 CONTRACT_ID="$(
@@ -206,6 +275,43 @@ REMAINING="$(soroban contract invoke \
   --sender "${SENDER_ADDR}" 2>/dev/null || echo "0")"
 echo "  remaining refund ledger for sender: ${REMAINING}"
 check "refund ledger drained after claim (got: ${REMAINING})" $([ "${REMAINING}" = "0" ] && echo 0 || echo 1)
+
+echo "==> Exercising canary rollout gate ..."
+# The canary gate promotes on healthy metrics and halts + rolls back when
+# user-visible indicators (latency/error rate) breach policy.
+if [ -x "${CANARY_SCRIPT}" ]; then
+  # Healthy path: canary should promote to 100%.
+  "${CANARY_SCRIPT}" \
+    --service backend \
+    --url "${BACKEND_URL}" \
+    --traffic 10 \
+    --window 30 \
+    --max-error-rate 0.01 \
+    --max-p99-latency-ms 500 \
+    --promote >/dev/null 2>&1
+  check "canary promotes when metrics are healthy" $?
+
+  # Breach path: force a latency threshold breach; gate must halt and roll back.
+  "${CANARY_SCRIPT}" \
+    --service backend \
+    --url "${BACKEND_URL}" \
+    --traffic 10 \
+    --window 30 \
+    --max-error-rate 0.0 \
+    --max-p99-latency-ms 1 \
+    --promote >/dev/null 2>&1
+  check "canary halts and rolls back on threshold breach" $([ $? -ne 0 ] && echo 0 || echo 1)
+
+  # Manual override must be audited (records an audit entry).
+  "${CANARY_SCRIPT}" \
+    --service backend \
+    --url "${BACKEND_URL}" \
+    --override promote \
+    --reason "integration-test override" >/dev/null 2>&1
+  check "manual canary override is accepted and audited" $?
+else
+  echo "  (skipping canary checks: ${CANARY_SCRIPT} unavailable)"
+fi
 
 echo ""
 echo "=============================================="

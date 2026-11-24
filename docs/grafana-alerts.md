@@ -177,6 +177,78 @@ stellar_tags_reconciliation_oldest_unreconciled_seconds > 600
    - **Summary:** `Reconciliation backlog: oldest unreconciled intent exceeds the 5m objective`
    - **Description:** `network={{ $labels.network }} oldest unreconciled intent age is {{ $values.A.Value }}s (objective 300s) for more than 10m.`
 
+## Alert: `StellarTagsCanaryRolloutHalted`
+
+This alert fires when the backend canary rollout controller halts promotion or triggers an automatic rollback because a user-visible indicator breached the canary policy. The controller exposes the following metrics, all labelled by `network` and `component` only (never by canary instance, request, or user identifiers):
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `stellar_tags_canary_traffic_ratio` | gauge | Fraction of backend traffic currently routed to the canary (0–1). |
+| `stellar_tags_canary_error_ratio` | gauge | Canary error ratio over the evaluation window (0–1). |
+| `stellar_tags_canary_latency_p95_seconds` | gauge | Canary p95 request latency over the evaluation window. |
+| `stellar_tags_canary_rollback_total` | counter | Automatic rollbacks triggered, by `reason` (`error_ratio`, `latency`, `manual`). |
+| `stellar_tags_canary_state` | gauge | Current state: `0` = idle, `1` = promoting, `2` = halted, `3` = rolled back. |
+
+| Property | Value |
+| --- | --- |
+| Alert name | `StellarTagsCanaryRolloutHalted` |
+| Metric | `stellar_tags_canary_state` |
+| Condition | state `== 2` (halted) or `== 3` (rolled back) for `1m` |
+| Duration (`for`) | `1m` |
+| Severity | `critical` |
+| Summary | Canary rollout halted or rolled back: user-visible indicators breached policy |
+
+### PromQL
+
+```promql
+# Halted or rolled back canary for 1m
+stellar_tags_canary_state >= 2
+```
+
+### Grafana-managed rule
+
+1. **Rule name:** `StellarTagsCanaryRolloutHalted`
+2. **Folder:** `Stellar Tags`
+3. **Evaluation group:** `stellar-tags-canary`, evaluation interval `30s`.
+4. **Query:** the PromQL above.
+5. **Condition:** **Is above** `1`.
+6. **Pending period:** `1m`.
+7. **Labels:** `severity: critical`, `component: canary`. Do **not** add canary instance IDs, deployment SHAs, or request identifiers as labels.
+8. **Annotations:**
+   - **Summary:** `Canary rollout halted or rolled back: user-visible indicators breached policy`
+   - **Description:** `network={{ $labels.network }} canary state is {{ $values.A.Value }} (2=halted, 3=rolled back). Check stellar_tags_canary_rollback_total for the reason.`
+
+## Canary Rollout Policy
+
+The backend canary rollout is governed by a fixed policy. Promotion is **halted** and the canary is **automatically rolled back** whenever a user-visible indicator breaches a threshold during the evaluation window. The policy is:
+
+| Parameter | Value | Notes |
+| --- | --- | --- |
+| Initial canary traffic | `5%` | First step after deploy. |
+| Traffic steps | `5% → 25% → 50% → 100%` | Each step requires passing the evaluation window. |
+| Evaluation window | `10m` per step | Minimum observation time before promotion. |
+| Error ratio threshold | `> 1%` canary error ratio | Compared against the stable baseline; breaches halt promotion. |
+| Latency threshold | canary p95 `> 1.25x` stable p95 (and `> 500ms` absolute) | Either condition breaches halt promotion. |
+| Minimum sample size | `200` canary requests per window | Below this, the window is extended, not failed. |
+| Automatic rollback | On any breach | Traffic returns to `0%` canary; the rollout is marked rolled back. |
+
+### Interpreting canary alerts
+
+- `StellarTagsCanaryRolloutHalted` firing with `stellar_tags_canary_state == 2` means promotion was **halted** (e.g. the window is still being evaluated or a breach was detected) but traffic has not yet been fully drained. Investigate `stellar_tags_canary_error_ratio` and `stellar_tags_canary_latency_p95_seconds` for the breaching indicator.
+- Firing with `stellar_tags_canary_state == 3` means the canary was **automatically rolled back**. Inspect `stellar_tags_canary_rollback_total{reason=...}` to identify whether the error-ratio or latency gate tripped, then review the canary logs for the affected `network`.
+- A canary that never advances past a step (state stays `1` with a flat `stellar_tags_canary_traffic_ratio`) usually indicates the minimum sample size was not reached; extend the observation window rather than overriding.
+
+### Manual override (audited)
+
+Operators may override a halted or rolled-back canary, but every override is **audited**. An override:
+
+1. Requires an operator with the rollout-admin role.
+2. Records the operator identity, timestamp, target state, and a mandatory justification in the audit log (the justification is free text and must not contain user identifiers).
+3. Emits an audit event and increments `stellar_tags_canary_rollback_total{reason="manual"}` when the override forces a rollback.
+4. Does **not** bypass the thresholds for subsequent steps — the policy re-applies at the next promotion.
+
+To perform an override, use the rollout admin endpoint (see the backend API docs) with a justification; the request is rejected if the justification is missing or the caller lacks the role. Overrides are visible in the audit log and should be referenced in the incident record.
+
 ## Configure Notification Channels (Contact Points)
 
 Notification delivery (Slack, PagerDuty, email, etc.) is an operator choice and is out of scope for the repository. To wire up notifications:
@@ -205,6 +277,6 @@ promtool check rules docs/prometheus-alerts.yml
 
 ## Related Files
 
-- [`docs/prometheus-alerts.yml`](./prometheus-alerts.yml) — Prometheus alerting rule definitions, including the ledger confirmation lag and reconciliation backlog alerts.
+- [`docs/prometheus-alerts.yml`](./prometheus-alerts.yml) — Prometheus alerting rule definitions, including the ledger confirmation lag, reconciliation backlog, and canary rollout alerts.
 - [`docs/grafana-dashboard.json`](./grafana-dashboard.json) — Grafana dashboard, including the embedded alert panel for this metric.
 - [`README.md`](../README.md) — Monitoring section referencing the alert file.
