@@ -5,18 +5,106 @@
 payment_router
 *.md
 .env
+.env.*
 **/.env
+**/.env.*
 *.db
+
+# Credentials and secrets — must never enter a build context
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.csr
+*.jks
+*.keystore
+secrets
+secrets/**
+**/secrets
+**/secrets/**
+*.secret
+*.secrets
+credentials
+credentials/**
+**/credentials
+**/credentials/**
+*.npmrc
+.npmrc
+**/.npmrc
+*.netrc
+.netrc
+**/.netrc
+*.htpasswd
+**/*.htpasswd
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+**/id_rsa
+**/id_rsa.*
+**/id_ed25519
+**/id_ed25519.*
+
+# CI configuration — not needed inside images
+.gitlab-ci.yml
+**/.gitlab-ci.yml
+azure-pipelines.yml
+**/azure-pipelines.yml
+Jenkinsfile
+**/Jenkinsfile
+.circleci
+**/.circleci
+.travis.yml
+**/.travis.yml
+.github/**
+**/.github/**
 
 # Backend test files & artifacts — never needed inside an image
 # (CI runs tests on the runner; the api-test service builds from the
 # stellar-payment-platform context, which has its own .dockerignore)
 stellar-payment-platform/tests
+stellar-payment-platform/test
+stellar-payment-platform/__tests__
+stellar-payment-platform/fixtures
+stellar-payment-platform/test-fixtures
 stellar-payment-platform/*.test.js
+stellar-payment-platform/*.spec.js
 stellar-payment-platform/test_*.txt
 stellar-payment-platform/test_output.txt
+stellar-payment-platform/coverage
+stellar-payment-platform/.nyc_output
 stellar-payment-platform/data
 stellar-payment-platform/artillery.yml
+
+# Build-only inputs and tooling artifacts
+Dockerfile*
+docker-compose*.yml
+docker-compose*.yaml
+compose*.yml
+compose*.yaml
+Makefile
+*.mk
+scripts
+**/scripts
+.github/workflows
+**/.github/workflows
+*.log
+**/*.log
+coverage
+**/coverage
+.nyc_output
+**/.nyc_output
+dist
+**/dist
+build
+**/build
+tmp
+**/tmp
+*.tmp
+**/*.tmp
+.cache
+**/.cache
 
 # Root-level files not referenced by any image build
 docs

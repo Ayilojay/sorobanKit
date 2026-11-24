@@ -34,6 +34,26 @@
     "level": 1,
     "min_supported_level": 1
   },
+  "provenance": {
+    "attestation_path": "provenance/payment_router.intoto.jsonl",
+    "subject_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "source_commit": "0000000000000000000000000000000000000000",
+    "workflow_identity": "https://github.com/example/payment_router/.github/workflows/release.yml@refs/heads/main"
+  },
+  "images": [
+    {
+      "name": "payment_router_backend",
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "signature": "cosign:0000000000000000000000000000000000000000000000000000000000000000",
+      "verified": false
+    },
+    {
+      "name": "payment_router_dashboard",
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "signature": "cosign:0000000000000000000000000000000000000000000000000000000000000000",
+      "verified": false
+    }
+  ],
   "contracts": [
     {
       "name": "payment_router",

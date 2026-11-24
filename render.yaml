@@ -46,6 +46,37 @@ services:
       # the instance to be considered ready to receive traffic.
       - key: HEALTH_READINESS_TIMEOUT_MS
         value: "3000"
+      # Canary rollout policy. Render's native rolling deploys are augmented by
+      # the application-level canary gate: a new revision first receives a small
+      # slice of traffic, is evaluated over a fixed window, and is only promoted
+      # to 100% if user-visible indicators (latency, error rate) stay within
+      # policy. On breach, promotion halts and traffic is rolled back to the
+      # previous revision automatically. Manual overrides are audited.
+      #
+      # Percentage of traffic routed to the canary revision during evaluation.
+      - key: CANARY_TRAFFIC_PERCENT
+        value: "10"
+      # How long the canary is observed before a promotion decision is made.
+      - key: CANARY_EVALUATION_WINDOW_MS
+        value: "300000"
+      # Minimum number of requests required in the window before a decision is
+      # made; below this the window is extended rather than promoted blindly.
+      - key: CANARY_MIN_REQUESTS
+        value: "100"
+      # Latency gate: p95 latency (ms) above this threshold breaches policy.
+      - key: CANARY_LATENCY_P95_MS
+        value: "750"
+      # Error gate: user-visible error rate (0..1) above this breaches policy.
+      - key: CANARY_ERROR_RATE_THRESHOLD
+        value: "0.02"
+      # Path to the canary policy definition used by the promotion gate.
+      - key: CANARY_POLICY_PATH
+        value: /app/config/canary-policy.json
+      # When true, a policy breach triggers an automatic rollback to the
+      # previous revision; when false, promotion halts and awaits a manual,
+      # audited override.
+      - key: CANARY_AUTO_ROLLBACK
+        value: "true"
       - key: DATABASE_URL
         fromDatabase:
           name: stellar-tags-db

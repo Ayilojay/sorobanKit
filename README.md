@@ -498,6 +498,93 @@ artifact has a matching SBOM.
 in the SBOM, and checks that `vcs.revision` matches the supplied revision. It
 exits non-zero on any mismatch, so it can be used as a release gate or in CI.
 
+## Supply chain and release safety
+
+Every release artifact is attested, signed, and reproducible, and backend
+rollouts are gated by a canary with automatic rollback. The sections below are
+summaries; the authoritative procedures live in the linked documents.
+
+### Build provenance
+
+Build provenance is published for the backend, dashboard, and contract
+artifacts. Each attestation binds the source commit, the workflow identity that
+produced the artifact, the toolchain versions, and the artifact digest. A
+release is not complete until every artifact has a matching attestation.
+
+```bash
+# Verify an artifact's provenance against a source revision and digest
+./scripts/verify-provenance.sh \
+  --artifact dist/release/backend.tar.gz \
+  --revision "$(git rev-parse HEAD)" \
+  --digest "sha256:<artifact-sha256>"
+
+# Verify every attestation attached to a release
+./scripts/verify-provenance.sh --release <tag>
+```
+
+Verification fails (non-zero exit) when the recorded digest does not match the
+artifact, when the source revision differs, or when the workflow identity is not
+an approved builder. A digest mismatch is a hard validation failure and blocks
+promotion — see [docs/supply-chain/provenance.md](docs/supply-chain/provenance.md).
+
+### Image signatures
+
+Container images are signed by digest using workload identity (keyless OIDC
+signing), so there are no long-lived repository signing keys to store or rotate.
+Deployment verifies the signature against the immutable digest before any
+container starts; an unsigned or mismatched image is rejected.
+
+```bash
+# Verify the signature on an image digest before deploying
+cosign verify \
+  --certificate-identity-regexp '^https://github.com/<org>/<repo>/\.github/workflows/.*$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  <registry>/<image>@sha256:<digest>
+```
+
+If signing is unavailable (identity provider outage, expired workflow token),
+the release is held rather than shipped unsigned. Recovery steps — re-running
+the signing job, verifying the digest, and re-attesting — are documented in
+[docs/supply-chain/image-signing.md](docs/supply-chain/image-signing.md).
+
+### Reproducible builds
+
+Container builds are reproducible from pinned inputs:
+
+- Base images are pinned by digest, not by tag, in every Dockerfile.
+- Build inputs (lockfiles, toolchain versions, build args) are pinned and
+  recorded in the build metadata.
+- Build and runtime stages are separate, so released images contain only the
+  runtime dependencies — no compilers, package managers, or build-only tools.
+- No credentials are copied into any layer; secrets are injected at runtime.
+- Reviewed digest updates are automated: the update workflow opens a PR that
+  bumps the pinned digests, and the change must be reviewed and merged before it
+  takes effect.
+
+The release check verifies that a built image contains no build-only tools or
+credentials and fails the build otherwise. See
+[docs/supply-chain/reproducible-builds.md](docs/supply-chain/reproducible-builds.md)
+for the pinned-input policy and the digest update process.
+
+### Canary rollout and rollback
+
+Backend deploys roll out through a canary before full promotion:
+
+- **Traffic:** the canary receives a small, fixed share of production traffic
+  (default 10%) while the stable version serves the rest.
+- **Evaluation window:** the canary is observed for a fixed window (default
+  15 minutes) before promotion continues.
+- **Thresholds:** promotion halts and the deploy rolls back automatically when
+  user-visible indicators breach policy — error rate above the configured
+  threshold, or p95 latency above the configured budget, measured over the
+  evaluation window.
+- **Manual override:** an operator can halt or promote the canary manually. The
+  override is audited with the acting credential, the decision, and the reason.
+
+Rollback restores the previously verified digest and is recorded in the release
+ledger. Thresholds, windows, and the override procedure are documented in
+[docs/runbooks/canary-rollout.md](docs/runbooks/canary-rollout.md).
+
 ## Webhook signature verification
 
 Every webhook delivery includes an HMAC-SHA256 signature in the

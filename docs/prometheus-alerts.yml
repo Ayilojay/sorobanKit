@@ -763,6 +763,105 @@ groups:
             indicating sustained degradation rather than a transient spike.
             Owner: ledger-ops. See docs/slo.md.
 
+  - name: stellar-tags-canary-rollout
+    rules:
+      # Canary rollout gates (see docs/canary-rollout.md).
+      #
+      # The backend exposes the active canary evaluation window through
+      # stellar_tags_canary_* metrics. The gate halts promotion and rolls back
+      # automatically when user-visible indicators breach policy:
+      #   - error rate (5xx / all requests) above 1% for the evaluation window
+      #   - p95 request latency above 500ms for the evaluation window
+      # These alerts mirror the automated gate so operators are paged when the
+      # gate trips, even if the rollback itself succeeds.
+      - alert: StellarTagsCanaryErrorRateHigh
+        expr: |
+          (
+            sum(rate(stellar_tags_canary_http_requests_total{status_class="5xx"}[5m]))
+            /
+            sum(rate(stellar_tags_canary_http_requests_total[5m]))
+          ) > 0.01
+        for: 5m
+        labels:
+          severity: critical
+          service: stellar-tags
+          component: canary
+          owner: release-engineering
+        annotations:
+          summary: "Canary error rate above 1% ({{ $value | humanizePercentage }})"
+          description: >-
+            The canary cohort's 5xx error rate has been above the 1% policy
+            threshold for more than 5 minutes (current: {{ $value |
+            humanizePercentage }}). The automated gate should halt promotion
+            and roll back. Investigate the canary build before re-attempting
+            the rollout. See docs/canary-rollout.md.
+
+      - alert: StellarTagsCanaryLatencyP95High
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(stellar_tags_canary_http_request_duration_seconds_bucket[5m]))
+          ) > 0.5
+        for: 5m
+        labels:
+          severity: critical
+          service: stellar-tags
+          component: canary
+          owner: release-engineering
+        annotations:
+          summary: "Canary p95 latency above 500ms ({{ $value }}s)"
+          description: >-
+            The canary cohort's p95 request latency has been above the 500ms
+            policy threshold for more than 5 minutes (current: {{ $value }}s).
+            The automated gate should halt promotion and roll back. Check for
+            regressions in the canary build and downstream dependencies. See
+            docs/canary-rollout.md.
+
+      - alert: StellarTagsCanaryHalted
+        expr: increase(stellar_tags_canary_gate_events_total{event="halted"}[10m]) > 0
+        labels:
+          severity: warning
+          service: stellar-tags
+          component: canary
+          owner: release-engineering
+        annotations:
+          summary: "Canary promotion halted ({{ $labels.reason }})"
+          description: >-
+            The canary gate halted promotion within the last 10 minutes
+            (reason: {{ $labels.reason }}). Traffic remains pinned at the
+            current canary weight until an operator resolves the breach or
+            records an audited manual override. See docs/canary-rollout.md.
+
+      - alert: StellarTagsCanaryRolledBack
+        expr: increase(stellar_tags_canary_gate_events_total{event="rolled_back"}[10m]) > 0
+        labels:
+          severity: critical
+          service: stellar-tags
+          component: canary
+          owner: release-engineering
+        annotations:
+          summary: "Canary automatically rolled back ({{ $labels.reason }})"
+          description: >-
+            The canary gate automatically rolled back the rollout within the
+            last 10 minutes (reason: {{ $labels.reason }}). All canary traffic
+            has been returned to the stable build. Review the rollback audit
+            log and the canary build before re-attempting the rollout. See
+            docs/canary-rollout.md.
+
+      - alert: StellarTagsCanaryManualOverride
+        expr: increase(stellar_tags_canary_manual_overrides_total[10m]) > 0
+        labels:
+          severity: warning
+          service: stellar-tags
+          component: canary
+          owner: release-engineering
+        annotations:
+          summary: "Canary manual override recorded by {{ $labels.actor }}"
+          description: >-
+            An operator recorded an audited manual override of the canary gate
+            within the last 10 minutes (actor: {{ $labels.actor }}, reason:
+            {{ $labels.reason }}). Overrides bypass the automated rollback
+            gate and must be reviewed. See docs/canary-rollout.md.
+
   - name: stellar-tags-reconciliation
     rules:
       # Thresholds are tied to the payment availability objective: intents

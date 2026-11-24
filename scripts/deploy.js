@@ -72,6 +72,24 @@ const DEFAULT_SMOKE_RESULTS_DIR = path.join(ROOT_DIR, 'deploy', 'smoke-results')
 const DEFAULT_BACKEND_DIR = path.join(ROOT_DIR, 'stellar-payment-platform');
 const DEFAULT_DASHBOARD_DIR = path.join(ROOT_DIR, 'payment-dashboard');
 const DEFAULT_IMAGE_REPOSITORY = 'stellar-payment-platform';
+const DEFAULT_PROVENANCE_DIR = path.join(ROOT_DIR, 'deploy', 'provenance');
+const DEFAULT_CANARY_RECORD_PATH = path.join(ROOT_DIR, 'deploy', 'canary.json');
+const DEFAULT_CANARY_LOCK_PATH = path.join(ROOT_DIR, 'deploy', '.canary.lock');
+const PROVENANCE_STATEMENT_TYPE = 'https://in-toto.io/Statement/v1';
+const PROVENANCE_PREDICATE_TYPE = 'https://slsa.dev/provenance/v1';
+const ARTIFACT_TYPES = ['backend', 'dashboard', 'contract'];
+const CANARY_DEFAULT_POLICY = {
+  traffic_percent: 10,
+  evaluation_window_seconds: 300,
+  poll_interval_seconds: 30,
+  latency_p95_ms: 500,
+  error_rate_percent: 1,
+  min_requests: 20,
+};
+const CANARY_LOCK_STALE_MS = 30 * 60 * 1000;
+const CANARY_LOCK_MAX_ATTEMPTS = 3;
+const CANARY_LOCK_RETRY_MS = 100;
+=======
 
 // Environment configuration is always supplied externally at deploy time; it is
 // never baked into the immutable image. These are the keys the backend requires.
@@ -627,6 +645,460 @@ const resolveRuntimeEnv = (options = {}) => {
     env[key] = source[key];
   }
   return env;
+};
+
+// ── Build Provenance Attestation (Issue #464) ────────────────────────────────
+
+const normalizeSha256 = (value) => {
+  const normalized = String(value || '').toLowerCase();
+  if (/^[a-f0-9]{64}$/.test(normalized)) {
+    return normalized;
+  }
+  if (DIGEST_PATTERN.test(normalized)) {
+    return normalized.slice('sha256:'.length);
+  }
+  return null;
+};
+
+const resolveToolchain = (toolchain = {}) => {
+  const resolved = {
+    node: toolchain.node || process.version,
+    npm: toolchain.npm || null,
+    rustc: toolchain.rustc || null,
+    cargo: toolchain.cargo || null,
+    stellar_cli: toolchain.stellar_cli || null,
+    docker: toolchain.docker || null,
+  };
+  for (const key of Object.keys(resolved)) {
+    if (resolved[key] !== null && typeof resolved[key] !== 'string') {
+      throw new Error(`Toolchain entry "${key}" must be a string.`);
+    }
+  }
+  return resolved;
+};
+
+const resolveWorkflowIdentity = (workflowIdentity) => {
+  const identity = workflowIdentity || {};
+  const resolved = {
+    repository: identity.repository || process.env.GITHUB_REPOSITORY || null,
+    workflow_ref: identity.workflow_ref || process.env.GITHUB_WORKFLOW_REF || null,
+    workflow_sha: identity.workflow_sha || process.env.GITHUB_SHA || null,
+    run_id: identity.run_id || process.env.GITHUB_RUN_ID || null,
+    run_attempt: identity.run_attempt || process.env.GITHUB_RUN_ATTEMPT || null,
+    actor: identity.actor || process.env.GITHUB_ACTOR || null,
+  };
+  if (!resolved.workflow_ref) {
+    throw new Error('Provenance requires a workflow identity (workflow_ref).');
+  }
+  return resolved;
+};
+
+/**
+ * Generates a SLSA-style in-toto provenance attestation for a build artifact.
+ * The subject digest is the SHA-256 of the artifact bytes; the predicate binds
+ * the source commit, workflow identity, and toolchain versions.
+ *
+ * @param {object} options
+ * @returns {object} The attestation statement (also persisted when outputPath is set).
+ */
+const generateProvenance = (options = {}) => {
+  const artifactPath = path.resolve(options.artifactPath || '');
+  if (!options.artifactPath || !fs.existsSync(artifactPath)) {
+    throw new Error(`Provenance requires an existing --artifact, got "${options.artifactPath}".`);
+  }
+  const artifactType = options.artifactType;
+  if (!ARTIFACT_TYPES.includes(artifactType)) {
+    throw new Error(
+      `Provenance artifact type must be one of ${ARTIFACT_TYPES.join(', ')}, got "${artifactType}".`
+    );
+  }
+  const sourceCommit = String(options.sourceCommit || process.env.GITHUB_SHA || '');
+  if (!/^[a-f0-9]{40}$/i.test(sourceCommit)) {
+    throw new Error(`Provenance requires a 40-character source commit, got "${sourceCommit}".`);
+  }
+  const workflowIdentity = resolveWorkflowIdentity(options.workflowIdentity);
+  const toolchain = resolveToolchain(options.toolchain);
+
+  const artifactDigest = computeFileSha256(artifactPath);
+  const artifactName = options.artifactName || path.basename(artifactPath);
+  const statement = {
+    _type: PROVENANCE_STATEMENT_TYPE,
+    subject: [
+      {
+        name: artifactName,
+        digest: { sha256: artifactDigest },
+      },
+    ],
+    predicateType: PROVENANCE_PREDICATE_TYPE,
+    predicate: {
+      buildDefinition: {
+        buildType: 'https://stellar-payment-platform.dev/buildtypes/deploy-cli/v1',
+        externalParameters: {
+          artifact_type: artifactType,
+          source_commit: sourceCommit.toLowerCase(),
+        },
+        internalParameters: {
+          toolchain,
+        },
+        resolvedDependencies: [
+          {
+            uri: `git+${workflowIdentity.repository || 'unknown'}@${sourceCommit.toLowerCase()}`,
+            digest: { gitCommit: sourceCommit.toLowerCase() },
+          },
+        ],
+      },
+      runDetails: {
+        builder: {
+          id: workflowIdentity.workflow_ref,
+          version: workflowIdentity.workflow_sha || undefined,
+        },
+        metadata: {
+          invocationId: workflowIdentity.run_id || undefined,
+          startedOn: new Date().toISOString(),
+          actor: workflowIdentity.actor || undefined,
+        },
+        byproducts: [],
+      },
+      workflow: workflowIdentity,
+    },
+  };
+
+  if (options.outputPath) {
+    const outputPath = path.resolve(options.outputPath);
+    writeJsonFileAtomic(outputPath, statement, 'provenance attestation');
+    console.log(`✅ Wrote provenance attestation ${outputPath} for ${artifactName}.`);
+  }
+  return statement;
+};
+
+/**
+ * Verifies a provenance attestation against an artifact, recomputing the
+ * artifact digest. Throws on any mismatch so callers abort deployment.
+ *
+ * @param {object} options
+ * @returns {object} Verification result.
+ */
+const verifyProvenance = (options = {}) => {
+  if (!options.attestationPath) {
+    throw new Error('Provenance verification requires --attestation.');
+  }
+  const attestationPath = path.resolve(options.attestationPath);
+  const statement = readJsonFile(attestationPath, 'provenance attestation');
+  if (!statement || statement._type !== PROVENANCE_STATEMENT_TYPE) {
+    throw new Error(`Attestation ${attestationPath} is not an in-toto statement.`);
+  }
+  if (statement.predicateType !== PROVENANCE_PREDICATE_TYPE) {
+    throw new Error(`Attestation ${attestationPath} has an unsupported predicate type.`);
+  }
+  if (!Array.isArray(statement.subject) || statement.subject.length !== 1) {
+    throw new Error(`Attestation ${attestationPath} must have exactly one subject.`);
+  }
+  const subject = statement.subject[0];
+  const expectedDigest = normalizeSha256(subject && subject.digest && subject.digest.sha256);
+  if (!expectedDigest) {
+    throw new Error(`Attestation ${attestationPath} subject has no valid sha256 digest.`);
+  }
+
+  const artifactPath = path.resolve(options.artifactPath || '');
+  if (!options.artifactPath || !fs.existsSync(artifactPath)) {
+    throw new Error(`Provenance verification requires an existing --artifact, got "${options.artifactPath}".`);
+  }
+  const actualDigest = computeFileSha256(artifactPath);
+  if (!hashesEqual(actualDigest, expectedDigest)) {
+    throw new Error(
+      `Provenance digest mismatch for ${path.basename(artifactPath)}: ` +
+        `attestation=${expectedDigest} artifact=${actualDigest}. Aborting deployment.`
+    );
+  }
+
+  const sourceCommit = statement.predicate &&
+    statement.predicate.buildDefinition &&
+    statement.predicate.buildDefinition.externalParameters &&
+    statement.predicate.buildDefinition.externalParameters.source_commit;
+  if (!/^[a-f0-9]{40}$/.test(String(sourceCommit || ''))) {
+    throw new Error(`Attestation ${attestationPath} does not bind a source commit.`);
+  }
+
+  return {
+    ok: true,
+    attestation: attestationPath,
+    artifact: artifactPath,
+    digest: actualDigest,
+    source_commit: sourceCommit,
+    workflow_ref: statement.predicate.workflow && statement.predicate.workflow.workflow_ref,
+  };
+};
+
+const runProvenanceCommand = (options = {}) => {
+  const action = options.provenanceAction || 'verify';
+  if (action === 'generate') {
+    return generateProvenance({
+      artifactPath: options.artifactPath,
+      artifactType: options.artifactType,
+      sourceCommit: options.sourceCommit,
+      workflowIdentity: options.workflowIdentity,
+      toolchain: options.toolchain,
+      outputPath: options.attestationPath,
+    });
+  }
+  if (action === 'verify') {
+    const result = verifyProvenance({
+      attestationPath: options.attestationPath,
+      artifactPath: options.artifactPath,
+    });
+    console.log(`✅ Provenance verified for ${path.basename(result.artifact)} (${result.digest}).`);
+    return result;
+  }
+  throw new Error(`Unknown provenance action "${action}"; expected generate or verify.`);
+};
+
+// ── Canary Rollout & Automated Rollback (Issue #468) ─────────────────────────
+
+const resolveCanaryPolicy = (policy = {}) => {
+  const merged = { ...CANARY_DEFAULT_POLICY, ...(policy || {}) };
+  const numeric = [
+    'traffic_percent',
+    'evaluation_window_seconds',
+    'poll_interval_seconds',
+    'latency_p95_ms',
+    'error_rate_percent',
+    'min_requests',
+  ];
+  for (const key of numeric) {
+    if (typeof merged[key] !== 'number' || !Number.isFinite(merged[key]) || merged[key] < 0) {
+      throw new Error(`Canary policy "${key}" must be a non-negative number.`);
+    }
+  }
+  if (merged.traffic_percent <= 0 || merged.traffic_percent >= 100) {
+    throw new Error('Canary traffic_percent must be greater than 0 and less than 100.');
+  }
+  if (merged.evaluation_window_seconds <= 0) {
+    throw new Error('Canary evaluation_window_seconds must be positive.');
+  }
+  if (merged.poll_interval_seconds <= 0) {
+    throw new Error('Canary poll_interval_seconds must be positive.');
+  }
+  if (merged.latency_p95_ms <= 0) {
+    throw new Error('Canary latency_p95_ms must be positive.');
+  }
+  if (merged.error_rate_percent < 0 || merged.error_rate_percent > 100) {
+    throw new Error('Canary error_rate_percent must be between 0 and 100.');
+  }
+  return merged;
+};
+
+const acquireCanaryLock = (lockPath, options = {}) => {
+  const absoluteLockPath = path.resolve(lockPath);
+  fs.mkdirSync(path.dirname(absoluteLockPath), { recursive: true });
+  const now = options.now ? options.now() : Date.now();
+  for (let attempt = 0; attempt < CANARY_LOCK_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const handle = fs.openSync(absoluteLockPath, 'wx');
+      fs.writeSync(
+        handle,
+        `${JSON.stringify({ pid: process.pid, acquired_at: new Date(now).toISOString() })}\n`
+      );
+      fs.closeSync(handle);
+      return {
+        path: absoluteLockPath,
+        release: () => {
+          try {
+            fs.unlinkSync(absoluteLockPath);
+          } catch {
+            /* already released */
+          }
+        },
+      };
+    } catch (error) {
+      if (error.code !== 'EEXIST') {
+        throw new Error(`Could not acquire canary lock ${absoluteLockPath}: ${error.message}`);
+      }
+      let stale = false;
+      try {
+        const stat = fs.statSync(absoluteLockPath);
+        stale = now - stat.mtimeMs > CANARY_LOCK_STALE_MS;
+      } catch {
+        stale = false;
+      }
+      if (stale) {
+        try {
+          fs.unlinkSync(absoluteLockPath);
+        } catch {
+          /* raced with another releaser */
+        }
+        continue;
+      }
+      if (attempt === CANARY_LOCK_MAX_ATTEMPTS - 1) {
+        throw new Error(
+          `Another canary deployment holds the lock ${absoluteLockPath}; refusing to run concurrently.`
+        );
+      }
+      if (options.sleep) {
+        options.sleep(CANARY_LOCK_RETRY_MS);
+      }
+    }
+  }
+  throw new Error(`Could not acquire canary lock ${absoluteLockPath}.`);
+};
+
+const evaluateCanaryMetrics = (metrics, policy) => {
+  const breaches = [];
+  if (!metrics || typeof metrics !== 'object') {
+    return ['metrics unavailable'];
+  }
+  const requests = Number(metrics.requests);
+  if (!Number.isFinite(requests) || requests < policy.min_requests) {
+    breaches.push(`insufficient samples (${metrics.requests} < ${policy.min_requests})`);
+  }
+  const latency = Number(metrics.latency_p95_ms);
+  if (!Number.isFinite(latency) || latency > policy.latency_p95_ms) {
+    breaches.push(`latency p95 ${metrics.latency_p95_ms}ms > ${policy.latency_p95_ms}ms`);
+  }
+  const errorRate = Number(metrics.error_rate_percent);
+  if (!Number.isFinite(errorRate) || errorRate > policy.error_rate_percent) {
+    breaches.push(`error rate ${metrics.error_rate_percent}% > ${policy.error_rate_percent}%`);
+  }
+  return breaches;
+};
+
+/**
+ * Runs a canary rollout of an immutable digest: deploys the canary, polls
+ * metrics during the evaluation window, and halts promotion / rolls back when
+ * user-visible indicators breach policy. Manual overrides are audited.
+ *
+ * @param {object} options
+ * @returns {object} Canary outcome record.
+ */
+const runCanaryRollout = async (options = {}) => {
+  const digest = String(options.digest || '').toLowerCase();
+  if (!DIGEST_PATTERN.test(digest)) {
+    throw new Error(`canary requires a valid --digest (sha256:<64 hex>), got "${options.digest}".`);
+  }
+  const policy = resolveCanaryPolicy(options.policy);
+  const deploymentId = options.deploymentId || `canary-${Date.now()}`;
+  if (!DEPLOYMENT_ID_PATTERN.test(deploymentId)) {
+    throw new Error(`Invalid deployment ID "${deploymentId}".`);
+  }
+  const lockPath = path.resolve(options.lockPath || DEFAULT_CANARY_LOCK_PATH);
+  const recordPath = path.resolve(options.canaryRecordPath || DEFAULT_CANARY_RECORD_PATH);
+  const runCommand = options.runCommand || execFileSync;
+  const now = options.now || (() => Date.now());
+  const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const fetchMetrics = options.fetchMetrics || (async () => {
+    throw new Error('canary requires a metrics provider (fetchMetrics).');
+  });
+
+  const lock = acquireCanaryLock(lockPath, { now, sleep });
+  const record = fs.existsSync(recordPath)
+    ? readJsonFile(recordPath, 'canary record')
+    : { schema_version: 1, rollouts: [] };
+  if (!Array.isArray(record.rollouts)) {
+    lock.release();
+    throw new Error(`Canary record ${recordPath} has no rollouts array.`);
+  }
+
+  const entry = {
+    deployment_id: deploymentId,
+    digest,
+    policy,
+    started_at: new Date(now()).toISOString(),
+    status: 'running',
+    samples: [],
+    overrides: [],
+    rolled_back: false,
+  };
+
+  const persist = () => {
+    record.rollouts.push(entry);
+    writeJsonFileAtomic(recordPath, record, 'canary record');
+  };
+
+  try {
+    if (options.dryRun) {
+      logDryRun(`deploy canary ${digest} at ${policy.traffic_percent}% traffic`);
+      logDryRun(`poll metrics every ${policy.poll_interval_seconds}s for ${policy.evaluation_window_seconds}s`);
+      logDryRun('halt promotion and roll back on policy breach');
+      entry.status = 'dry-run';
+      persist();
+      return entry;
+    }
+
+    if (options.manualOverride) {
+      const override = options.manualOverride;
+      if (!override.actor || !override.reason) {
+        throw new Error('Manual override requires an actor and a reason.');
+      }
+      entry.overrides.push({
+        actor: override.actor,
+        reason: override.reason,
+        at: new Date(now()).toISOString(),
+        action: override.action || 'promote',
+      });
+      console.log(`⚠️  Manual override by ${override.actor}: ${override.reason}`);
+    }
+
+    if (options.deployCanary) {
+      await options.deployCanary({ digest, trafficPercent: policy.traffic_percent, deploymentId });
+    } else {
+      runCommand(
+        'docker',
+        ['run', '--detach', '--name', `${DEFAULT_IMAGE_REPOSITORY}-canary-${deploymentId}`, digest],
+        { stdio: 'inherit' }
+      );
+    }
+
+    const deadline = now() + policy.evaluation_window_seconds * 1000;
+    let breached = null;
+    while (now() < deadline) {
+      const metrics = await fetchMetrics({ digest, deploymentId });
+      const breaches = evaluateCanaryMetrics(metrics, policy);
+      entry.samples.push({
+        at: new Date(now()).toISOString(),
+        metrics,
+        breaches,
+      });
+      if (breaches.length > 0) {
+        breached = breaches;
+        break;
+      }
+      await sleep(policy.poll_interval_seconds * 1000);
+    }
+
+    if (breached) {
+      entry.status = 'rolled-back';
+      entry.rolled_back = true;
+      entry.breaches = breached;
+      if (options.rollback) {
+        await options.rollback({ digest, deploymentId, reason: breached.join('; ') });
+      } else if (options.previousDigest) {
+        rollbackArtifact({
+          to: options.previousDigest,
+          deploymentId: `rollback-${deploymentId}`,
+          deploymentRecordPath: options.deploymentRecordPath,
+          runtimeEnv: options.runtimeEnv,
+          runCommand,
+        });
+      }
+      console.error(`❌ Canary breached policy and was rolled back: ${breached.join('; ')}`);
+      persist();
+      throw new Error(`Canary rollout ${deploymentId} breached policy: ${breached.join('; ')}`);
+    }
+
+    entry.status = 'promoted';
+    entry.completed_at = new Date(now()).toISOString();
+    persist();
+    console.log(`✅ Canary ${deploymentId} passed evaluation; promotion allowed.`);
+    return entry;
+  } catch (error) {
+    if (entry.status === 'running') {
+      entry.status = 'failed';
+      entry.error = error.message;
+      persist();
+    }
+    throw error;
+  } finally {
+    lock.release();
+  }
 };
 
 const verifyDigestAvailable = (digest, options = {}) => {
@@ -1259,6 +1731,30 @@ const parseArgs = (argv = process.argv.slice(2)) => {
       options.expectedWasmHash = argv[++i];
     } else if (arg === '--expected-admin') {
       options.expectedAdmin = argv[++i];
+    } else if (arg === '--artifact') {
+      options.artifactPath = path.resolve(argv[++i]);
+    } else if (arg === '--artifact-type') {
+      options.artifactType = argv[++i];
+    } else if (arg === '--attestation') {
+      options.attestationPath = path.resolve(argv[++i]);
+    } else if (arg === '--source-commit') {
+      options.sourceCommit = argv[++i];
+    } else if (arg === '--workflow-ref') {
+      options.workflowIdentity = { ...(options.workflowIdentity || {}), workflow_ref: argv[++i] };
+    } else if (arg === '--canary-record') {
+      options.canaryRecordPath = path.resolve(argv[++i]);
+    } else if (arg === '--traffic-percent') {
+      options.policy = { ...(options.policy || {}), traffic_percent: Number(argv[++i]) };
+    } else if (arg === '--evaluation-window') {
+      options.policy = { ...(options.policy || {}), evaluation_window_seconds: Number(argv[++i]) };
+    } else if (arg === '--latency-p95-ms') {
+      options.policy = { ...(options.policy || {}), latency_p95_ms: Number(argv[++i]) };
+    } else if (arg === '--error-rate-percent') {
+      options.policy = { ...(options.policy || {}), error_rate_percent: Number(argv[++i]) };
+    } else if (arg === '--override-actor') {
+      options.manualOverride = { ...(options.manualOverride || {}), actor: argv[++i] };
+    } else if (arg === '--override-reason') {
+      options.manualOverride = { ...(options.manualOverride || {}), reason: argv[++i] };
     } else if (arg === '--env-file') {
       options.envFiles.push(path.resolve(argv[++i]));
     } else if (!arg.startsWith('-')) {
@@ -1268,10 +1764,12 @@ const parseArgs = (argv = process.argv.slice(2)) => {
 
   if (positional.length > 0) {
     const cmd = positional[0].toLowerCase();
-    if (['build', 'deploy', 'upgrade', 'upgrade-manifest', 'execute-action', 'init', 'status', 'verify-hash'].includes(cmd)) {
+    if (['build', 'deploy', 'upgrade', 'upgrade-manifest', 'execute-action', 'init', 'status', 'verify-hash', 'provenance', 'canary'].includes(cmd)) {
       options.command = cmd;
     }
-    if (positional[1] && !options.contractId) {
+    if (options.command === 'provenance' && positional[1]) {
+      options.provenanceAction = positional[1].toLowerCase();
+    } else if (positional[1] && !options.contractId) {
       options.contractId = positional[1];
     }
   }
@@ -1637,6 +2135,26 @@ const validateOptions = (options) => {
     return false;
   }
 
+  if (options.command === 'provenance') {
+    if (!options.artifactPath) {
+      console.error('❌ Missing --artifact path for provenance.');
+      return false;
+    }
+    if (options.provenanceAction === 'generate' && !ARTIFACT_TYPES.includes(options.artifactType)) {
+      console.error(`❌ Missing or invalid --artifact-type (${ARTIFACT_TYPES.join(', ')}).`);
+      return false;
+    }
+    if (options.provenanceAction !== 'generate' && !options.attestationPath) {
+      console.error('❌ Missing --attestation path for provenance verification.');
+      return false;
+    }
+  }
+
+  if (options.command === 'canary' && !DIGEST_PATTERN.test(String(options.digest || '').toLowerCase())) {
+    console.error('❌ Missing or invalid --digest for canary.');
+    return false;
+  }
+
   return true;
 };
 
@@ -1658,6 +2176,9 @@ Commands:
   execute-action        Execute a matured timelock action
   init                  Initialize an existing contract
   status                Show current contract configuration
+  provenance generate   Generate a SLSA provenance attestation for an artifact
+  provenance verify     Verify an attestation against an artifact digest
+  canary                Run a canary rollout with automated rollback gates
 
 Options:
   -n, --network <name>  Network: testnet | mainnet | futurenet | local (default: testnet)
@@ -1675,6 +2196,17 @@ Options:
       --dry-run         Simulate the workflow without RPC calls or on-chain transactions
       --skip-build      Skip WASM compilation
       --skip-hash-check Bypass the pre-deployment WASM hash verification
+      --artifact <path> Artifact file for provenance
+      --artifact-type <t> Provenance artifact type: backend | dashboard | contract
+      --attestation <p> Provenance attestation output/input path
+      --source-commit <sha> Source commit bound into provenance
+      --workflow-ref <ref> Workflow identity bound into provenance
+      --traffic-percent <n> Canary traffic percentage (default: 10)
+      --evaluation-window <s> Canary evaluation window seconds (default: 300)
+      --latency-p95-ms <n> Canary latency p95 threshold (default: 500)
+      --error-rate-percent <n> Canary error rate threshold (default: 1)
+      --override-actor <id> Audited manual override actor
+      --override-reason <r> Audited manual override reason
       --env-file <path> Additional .env file to update
   -h, --help            Show this help
   -v, --version         Show version
@@ -1706,6 +2238,16 @@ const main = async () => {
   console.log(`\n🌐 Network: ${network.name} (${network.rpcUrl})`);
   if (options.dryRun) {
     console.log('🧪 DRY RUN enabled — no RPC calls or on-chain transactions will be made.');
+  }
+
+  if (options.command === 'provenance') {
+    runProvenanceCommand(options);
+    return;
+  }
+
+  if (options.command === 'canary') {
+    await runCanaryRollout(options);
+    return;
   }
 
   if (options.command === 'upgrade-manifest') {
@@ -1775,6 +2317,9 @@ const main = async () => {
 
   if (options.command === 'deploy') {
     verifyLocalWasmHash(wasmPath, options);
+    if (options.attestationPath) {
+      verifyProvenance({ attestationPath: options.attestationPath, artifactPath: wasmPath });
+    }
     const contractId = deployContract(options, wasmPath);
     if (options.dryRun) {
       logDryRun('initialize contract after deploy');
@@ -1851,5 +2396,13 @@ module.exports = {
   validateOptions,
   logDryRun,
   runOrDryRun,
+  generateProvenance,
+  verifyProvenance,
+  runProvenanceCommand,
+  resolveCanaryPolicy,
+  evaluateCanaryMetrics,
+  acquireCanaryLock,
+  runCanaryRollout,
+  CANARY_DEFAULT_POLICY,
   main,
 };

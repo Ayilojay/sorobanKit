@@ -108,6 +108,56 @@ you touch anything under `.github/workflows/`.
   requires one, document the flag and its rationale in this section and in the
   workflow step that uses it.
 
+### Pinned base image digests
+
+Container builds are reproducible: base images are pinned by digest and build
+inputs are pinned, and build-only stages are separated from the runtime stage.
+
+- **Pin by digest, not tag.** Every `FROM` in a Dockerfile must reference an
+  image by its immutable `@sha256:...` digest. Tags are mutable and are not
+  accepted. Keep a readable `# <image>:<tag>` comment on the same line.
+- **Reviewed digest updates.** Base image digests are updated through a
+  reviewed pull request (Dependabot opens these, or you can open one by hand).
+  Resolve the tag to its digest, review the upstream changelog and diff, update
+  the digest and the tag comment together, and let CI run the digest-pinning
+  check before merging. Do not merge a PR that drops the digest pin or the tag
+  comment.
+- **No build-only tools or credentials in released images.** Build stages may
+  install compilers, package managers, and other build-only tooling, but the
+  runtime stage must not contain them. Never bake credentials, tokens, or
+  `.npmrc`/`.netrc` files into an image. The image-content check fails the
+  build if build-only tools or credentials are detected in the released image.
+
+### Build provenance and image signing
+
+Release artifacts (backend, dashboard, and contract artifacts) are attested and
+container images are signed in CI. Both use short-lived workload identity; no
+long-lived repository signing keys are stored.
+
+- **Provenance.** CI publishes build provenance that binds the source commit,
+  the workflow identity that produced the artifact, the toolchain versions, and
+  the artifact digest. Verification fails if the artifact digest does not match
+  the attested digest.
+- **Image signing.** Container images are signed by immutable digest using
+  workload identity. Deployment verifies the signature before rollout; an
+  unsigned or mismatched image is rejected.
+- **Recovery when signing is unavailable.** If the signing identity is
+  unavailable, do not bypass verification. Halt the release, record the
+  incident, and re-run the signing workflow once identity is restored. Never
+  deploy an unverified image as a workaround.
+
+### Canary rollout for backend changes
+
+Backend deployments roll out through a canary before full promotion.
+
+- **Traffic and window.** A small canary slice receives traffic first and is
+  evaluated over a defined window before promotion.
+- **Gates.** Promotion halts and rolls back automatically when user-visible
+  latency or error thresholds are breached during the evaluation window.
+- **Manual override.** A manual override to promote or roll back is audited,
+  recording who acted, when, and why. Use it only for incidents, and note the
+  reason in the pull request or incident record.
+
 ### Running the CI checks locally
 
 The CI hardening checks are available as scripts and can be run before
@@ -119,6 +169,12 @@ pushing:
   superseded runs and deploy/release workflows do not.
 - Run the lockfile check to confirm each workspace installs with `npm ci` and
   that the lockfiles are committed and in sync.
+- Run the base-image digest check to confirm every `FROM` is pinned by digest
+  with a tag comment.
+- Run the image-content check to confirm released images contain no build-only
+  tools or credentials.
+- Run the provenance and signature verification checks against a built
+  artifact or image to confirm the digest matches and the signature verifies.
 
 See the script headers and the workflow files for the exact commands and any
 workspace-specific flags.
